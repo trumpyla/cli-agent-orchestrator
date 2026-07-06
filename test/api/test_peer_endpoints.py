@@ -7,7 +7,10 @@ The DB layer is patched at the seam; these assert the HTTP contract, including t
 ``TerminalId`` 8-hex path validation.
 """
 
-from unittest.mock import patch
+from datetime import datetime
+from unittest.mock import MagicMock, patch
+
+from cli_agent_orchestrator.models.inbox import MessageStatus
 
 
 class TestRegisterPeerEndpoint:
@@ -58,3 +61,55 @@ class TestAckInboxEndpoint:
             resp = client.post("/terminals/deadbeef/inbox/ack", json={"message_ids": []})
             assert resp.status_code == 200
             assert resp.json()["acked"] == 0
+
+
+class TestInboxLongPoll:
+    """The wait= long-poll lane on GET .../inbox/messages (universal pseudo-push)."""
+
+    def test_longpoll_returns_pending_immediately(self, client):
+        msg = MagicMock(
+            id=1, sender_id="cond0001", receiver_id="deadbeef",
+            message="hi", status=MessageStatus.PENDING, created_at=datetime(2026, 7, 6),
+        )
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages", return_value=[msg]):
+            resp = client.get(
+                "/terminals/deadbeef/inbox/messages", params={"status": "pending", "wait": 5}
+            )
+        assert resp.status_code == 200
+        assert len(resp.json()) == 1
+
+    def test_longpoll_times_out_empty(self, client):
+        with patch("cli_agent_orchestrator.api.main.get_inbox_messages", return_value=[]):
+            resp = client.get(
+                "/terminals/deadbeef/inbox/messages", params={"status": "pending", "wait": 0.3}
+            )
+        assert resp.status_code == 200
+        assert resp.json() == []
+
+    def test_longpoll_rejects_delivered_filter(self, client):
+        resp = client.get(
+            "/terminals/deadbeef/inbox/messages", params={"status": "delivered", "wait": 1}
+        )
+        assert resp.status_code == 400
+
+
+class TestInboxEventPublish:
+    """Storing an inbox message publishes a body-free wake event."""
+
+    def test_post_message_publishes_body_free_event(self, client):
+        msg = MagicMock(
+            id=7, sender_id="cond0001", receiver_id="deadbeef", created_at=datetime(2026, 7, 6)
+        )
+        with patch("cli_agent_orchestrator.api.main.create_inbox_message", return_value=msg), \
+                patch("cli_agent_orchestrator.api.main.inbox_service"), \
+                patch("cli_agent_orchestrator.api.main.bus") as mock_bus:
+            resp = client.post(
+                "/terminals/deadbeef/inbox/messages",
+                params={"sender_id": "cond0001", "message": "secret-body"},
+            )
+        assert resp.status_code == 200
+        mock_bus.publish.assert_called_once()
+        topic, data = mock_bus.publish.call_args[0]
+        assert topic == "terminal.deadbeef.inbox"
+        assert data["message_id"] == 7
+        assert "message" not in data  # body-free privacy guard

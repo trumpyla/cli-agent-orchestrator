@@ -1,10 +1,15 @@
 """CAO operations MCP server implementation."""
 
+import asyncio
+import logging
+import re
 from typing import Annotated, Any, Dict, List, Optional
 
 import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
-from pydantic import Field
+from pydantic import AnyUrl, Field
+
+logger = logging.getLogger(__name__)
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.ops_mcp_server.models import (
@@ -45,10 +50,12 @@ mcp = FastMCP(
       task so the conductor and its workers know where to reply.
     - The conductor/worker replies with the existing send_message(receiver_id=peer_id,
       message=...); it queues in the peer's inbox (no pane, so it stays pending).
-    - receive_messages(peer_id) pulls pending replies (call it in a loop to poll);
-      ack_messages(peer_id, message_ids) marks them delivered so they are not re-returned.
-    This is the shipped, client-agnostic pull lane; an MCP push (resource subscription)
-    is deferred because current MCP clients drop server notifications.
+    - receive_messages(peer_id, wait_seconds=60) is the reliable pattern: it long-polls
+      (pseudo-push) and returns the moment a reply arrives or the timeout expires — works
+      on every MCP client. Then ack_messages(peer_id, message_ids) clears them.
+    A native MCP push (resources/subscribe on cao://peers/<id>/inbox -> resources/updated)
+    is also exposed for future clients, but today's Claude Code / Codex drop it, so the
+    long-poll is the client-agnostic lane.
     """,
 )
 
@@ -77,15 +84,18 @@ def _request_json(
     params: Optional[Dict[str, Any]] = None,
     json: Optional[Any] = None,
     operation: str,
+    timeout: Optional[float] = None,
 ) -> tuple[Optional[Any], Optional[str]]:
-    """Execute an API request and return either JSON data or an error message."""
+    """Execute an API request and return either JSON data or an error message.
+
+    ``timeout`` is the ``requests`` read timeout in seconds (``None`` = no timeout,
+    needed for a long-poll receive that holds the connection open server-side).
+    """
+    request_kwargs: Dict[str, Any] = {"params": params, "json": json}
+    if timeout is not None:
+        request_kwargs["timeout"] = timeout
     try:
-        response = requests.request(
-            method,
-            f"{API_BASE_URL}{path}",
-            params=params,
-            json=json,
-        )
+        response = requests.request(method, f"{API_BASE_URL}{path}", **request_kwargs)
     except requests.RequestException as exc:
         return None, f"{operation} failed: {exc}"
 
@@ -664,21 +674,37 @@ async def register_peer(
 async def receive_messages(
     peer_id: Annotated[str, Field(description="The 8-hex peer id from register_peer")],
     limit: Annotated[int, Field(description="Max messages to pull", ge=1, le=100)] = 10,
+    wait_seconds: Annotated[
+        float,
+        Field(
+            description="Long-poll: block server-side up to N seconds until a message arrives (0 = return immediately)",
+            ge=0.0,
+            le=120.0,
+        ),
+    ] = 0.0,
 ) -> JsonDict:
     """Pull pending conductor/worker->driver messages for a peer (does NOT ack them).
 
-    The shipped, client-agnostic pull lane. Call ``ack_messages`` with the returned ids
-    once processed, or they will be returned again. An empty list means nothing pending
-    yet — poll again.
+    The shipped, client-agnostic lane. With ``wait_seconds>0`` this is **pseudo-push**:
+    the server holds the call open until a message lands or the timeout, so a driver
+    awaiting a reply gets it with push latency over an ordinary tool call (works on every
+    MCP client). Call ``ack_messages`` with the returned ids once processed, or they will
+    be returned again.
 
     Returns:
         Dict with ``messages`` (list) and ``count`` — or a failure dict.
     """
+    params: Dict[str, Any] = {"status": "pending", "limit": limit}
+    request_timeout: Optional[float] = None
+    if wait_seconds > 0:
+        params["wait"] = wait_seconds
+        request_timeout = wait_seconds + 5.0  # give the held request headroom over the server wait
     data, error = _request_json(
         "get",
         f"/terminals/{peer_id}/inbox/messages",
-        params={"status": "pending", "limit": limit},
+        params=params,
         operation=f"Receive messages for peer '{peer_id}'",
+        timeout=request_timeout,
     )
     if error:
         return {"success": False, "message": error}
@@ -733,8 +759,125 @@ async def peer_inbox_resource(peer_id: str) -> JsonDict:
     return {"peer_id": peer_id, "messages": data if isinstance(data, list) else []}
 
 
+# --- MCP-subscribe lane for the peer inbox (bi-directional bridge) ---
+# Advertise resources/subscribe and push notifications/resources/updated when a peer's
+# inbox gets a new message. The mcp SDK hardcodes ResourcesCapability(subscribe=False),
+# so we flip it via the low-level _mcp_server seam (the technique CAO uses in
+# ext_apps/sep2133.py). Everything here is best-effort: an SDK/FastMCP build without the
+# hooks is logged and skipped rather than crashing startup, and the poll lane
+# (receive_messages) stays the client-agnostic fallback.
+
+_PEER_URI_RE = re.compile(r"^cao://peers/([a-f0-9]{8})/inbox$")
+_peer_consumers: Dict[str, "asyncio.Task[None]"] = {}
+
+
+def _peer_inbox_uri(peer_id: str) -> str:
+    return f"cao://peers/{peer_id}/inbox"
+
+
+def _long_poll_inbox(peer_id: str, wait: float) -> List[Any]:
+    """Blocking long-poll of a peer inbox (runs in a worker thread); returns pending rows."""
+    resp = requests.get(
+        f"{API_BASE_URL}/terminals/{peer_id}/inbox/messages",
+        params={"status": "pending", "limit": 100, "wait": wait},
+        timeout=wait + 5.0,
+    )
+    resp.raise_for_status()
+    data = resp.json()
+    return data if isinstance(data, list) else []
+
+
+async def _consume_inbox(peer_id: str, session: Any) -> None:
+    """Long-poll a peer inbox and emit resources/updated when messages land.
+
+    Reuses the same long-poll endpoint as ``receive_messages`` (no separate SSE stream —
+    for a stdio child, re-calling a long-poll is simpler than reconnecting an SSE feed).
+    The blocking ``requests`` call runs off the event loop via ``asyncio.to_thread`` so it
+    never stalls the stdio server. Best-effort with capped backoff; cancellation (on
+    unsubscribe) stops it cleanly. The resource read remains the source of truth — a
+    missed wake is repaired by the next long-poll.
+    """
+    uri = AnyUrl(_peer_inbox_uri(peer_id))
+    backoff = 1.0
+    while True:
+        try:
+            rows = await asyncio.to_thread(_long_poll_inbox, peer_id, 25.0)
+            backoff = 1.0
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("peer-inbox: long-poll for %s failed; backing off", peer_id, exc_info=True)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 30.0)
+            continue
+        if rows:
+            try:
+                await session.send_resource_updated(uri)
+            except Exception:
+                logger.debug("peer-inbox: send_resource_updated failed (%s)", peer_id, exc_info=True)
+
+
+def _setup_peer_subscribe(server: FastMCP) -> None:
+    """Advertise resources/subscribe and wire subscribe/unsubscribe to stream consumers.
+
+    Mirrors ext_apps/sep2133.advertise_capability's low-level seam. No-op + logged if the
+    FastMCP/SDK build lacks the hooks, so it never breaks startup or the poll lane.
+    """
+    low = getattr(server, "_mcp_server", None)
+    if low is None:
+        logger.warning("peer-inbox: no _mcp_server; MCP subscribe capability not advertised")
+        return
+
+    # 1) Flip resources.subscribe=True in the initialize response.
+    original_init = low.create_initialization_options
+
+    def _patched_init(*args: Any, **kwargs: Any) -> Any:
+        opts = original_init(*args, **kwargs)
+        try:
+            resources_cap = getattr(getattr(opts, "capabilities", None), "resources", None)
+            if resources_cap is not None:
+                resources_cap.subscribe = True
+        except Exception:
+            logger.debug("peer-inbox: could not advertise resources.subscribe", exc_info=True)
+        return opts
+
+    low.create_initialization_options = _patched_init
+
+    # 2) subscribe/unsubscribe start/stop a per-peer stream consumer.
+    try:
+
+        @low.subscribe_resource()
+        async def _on_subscribe(uri: Any) -> None:
+            match = _PEER_URI_RE.match(str(uri))
+            if not match or match.group(1) in _peer_consumers:
+                return
+            peer_id = match.group(1)
+            # Capture the live ServerSession from the LOW-LEVEL request context — not
+            # server.get_context() (FastMCP's own context, which is not populated for a
+            # handler registered directly on the low-level _mcp_server). With stdio there
+            # is exactly one session, valid for the process lifetime.
+            try:
+                session = low.request_context.session
+            except LookupError:
+                logger.debug("peer-inbox: no request-context session on subscribe for %s", peer_id)
+                return
+            _peer_consumers[peer_id] = asyncio.create_task(_consume_inbox(peer_id, session))
+
+        @low.unsubscribe_resource()
+        async def _on_unsubscribe(uri: Any) -> None:
+            match = _PEER_URI_RE.match(str(uri))
+            if not match:
+                return
+            task = _peer_consumers.pop(match.group(1), None)
+            if task is not None:
+                task.cancel()
+    except Exception:
+        logger.warning("peer-inbox: could not register MCP subscribe handlers", exc_info=True)
+
+
 def main() -> None:
     """Run the operations MCP server."""
+    _setup_peer_subscribe(mcp)
     mcp.run()
 
 

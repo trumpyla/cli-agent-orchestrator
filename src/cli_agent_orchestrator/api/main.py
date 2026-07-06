@@ -2794,6 +2794,12 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    wait: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=120.0,
+        description="Long-poll seconds: block until a new pending message arrives (0 = immediate)",
+    ),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -2817,8 +2823,32 @@ async def get_inbox_messages_endpoint(
                     detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
                 )
 
-        # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        # Long-poll is only meaningful for pending (a new inbox event only makes a
+        # message PENDING); reject wait on delivered/failed filters.
+        if wait > 0 and status_filter is not None and status_filter != MessageStatus.PENDING:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="wait>0 is only valid with status=pending or no status filter",
+            )
+
+        # Subscribe FIRST (before the DB read) to close the check/wait race, then block
+        # up to `wait`s for a new inbox event if nothing is pending yet. Universal
+        # pseudo-push: works through any MCP client via an ordinary tool call.
+        queue = None
+        topic = f"terminal.{terminal_id}.inbox"
+        if wait > 0:
+            queue = bus.subscribe(topic)
+        try:
+            messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+            if wait > 0 and not messages:
+                try:
+                    await asyncio.wait_for(queue.get(), timeout=wait)
+                except asyncio.TimeoutError:
+                    pass
+                messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        finally:
+            if queue is not None:
+                bus.unsubscribe(topic, queue)
 
         # Convert to response format
         result = []
@@ -2932,32 +2962,6 @@ async def ack_inbox_messages_endpoint(
             detail=f"Failed to ack messages: {str(e)}",
         )
     return AckResponse(acked=acked)
-
-
-@app.get("/terminals/{terminal_id}/inbox/stream")
-async def inbox_stream(terminal_id: TerminalId):
-    """Stream inbox 'new message' signals for a terminal as Server-Sent Events.
-
-    Each frame is **body-free** (``{"message_id", "sender_id"}``) — a doorbell telling a
-    cross-process consumer (e.g. cao-ops emitting an MCP ``resources/updated``) to
-    re-read the inbox. The message body travels only via the authenticated
-    ``GET .../inbox/messages``, preserving the event/telemetry privacy boundary. This
-    is what drives the peer-inbox MCP subscription lane.
-    """
-    from fastapi.responses import StreamingResponse
-
-    topic = f"terminal.{terminal_id}.inbox"
-    queue = bus.subscribe(topic)
-
-    async def event_generator():
-        try:
-            while True:
-                event = await queue.get()
-                yield f"data: {json.dumps(event['data'])}\n\n"
-        finally:
-            bus.unsubscribe(topic, queue)
-
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.websocket("/terminals/{terminal_id}/ws")
