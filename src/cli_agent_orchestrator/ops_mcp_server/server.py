@@ -713,6 +713,26 @@ async def ack_messages(
     return {"success": False, "message": "Ack messages failed: invalid response payload"}
 
 
+@mcp.resource("cao://peers/{peer_id}/inbox")
+async def peer_inbox_resource(peer_id: str) -> JsonDict:
+    """The peer's inbox as a readable MCP resource (subscribe for update notifications).
+
+    Returns the peer's pending messages. A client that supports resource subscriptions
+    is notified (``notifications/resources/updated``) when a new message arrives and can
+    then re-read this resource; clients that do not can read it on demand or poll
+    ``receive_messages``. This is the MCP-subscribe surface for the bi-directional bridge.
+    """
+    data, error = _request_json(
+        "get",
+        f"/terminals/{peer_id}/inbox/messages",
+        params={"status": "pending", "limit": 100},
+        operation=f"Read peer inbox '{peer_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    return {"peer_id": peer_id, "messages": data if isinstance(data, list) else []}
+
+
 def main() -> None:
     """Run the operations MCP server."""
     mcp.run()

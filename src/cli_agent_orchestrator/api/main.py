@@ -2763,6 +2763,14 @@ async def create_inbox_message_endpoint(
             detail=f"Failed to create inbox message: {str(e)}",
         )
 
+    # Notify inbox subscribers (peer channel / cao-ops resource-update push) that a new
+    # message was stored. Body-free to preserve the event/telemetry privacy boundary —
+    # the message body travels only via the authenticated inbox read.
+    bus.publish(
+        f"terminal.{receiver_id}.inbox",
+        {"message_id": inbox_msg.id, "sender_id": inbox_msg.sender_id},
+    )
+
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
@@ -2924,6 +2932,32 @@ async def ack_inbox_messages_endpoint(
             detail=f"Failed to ack messages: {str(e)}",
         )
     return AckResponse(acked=acked)
+
+
+@app.get("/terminals/{terminal_id}/inbox/stream")
+async def inbox_stream(terminal_id: TerminalId):
+    """Stream inbox 'new message' signals for a terminal as Server-Sent Events.
+
+    Each frame is **body-free** (``{"message_id", "sender_id"}``) — a doorbell telling a
+    cross-process consumer (e.g. cao-ops emitting an MCP ``resources/updated``) to
+    re-read the inbox. The message body travels only via the authenticated
+    ``GET .../inbox/messages``, preserving the event/telemetry privacy boundary. This
+    is what drives the peer-inbox MCP subscription lane.
+    """
+    from fastapi.responses import StreamingResponse
+
+    topic = f"terminal.{terminal_id}.inbox"
+    queue = bus.subscribe(topic)
+
+    async def event_generator():
+        try:
+            while True:
+                event = await queue.get()
+                yield f"data: {json.dumps(event['data'])}\n\n"
+        finally:
+            bus.unsubscribe(topic, queue)
+
+    return StreamingResponse(event_generator(), media_type="text/event-stream")
 
 
 @app.websocket("/terminals/{terminal_id}/ws")
