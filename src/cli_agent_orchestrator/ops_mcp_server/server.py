@@ -699,7 +699,11 @@ async def receive_messages(
     if wait_seconds > 0:
         params["wait"] = wait_seconds
         request_timeout = wait_seconds + 5.0  # give the held request headroom over the server wait
-    data, error = _request_json(
+    # Offload the blocking long-poll off the stdio event loop so cao-ops stays responsive
+    # to other MCP messages while the request is held open server-side (the request thread
+    # blocks; the event loop does not).
+    data, error = await asyncio.to_thread(
+        _request_json,
         "get",
         f"/terminals/{peer_id}/inbox/messages",
         params=params,
