@@ -58,6 +58,13 @@ An MCP server that exposes the same set of management operations as structured t
   - A primary agent (Claude Code, Claude Desktop, etc.) that already uses MCP should prefer this over shell.
   - Multi-step workflows where an agent benefits from tool-level discoverability.
 - **When *not* to use:** if your caller cannot speak MCP or you are writing a shell script — use `cao session` instead.
+- **Bi-directional bridge:** `register_peer`, `receive_messages`, and `ack_messages`
+  let the driving agent register a pane-less **peer** and receive replies from a
+  conductor (or any worker) over CAO's inbox — closing the loop so the conductor can
+  call *back* to the driver, not just be driven. The driver polls `receive_messages`
+  (client-agnostic pull); an MCP push (resource subscription) is deferred because
+  current MCP clients drop server notifications. See
+  [API: Peers](api.md#peers-bi-directional-bridge).
 
 See [CAO Ops MCP Server](../README.md#cao-ops-mcp-server) in the README for setup and the tool catalog.
 

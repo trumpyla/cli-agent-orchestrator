@@ -37,6 +37,18 @@ mcp = FastMCP(
     8. read_session_output to read a terminal's captured output by session name
     9. get_session_info or list_sessions to monitor overall progress
     10. shutdown_session to clean up when done
+
+    ## Bi-directional bridge (conductor/worker -> driver)
+    Register the driving CLI as a pane-less peer so a conductor (or any worker) can
+    reply to it over CAO's own inbox, without polling files or terminal output:
+    - register_peer(name?) -> an 8-hex peer_id. Pass it to a conductor in its launch
+      task so the conductor and its workers know where to reply.
+    - The conductor/worker replies with the existing send_message(receiver_id=peer_id,
+      message=...); it queues in the peer's inbox (no pane, so it stays pending).
+    - receive_messages(peer_id) pulls pending replies (call it in a loop to poll);
+      ack_messages(peer_id, message_ids) marks them delivered so they are not re-returned.
+    This is the shipped, client-agnostic pull lane; an MCP push (resource subscription)
+    is deferred because current MCP clients drop server notifications.
     """,
 )
 

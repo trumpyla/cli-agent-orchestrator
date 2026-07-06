@@ -2,6 +2,10 @@
 
 Base URL: `http://localhost:9889` (default)
 
+Interactive API docs (Swagger UI) are served live at **`/docs`**, and the raw OpenAPI
+schema at **`/openapi.json`** — both auto-generated from the FastAPI route models, so
+they always reflect the running server.
+
 ## Health Check
 
 ### GET /health
@@ -261,6 +265,59 @@ Send a message to another terminal's inbox.
 - Messages are queued and delivered when the receiver terminal is IDLE
 - Messages are delivered in order (oldest first)
 - Delivery is automatic via event-driven status detection
+- **Peers** (pane-less receivers, see below) never auto-deliver: their messages stay
+  `pending` until the peer pulls them (GET below) and acks them (POST below)
+
+### GET /terminals/{receiver_id}/inbox/messages
+Pull a terminal's inbox messages (a peer polls this with `?status=pending`).
+
+**Query parameters:**
+- `status` (string, optional): filter by `pending` | `delivered` | `failed`
+- `limit` (int, optional, default 10, max 100)
+
+**Response:** a list of `{id, sender_id, receiver_id, message, status, created_at}`.
+This read does **not** mark messages delivered — call the ack endpoint below.
+
+### POST /terminals/{receiver_id}/inbox/ack
+Explicitly mark pulled peer-inbox messages `delivered` so they are not re-returned.
+`receiver_id` must be an 8-hex `TerminalId` (a non-8-hex id such as `peer-abc` → `422`).
+
+**Body:**
+- `message_ids` (int[]): the message ids to mark delivered
+
+**Response:**
+```json
+{ "acked": 2 }
+```
+
+---
+
+## Peers (Bi-directional bridge)
+
+A **peer** is a pane-less inbox receiver that represents an external driving CLI, so a
+conductor (or any worker) can reply *back* to the driver over CAO's own inbox — no file
+polling or terminal scraping. See [Control Planes](control-planes.md) for the cao-ops
+MCP tools (`register_peer` / `receive_messages` / `ack_messages`) that wrap these routes.
+
+### POST /peers
+Register a pane-less peer and return its 8-hex id.
+
+**Body (all optional):**
+- `name` (string): human label for the peer
+- `mode` (string): forward-compat; only `poll` is honored
+
+**Response:**
+```json
+{ "peer_id": "deadbeef", "name": "driver-x", "mode": "poll" }
+```
+
+**Behavior:**
+- Mints an 8-hex `TerminalId` and inserts a pane-less terminal row (`provider=peer`, in
+  the sentinel `__peers__` session), so the peer is a valid `receiver_id`.
+- The conductor/worker replies with the existing `POST .../inbox/messages`; delivery is
+  skipped (no pane), so messages stay `pending` for the peer to pull + ack.
+- The **poll** lane is shipped and client-agnostic; an MCP push (resource subscription)
+  is deferred because current MCP clients drop server resource-update notifications.
 
 ---
 

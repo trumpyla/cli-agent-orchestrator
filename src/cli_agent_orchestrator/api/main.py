@@ -2843,26 +2843,52 @@ async def get_inbox_messages_endpoint(
 class RegisterPeerRequest(BaseModel):
     """Body for POST /peers (all fields optional)."""
 
-    name: Optional[str] = None
-    mode: Optional[str] = None  # forward-compat; only "poll" is honored (design Decision 5)
+    name: Optional[str] = Field(default=None, description="Optional human label for the peer")
+    mode: Optional[str] = Field(
+        default=None,
+        description="Forward-compat; only 'poll' is honored (MCP subscription is deferred)",
+    )
+
+
+class PeerResponse(BaseModel):
+    """A registered pane-less peer inbox receiver."""
+
+    peer_id: str = Field(description="8-hex TerminalId of the peer inbox receiver")
+    name: Optional[str] = Field(default=None, description="The human label, if one was supplied")
+    mode: str = Field(description="Delivery mode; always 'poll' (the driver pulls)")
 
 
 class AckRequest(BaseModel):
     """Body for POST /terminals/{id}/inbox/ack."""
 
-    message_ids: List[int] = Field(default_factory=list)
+    message_ids: List[int] = Field(
+        default_factory=list, description="Inbox message ids to mark delivered"
+    )
 
 
-@app.post("/peers")
+class AckResponse(BaseModel):
+    """Result of acking pulled peer-inbox messages."""
+
+    acked: int = Field(description="Number of messages marked delivered")
+
+
+@app.post(
+    "/peers",
+    response_model=PeerResponse,
+    tags=["peers"],
+    summary="Register a pane-less peer (bi-directional bridge)",
+)
 async def register_peer_endpoint(
     body: RegisterPeerRequest = Body(default=RegisterPeerRequest()),
-) -> Dict:
-    """Register a pane-less peer (external driver) and return its 8-hex id.
+) -> PeerResponse:
+    """Register the driving CLI as a pane-less peer inbox receiver.
 
     The peer is a valid inbox ``receiver_id`` with no tmux pane, so a conductor or
-    worker ``send_message(receiver_id=peer_id)`` lands here and stays PENDING until the
-    driver pulls it. Only the poll delivery mode is honored (design Decision 5;
-    subscription is deferred, client-blocked).
+    worker ``send_message(receiver_id=peer_id)`` lands in its inbox and stays PENDING
+    until the driver pulls it (``GET .../inbox/messages?status=pending``) and acks it
+    (``POST .../inbox/ack``). Only the **poll** delivery mode is honored — the
+    MCP-subscription lane is deferred because Claude Code / Codex MCP clients drop
+    server resource-update notifications.
     """
     try:
         peer_id = create_peer(name=body.name)
@@ -2871,18 +2897,24 @@ async def register_peer_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to register peer: {str(e)}",
         )
-    return {"peer_id": peer_id, "name": body.name, "mode": "poll"}
+    return PeerResponse(peer_id=peer_id, name=body.name, mode="poll")
 
 
-@app.post("/terminals/{terminal_id}/inbox/ack")
+@app.post(
+    "/terminals/{terminal_id}/inbox/ack",
+    response_model=AckResponse,
+    tags=["inbox"],
+    summary="Ack pulled peer-inbox messages (explicit delivered-marking)",
+)
 async def ack_inbox_messages_endpoint(
     terminal_id: TerminalId,
     body: AckRequest = Body(default=AckRequest()),
-) -> Dict:
+) -> AckResponse:
     """Explicitly mark peer-inbox messages ``delivered`` (the GET does not ack on read).
 
     A peer pulls pending messages, processes them, then acks the ids here so they are
-    not re-returned. ``terminal_id`` is validated as 8-hex by ``TerminalId``.
+    not re-returned. ``terminal_id`` is validated as 8-hex by ``TerminalId`` (a
+    non-8-hex id such as ``peer-abc`` returns 422).
     """
     try:
         acked = mark_messages_delivered(terminal_id, body.message_ids)
@@ -2891,7 +2923,7 @@ async def ack_inbox_messages_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to ack messages: {str(e)}",
         )
-    return {"acked": acked}
+    return AckResponse(acked=acked)
 
 
 @app.websocket("/terminals/{terminal_id}/ws")
