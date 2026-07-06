@@ -41,9 +41,11 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
+    create_peer,
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
+    mark_messages_delivered,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -2836,6 +2838,60 @@ async def get_inbox_messages_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve inbox messages: {str(e)}",
         )
+
+
+class RegisterPeerRequest(BaseModel):
+    """Body for POST /peers (all fields optional)."""
+
+    name: Optional[str] = None
+    mode: Optional[str] = None  # forward-compat; only "poll" is honored (design Decision 5)
+
+
+class AckRequest(BaseModel):
+    """Body for POST /terminals/{id}/inbox/ack."""
+
+    message_ids: List[int] = Field(default_factory=list)
+
+
+@app.post("/peers")
+async def register_peer_endpoint(
+    body: RegisterPeerRequest = Body(default=RegisterPeerRequest()),
+) -> Dict:
+    """Register a pane-less peer (external driver) and return its 8-hex id.
+
+    The peer is a valid inbox ``receiver_id`` with no tmux pane, so a conductor or
+    worker ``send_message(receiver_id=peer_id)`` lands here and stays PENDING until the
+    driver pulls it. Only the poll delivery mode is honored (design Decision 5;
+    subscription is deferred, client-blocked).
+    """
+    try:
+        peer_id = create_peer(name=body.name)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to register peer: {str(e)}",
+        )
+    return {"peer_id": peer_id, "name": body.name, "mode": "poll"}
+
+
+@app.post("/terminals/{terminal_id}/inbox/ack")
+async def ack_inbox_messages_endpoint(
+    terminal_id: TerminalId,
+    body: AckRequest = Body(default=AckRequest()),
+) -> Dict:
+    """Explicitly mark peer-inbox messages ``delivered`` (the GET does not ack on read).
+
+    A peer pulls pending messages, processes them, then acks the ids here so they are
+    not re-returned. ``terminal_id`` is validated as 8-hex by ``TerminalId``.
+    """
+    try:
+        acked = mark_messages_delivered(terminal_id, body.message_ids)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to ack messages: {str(e)}",
+        )
+    return {"acked": acked}
 
 
 @app.websocket("/terminals/{terminal_id}/ws")

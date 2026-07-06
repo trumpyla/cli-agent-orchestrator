@@ -10,6 +10,7 @@ from itertools import groupby
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
+    is_peer,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     update_message_status,
@@ -71,6 +72,11 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
+        # Peers (external drivers) have no tmux pane: never pane-inject. Leave their
+        # messages PENDING for pull via the peer channel (bi-directional bridge).
+        if is_peer(terminal_id):
+            return
+
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:

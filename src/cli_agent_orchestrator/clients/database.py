@@ -559,6 +559,62 @@ def create_terminal(
         }
 
 
+PEER_PROVIDER = "peer"  # ProviderType.PEER.value; pane-less external-driver receiver
+PEER_TMUX_SESSION = "__peers__"  # sentinel session for peers (no real tmux pane/tab)
+
+
+def create_peer(name: Optional[str] = None) -> str:
+    """Register a pane-less peer (external driver) as an inbox receiver.
+
+    Mints an 8-hex terminal id (the ``TerminalId`` ``^[a-f0-9]{8}$`` shape) and inserts
+    a terminal row with ``provider='peer'`` and a sentinel session, so the peer is a
+    valid inbox ``receiver_id`` but has no tmux pane. Returns the peer id.
+    """
+    import secrets
+
+    for _ in range(5):
+        peer_id = secrets.token_hex(4)  # 8 lowercase-hex chars
+        with SessionLocal() as db:
+            if db.query(TerminalModel).filter(TerminalModel.id == peer_id).first():
+                continue
+        create_terminal(
+            terminal_id=peer_id,
+            tmux_session=PEER_TMUX_SESSION,
+            tmux_window=name or peer_id,
+            provider=PEER_PROVIDER,
+        )
+        return peer_id
+    raise RuntimeError("could not mint a unique 8-hex peer id after 5 attempts")
+
+
+def is_peer(terminal_id: str) -> bool:
+    """Return True if the terminal is a pane-less peer receiver."""
+    with SessionLocal() as db:
+        row = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        return bool(row and row.provider == PEER_PROVIDER)
+
+
+def mark_messages_delivered(receiver_id: str, message_ids: List[int]) -> int:
+    """Explicitly mark peer-inbox messages ``delivered`` (ack); returns the count updated.
+
+    The inbox GET does not ack on read (verified), so a peer pulls with
+    ``get_inbox_messages`` then acks here — otherwise a message is re-returned forever.
+    """
+    if not message_ids:
+        return 0
+    with SessionLocal() as db:
+        updated = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.receiver_id == receiver_id,
+                InboxModel.id.in_(message_ids),
+            )
+            .update({InboxModel.status: MessageStatus.DELIVERED.value}, synchronize_session=False)
+        )
+        db.commit()
+        return int(updated)
+
+
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
     """Get terminal metadata by ID."""
     import json as _json

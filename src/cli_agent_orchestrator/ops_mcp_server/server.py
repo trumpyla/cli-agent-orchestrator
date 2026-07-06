@@ -626,6 +626,81 @@ async def shutdown_session(
     return {"success": False, "message": "Shutdown session failed: invalid response payload"}
 
 
+@mcp.tool()
+async def register_peer(
+    name: Annotated[Optional[str], Field(description="Optional human label for the peer")] = None,
+) -> JsonDict:
+    """Register the driving CLI as a pane-less peer inbox receiver.
+
+    Returns an 8-hex ``peer_id``. Hand this id to a conductor (in its launch task) so it
+    and its workers can reply with ``send_message(receiver_id=peer_id)``; pull those
+    replies with ``receive_messages`` and clear them with ``ack_messages``. This is the
+    driver end of the bi-directional bridge (design Decision 5: shipped pull lane).
+
+    Returns:
+        Dict with ``peer_id`` (8-hex), ``name``, ``mode`` — or a failure dict.
+    """
+    data, error = _request_json("post", "/peers", json={"name": name}, operation="Register peer")
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Register peer failed: invalid response payload"}
+
+
+@mcp.tool()
+async def receive_messages(
+    peer_id: Annotated[str, Field(description="The 8-hex peer id from register_peer")],
+    limit: Annotated[int, Field(description="Max messages to pull", ge=1, le=100)] = 10,
+) -> JsonDict:
+    """Pull pending conductor/worker->driver messages for a peer (does NOT ack them).
+
+    The shipped, client-agnostic pull lane. Call ``ack_messages`` with the returned ids
+    once processed, or they will be returned again. An empty list means nothing pending
+    yet — poll again.
+
+    Returns:
+        Dict with ``messages`` (list) and ``count`` — or a failure dict.
+    """
+    data, error = _request_json(
+        "get",
+        f"/terminals/{peer_id}/inbox/messages",
+        params={"status": "pending", "limit": limit},
+        operation=f"Receive messages for peer '{peer_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, list):
+        return {"success": True, "messages": data, "count": len(data)}
+    return {"success": False, "message": "Receive messages failed: invalid response payload"}
+
+
+@mcp.tool()
+async def ack_messages(
+    peer_id: Annotated[str, Field(description="The 8-hex peer id")],
+    message_ids: Annotated[List[int], Field(description="Message ids to mark delivered")],
+) -> JsonDict:
+    """Mark pulled peer messages ``delivered`` so they are not returned again.
+
+    The inbox GET does not ack on read; call this after processing the ids from
+    ``receive_messages``.
+
+    Returns:
+        Dict with ``acked`` (count) — or a failure dict.
+    """
+    data, error = _request_json(
+        "post",
+        f"/terminals/{peer_id}/inbox/ack",
+        json={"message_ids": message_ids},
+        operation=f"Ack messages for peer '{peer_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if isinstance(data, dict):
+        return data
+    return {"success": False, "message": "Ack messages failed: invalid response payload"}
+
+
 def main() -> None:
     """Run the operations MCP server."""
     mcp.run()
