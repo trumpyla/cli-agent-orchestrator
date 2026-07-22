@@ -18,6 +18,7 @@ from cli_agent_orchestrator.constants import (
     KIRO_AGENTS_DIR,
     LOCAL_AGENT_STORE_DIR,
     OPENCODE_AGENTS_DIR,
+    PROVIDERS,
     SKILLS_DIR,
 )
 from cli_agent_orchestrator.models.copilot_agent import CopilotAgentConfig
@@ -256,7 +257,7 @@ def install_agent(
     and no call site constructs ``Path(user_input)`` through this module.
     """
     try:
-        valid_providers = [provider_type.value for provider_type in ProviderType]
+        valid_providers = PROVIDERS
         # An explicit provider is validated up front so bad input fails fast
         # BEFORE any URL download or env-file mutation. Frontmatter providers
         # are validated after the profile is parsed (below).

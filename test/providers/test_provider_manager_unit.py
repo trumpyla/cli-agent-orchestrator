@@ -154,6 +154,32 @@ def test_get_provider_not_in_database_raises():
             manager.get_provider("t1")
 
 
+def test_peer_terminal_cannot_create_runtime_provider():
+    manager = ProviderManager()
+
+    with pytest.raises(ValueError, match="Unknown provider type: peer"):
+        manager.create_provider("peer", "deadbeef", "__peers__", "driver")
+
+
+def test_peer_terminal_cannot_restore_runtime_provider():
+    manager = ProviderManager()
+    metadata = {
+        "provider": "peer",
+        "tmux_session": "__peers__",
+        "tmux_window": "driver",
+        "agent_profile": None,
+    }
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value=metadata,
+        ),
+        pytest.raises(ValueError, match="Unknown provider type: peer"),
+    ):
+        manager.get_provider("deadbeef")
+
+
 def test_cleanup_provider_handles_exception():
     """Test cleanup_provider handles exceptions gracefully."""
     manager = ProviderManager()

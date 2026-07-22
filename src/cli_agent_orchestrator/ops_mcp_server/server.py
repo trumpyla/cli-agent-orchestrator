@@ -3,7 +3,7 @@
 import asyncio
 import logging
 import re
-from typing import Annotated, Any, Dict, List, Optional
+from typing import Annotated, Any, Dict, List, Optional, Tuple
 
 import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
@@ -19,6 +19,7 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     SendMessageResult,
     SessionListResult,
 )
+from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 JsonDict = Dict[str, Any]
@@ -53,9 +54,10 @@ mcp = FastMCP(
     - receive_messages(peer_id, wait_seconds=60) is the reliable pattern: it long-polls
       (pseudo-push) and returns the moment a reply arrives or the timeout expires — works
       on every MCP client. Then ack_messages(peer_id, message_ids) clears them.
-    A native MCP push (resources/subscribe on cao://peers/<id>/inbox -> resources/updated)
-    is also exposed for future clients, but today's Claude Code / Codex drop it, so the
-    long-poll is the client-agnostic lane.
+    MCP push is also enabled (resources/subscribe on cao://peers/<id>/inbox -> a body-free
+    resources/updated wakeup), but long-poll remains authoritative because not every
+    client handles notifications. Re-read the resource after a wake; resubscribe if its
+    consumer terminates. CAO_AUTH_LOCAL_TOKEN is forwarded on every API request.
     """,
 )
 
@@ -77,6 +79,12 @@ def _response_detail(response: requests.Response) -> str:
     return text or f"HTTP {response.status_code}"
 
 
+def _auth_headers() -> Dict[str, str]:
+    """Build the local bearer header for the operations-MCP to API hop."""
+    token = get_local_bearer()
+    return {"Authorization": f"Bearer {token}"} if token else {}
+
+
 def _request_json(
     method: str,
     path: str,
@@ -92,6 +100,9 @@ def _request_json(
     needed for a long-poll receive that holds the connection open server-side).
     """
     request_kwargs: Dict[str, Any] = {"params": params, "json": json}
+    headers = _auth_headers()
+    if headers:
+        request_kwargs["headers"] = headers
     if timeout is not None:
         request_kwargs["timeout"] = timeout
     try:
@@ -722,10 +733,11 @@ async def ack_messages(
     peer_id: Annotated[str, Field(description="The 8-hex peer id")],
     message_ids: Annotated[List[int], Field(description="Message ids to mark delivered")],
 ) -> JsonDict:
-    """Mark pulled peer messages ``delivered`` so they are not returned again.
+    """Mark pending messages owned by a registered peer ``delivered``.
 
     The inbox GET does not ack on read; call this after processing the ids from
-    ``receive_messages``.
+    ``receive_messages``. Unknown ids and ordinary terminals are rejected by the API;
+    delivered, failed, and foreign-peer rows are never mutated.
 
     Returns:
         Dict with ``acked`` (count) — or a failure dict.
@@ -772,19 +784,30 @@ async def peer_inbox_resource(peer_id: str) -> JsonDict:
 # (receive_messages) stays the client-agnostic fallback.
 
 _PEER_URI_RE = re.compile(r"^cao://peers/([a-f0-9]{8})/inbox$")
-_peer_consumers: Dict[str, "asyncio.Task[None]"] = {}
+_peer_consumers: Dict[Tuple[int, str], "asyncio.Task[None]"] = {}
 
 
 def _peer_inbox_uri(peer_id: str) -> str:
     return f"cao://peers/{peer_id}/inbox"
 
 
-def _long_poll_inbox(peer_id: str, wait: float) -> List[Any]:
+def _long_poll_inbox(peer_id: str, wait: float, after_id: int = 0) -> List[Any]:
     """Blocking long-poll of a peer inbox (runs in a worker thread); returns pending rows."""
+    request_kwargs: Dict[str, Any] = {
+        "params": {
+            "status": "pending",
+            "limit": 100,
+            "wait": wait,
+            "after_id": after_id,
+        },
+        "timeout": wait + 5.0,
+    }
+    headers = _auth_headers()
+    if headers:
+        request_kwargs["headers"] = headers
     resp = requests.get(
         f"{API_BASE_URL}/terminals/{peer_id}/inbox/messages",
-        params={"status": "pending", "limit": 100, "wait": wait},
-        timeout=wait + 5.0,
+        **request_kwargs,
     )
     resp.raise_for_status()
     data = resp.json()
@@ -803,9 +826,15 @@ async def _consume_inbox(peer_id: str, session: Any) -> None:
     """
     uri = AnyUrl(_peer_inbox_uri(peer_id))
     backoff = 1.0
+    last_notified_id = 0
     while True:
         try:
-            rows = await asyncio.to_thread(_long_poll_inbox, peer_id, 25.0)
+            rows = await asyncio.to_thread(
+                _long_poll_inbox,
+                peer_id,
+                25.0,
+                last_notified_id,
+            )
             backoff = 1.0
         except asyncio.CancelledError:
             raise
@@ -814,11 +843,30 @@ async def _consume_inbox(peer_id: str, session: Any) -> None:
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 30.0)
             continue
-        if rows:
-            try:
-                await session.send_resource_updated(uri)
-            except Exception:
-                logger.debug("peer-inbox: send_resource_updated failed (%s)", peer_id, exc_info=True)
+        newer_ids = [
+            row["id"]
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("id"), int)
+            and row["id"] > last_notified_id
+        ]
+        if not newer_ids:
+            # An endpoint/proxy that ignores the cursor must not create a tight loop.
+            await asyncio.sleep(0.1)
+            continue
+
+        try:
+            await session.send_resource_updated(uri)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug(
+                "peer-inbox: send_resource_updated failed; consumer stopped (%s)",
+                peer_id,
+                exc_info=True,
+            )
+            return
+        last_notified_id = max(newer_ids)
 
 
 def _setup_peer_subscribe(server: FastMCP) -> None:
@@ -831,6 +879,9 @@ def _setup_peer_subscribe(server: FastMCP) -> None:
     if low is None:
         logger.warning("peer-inbox: no _mcp_server; MCP subscribe capability not advertised")
         return
+    if getattr(low, "_cao_peer_subscribe_setup", False):
+        return
+    low._cao_peer_subscribe_setup = True
 
     # 1) Flip resources.subscribe=True in the initialize response.
     original_init = low.create_initialization_options
@@ -853,7 +904,7 @@ def _setup_peer_subscribe(server: FastMCP) -> None:
         @low.subscribe_resource()
         async def _on_subscribe(uri: Any) -> None:
             match = _PEER_URI_RE.match(str(uri))
-            if not match or match.group(1) in _peer_consumers:
+            if not match:
                 return
             peer_id = match.group(1)
             # Capture the live ServerSession from the LOW-LEVEL request context — not
@@ -865,16 +916,50 @@ def _setup_peer_subscribe(server: FastMCP) -> None:
             except LookupError:
                 logger.debug("peer-inbox: no request-context session on subscribe for %s", peer_id)
                 return
-            _peer_consumers[peer_id] = asyncio.create_task(_consume_inbox(peer_id, session))
+            key = (id(session), peer_id)
+            existing = _peer_consumers.get(key)
+            if existing is not None and not existing.done():
+                return
+            task = asyncio.create_task(_consume_inbox(peer_id, session))
+            _peer_consumers[key] = task
+
+            def _remove_completed(completed: "asyncio.Task[None]") -> None:
+                if _peer_consumers.get(key) is completed:
+                    _peer_consumers.pop(key, None)
+                if completed.cancelled():
+                    return
+                try:
+                    error = completed.exception()
+                except Exception:
+                    logger.debug("peer-inbox: could not inspect consumer task", exc_info=True)
+                    return
+                if error is not None:
+                    logger.debug(
+                        "peer-inbox: consumer task failed (%s)",
+                        peer_id,
+                        exc_info=(type(error), error, error.__traceback__),
+                    )
+
+            task.add_done_callback(_remove_completed)
 
         @low.unsubscribe_resource()
         async def _on_unsubscribe(uri: Any) -> None:
             match = _PEER_URI_RE.match(str(uri))
             if not match:
                 return
-            task = _peer_consumers.pop(match.group(1), None)
+            try:
+                session = low.request_context.session
+            except LookupError:
+                logger.debug("peer-inbox: no request-context session on unsubscribe")
+                return
+            task = _peer_consumers.pop((id(session), match.group(1)), None)
             if task is not None:
                 task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+
     except Exception:
         logger.warning("peer-inbox: could not register MCP subscribe handlers", exc_info=True)
 

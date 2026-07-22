@@ -191,6 +191,15 @@ def test_launch_invalid_provider():
     assert "Invalid provider" in result.output
 
 
+def test_launch_rejects_synthetic_peer_provider():
+    runner = CliRunner()
+
+    result = runner.invoke(launch, ["--agents", "test-agent", "--provider", "peer"])
+
+    assert result.exit_code != 0
+    assert "Invalid provider 'peer'" in result.output
+
+
 def test_launch_with_session_name():
     """Test launch with custom session name."""
     runner = CliRunner()

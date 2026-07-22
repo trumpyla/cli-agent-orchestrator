@@ -608,6 +608,7 @@ def mark_messages_delivered(receiver_id: str, message_ids: List[int]) -> int:
             .filter(
                 InboxModel.receiver_id == receiver_id,
                 InboxModel.id.in_(message_ids),
+                InboxModel.status == MessageStatus.PENDING.value,
             )
             .update({InboxModel.status: MessageStatus.DELIVERED.value}, synchronize_session=False)
         )
@@ -795,7 +796,10 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    after_id: Optional[int] = None,
 ) -> List[InboxMessage]:
     """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
 
@@ -803,6 +807,7 @@ def get_inbox_messages(
         receiver_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10)
         status: Optional filter by message status (None = all statuses)
+        after_id: Optional exclusive message-id cursor
 
     Returns:
         List of inbox messages ordered by creation time (oldest first)
@@ -813,7 +818,13 @@ def get_inbox_messages(
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
 
-        messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+        if after_id is not None:
+            query = query.filter(InboxModel.id > after_id)
+            order_by = InboxModel.id.asc()
+        else:
+            order_by = InboxModel.created_at.asc()
+
+        messages = query.order_by(order_by).limit(limit).all()
 
         return [
             InboxMessage(

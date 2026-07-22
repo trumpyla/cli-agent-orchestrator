@@ -61,10 +61,19 @@ An MCP server that exposes the same set of management operations as structured t
 - **Bi-directional bridge:** `register_peer`, `receive_messages`, and `ack_messages`
   let the driving agent register a pane-less **peer** and receive replies from a
   conductor (or any worker) over CAO's inbox — closing the loop so the conductor can
-  call *back* to the driver, not just be driven. The driver polls `receive_messages`
-  (client-agnostic pull); an MCP push (resource subscription) is deferred because
-  current MCP clients drop server notifications. See
+  call *back* to the driver, not just be driven. Long-polling `receive_messages` is the
+  authoritative client-agnostic delivery path. The server also enables
+  `resources/subscribe` on `cao://peers/{id}/inbox` as a supplemental wakeup: updates
+  are body-free, are cursor-deduplicated per MCP session, and require the client to
+  re-read the resource. A failed notification ends that session's consumer, so the
+  client must resubscribe; long-poll remains available throughout. See
   [API: Peers](api.md#peers-bi-directional-bridge).
+- **Authenticated deployments:** `cao-ops-mcp` forwards `CAO_AUTH_LOCAL_TOKEN` as a
+  bearer token on every API call, including subscription long-polls. Inbox reads need
+  `cao:read`, `cao:write`, or `cao:admin`; peer registration and acknowledgement need
+  `cao:write` or `cao:admin`. A `peer_id` is only a routing identifier, not a per-peer
+  capability: `cao:write` is an operator-level scope over all peer inboxes and must not
+  be shared across mutually untrusted tenants. Authentication remains default-off.
 
 See [CAO Ops MCP Server](../README.md#cao-ops-mcp-server) in the README for setup and the tool catalog.
 

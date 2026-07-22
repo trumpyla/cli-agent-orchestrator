@@ -372,9 +372,16 @@ Other agents: use the equivalent stdio MCP command:
 uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao-ops-mcp-server
 ```
 
-**Available tools** — `list_profiles`, `get_profile_details`, `install_profile`, `launch_session`, `send_session_message`, `list_sessions`, `get_session_info`, `shutdown_session`.
+**Available tools** — `list_profiles`, `get_profile_details`, `install_profile`, `launch_session`, `send_session_message`, `list_sessions`, `get_session_info`, `shutdown_session`, `register_peer`, `receive_messages`, and `ack_messages`.
 
 Typical workflow: `list_profiles` → `install_profile` → `launch_session` → `send_session_message` → `get_session_info` → `shutdown_session`.
+
+For conductor/worker replies to the driving agent, call `register_peer`, pass the
+returned id into the task, long-poll with `receive_messages`, then acknowledge processed
+ids with `ack_messages`. MCP resource subscription is also enabled as a body-free
+supplemental wakeup, but long-poll remains the reliable fallback. When API authentication
+is enabled, set `CAO_AUTH_LOCAL_TOKEN` for `cao-ops-mcp`; it forwards that bearer token on
+all API requests without exposing it in tool output.
 
 ### Flows — scheduled agent sessions
 

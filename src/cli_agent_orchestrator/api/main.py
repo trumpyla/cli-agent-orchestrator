@@ -45,6 +45,7 @@ from cli_agent_orchestrator.clients.database import (
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
+    is_peer,
     mark_messages_delivered,
 )
 from cli_agent_orchestrator.constants import (
@@ -2800,6 +2801,12 @@ async def get_inbox_messages_endpoint(
         le=120.0,
         description="Long-poll seconds: block until a new pending message arrives (0 = immediate)",
     ),
+    after_id: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Exclusive message-id cursor; returns only pending rows with id > after_id",
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -2807,6 +2814,7 @@ async def get_inbox_messages_endpoint(
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
         status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        after_id: Optional exclusive message-id cursor
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -2823,12 +2831,18 @@ async def get_inbox_messages_endpoint(
                     detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
                 )
 
-        # Long-poll is only meaningful for pending (a new inbox event only makes a
-        # message PENDING); reject wait on delivered/failed filters.
-        if wait > 0 and status_filter is not None and status_filter != MessageStatus.PENDING:
+        # Waiting and cursored reads are delivery operations, so they always target
+        # pending messages. Preserve the legacy all-status immediate read only when
+        # neither behavior is requested.
+        delivery_read = wait > 0 or after_id is not None
+        if delivery_read and status_filter is None:
+            status_filter = MessageStatus.PENDING
+        if delivery_read and status_filter != MessageStatus.PENDING:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="wait>0 is only valid with status=pending or no status filter",
+                detail=(
+                    "wait>0 or after_id is only valid with status=pending " "or no status filter"
+                ),
             )
 
         # Subscribe FIRST (before the DB read) to close the check/wait race, then block
@@ -2839,13 +2853,19 @@ async def get_inbox_messages_endpoint(
         if wait > 0:
             queue = bus.subscribe(topic)
         try:
-            messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
-            if wait > 0 and not messages:
+            inbox_query: Dict[str, Any] = {
+                "limit": limit,
+                "status": status_filter,
+            }
+            if after_id is not None:
+                inbox_query["after_id"] = after_id
+            messages = get_inbox_messages(terminal_id, **inbox_query)
+            if wait > 0 and not messages and queue is not None:
                 try:
                     await asyncio.wait_for(queue.get(), timeout=wait)
                 except asyncio.TimeoutError:
                     pass
-                messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+                messages = get_inbox_messages(terminal_id, **inbox_query)
         finally:
             if queue is not None:
                 bus.unsubscribe(topic, queue)
@@ -2884,7 +2904,9 @@ class RegisterPeerRequest(BaseModel):
     name: Optional[str] = Field(default=None, description="Optional human label for the peer")
     mode: Optional[str] = Field(
         default=None,
-        description="Forward-compat; only 'poll' is honored (MCP subscription is deferred)",
+        description=(
+            "Forward-compat; only 'poll' is honored (MCP subscription is a " "supplemental wakeup)"
+        ),
     )
 
 
@@ -2900,7 +2922,9 @@ class AckRequest(BaseModel):
     """Body for POST /terminals/{id}/inbox/ack."""
 
     message_ids: List[int] = Field(
-        default_factory=list, description="Inbox message ids to mark delivered"
+        default_factory=list,
+        max_length=100,
+        description="Inbox message ids to mark delivered (maximum 100 per request)",
     )
 
 
@@ -2918,6 +2942,7 @@ class AckResponse(BaseModel):
 )
 async def register_peer_endpoint(
     body: RegisterPeerRequest = Body(default=RegisterPeerRequest()),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> PeerResponse:
     """Register the driving CLI as a pane-less peer inbox receiver.
 
@@ -2925,8 +2950,8 @@ async def register_peer_endpoint(
     worker ``send_message(receiver_id=peer_id)`` lands in its inbox and stays PENDING
     until the driver pulls it (``GET .../inbox/messages?status=pending``) and acks it
     (``POST .../inbox/ack``). Only the **poll** delivery mode is honored — the
-    MCP-subscription lane is deferred because Claude Code / Codex MCP clients drop
-    server resource-update notifications.
+    MCP resource subscription is an optional body-free wakeup, but the response remains
+    ``mode=poll`` because long-poll delivery is the reliable client-agnostic contract.
     """
     try:
         peer_id = create_peer(name=body.name)
@@ -2947,6 +2972,7 @@ async def register_peer_endpoint(
 async def ack_inbox_messages_endpoint(
     terminal_id: TerminalId,
     body: AckRequest = Body(default=AckRequest()),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> AckResponse:
     """Explicitly mark peer-inbox messages ``delivered`` (the GET does not ack on read).
 
@@ -2954,6 +2980,12 @@ async def ack_inbox_messages_endpoint(
     not re-returned. ``terminal_id`` is validated as 8-hex by ``TerminalId`` (a
     non-8-hex id such as ``peer-abc`` returns 422).
     """
+    if not is_peer(terminal_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Peer '{terminal_id}' not found",
+        )
+
     try:
         acked = mark_messages_delivered(terminal_id, body.message_ids)
     except Exception as e:

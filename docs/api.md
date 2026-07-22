@@ -64,6 +64,10 @@ List available providers with installation status.
 
 **Note:** The `installed` field checks if the provider binary is available in the system PATH via `shutil.which()`.
 
+`peer` may appear in terminal records because it is the persistence type for a
+pane-less inbox receiver. It is not a launchable provider and is rejected by
+profile validation, install, launch, and provider-manager entry points.
+
 ---
 
 ## Sessions
@@ -246,6 +250,8 @@ Delete a terminal.
 ### POST /terminals/{receiver_id}/inbox/messages
 Send a message to another terminal's inbox.
 
+**Scope when authentication is enabled:** `cao:write` or `cao:admin`.
+
 **Parameters:**
 - `sender_id` (string, required): Sender terminal ID
 - `message` (string, required): Message content
@@ -271,9 +277,21 @@ Send a message to another terminal's inbox.
 ### GET /terminals/{receiver_id}/inbox/messages
 Pull a terminal's inbox messages (a peer polls this with `?status=pending`).
 
+**Scope when authentication is enabled:** `cao:read`, `cao:write`, or `cao:admin`.
+
 **Query parameters:**
 - `status` (string, optional): filter by `pending` | `delivered` | `failed`
 - `limit` (int, optional, default 10, max 100)
+- `wait` (number, optional, default 0, max 120): long-poll for pending messages
+- `after_id` (non-negative int, optional): exclusive message-id cursor
+
+When `wait > 0` or `after_id` is present and `status` is omitted, the server
+normalizes the request to `status=pending`. Cursored or waiting requests with
+`status=delivered` or `status=failed` return `400`. Cursor results satisfy
+`id > after_id` and are ordered by ascending id, which lets consumers drain a
+backlog in stable batches without repeating older rows. The server subscribes
+to the inbox event before its first database read, preserving messages created
+during the check/wait transition.
 
 **Response:** a list of `{id, sender_id, receiver_id, message, status, created_at}`.
 This read does **not** mark messages delivered — call the ack endpoint below.
@@ -281,9 +299,14 @@ This read does **not** mark messages delivered — call the ack endpoint below.
 ### POST /terminals/{receiver_id}/inbox/ack
 Explicitly mark pulled peer-inbox messages `delivered` so they are not re-returned.
 `receiver_id` must be an 8-hex `TerminalId` (a non-8-hex id such as `peer-abc` → `422`).
+It must also identify a registered peer; unknown ids and ordinary terminals return
+`404`, including when `message_ids` is empty. Only messages owned by that peer and
+currently `pending` are updated. Delivered, failed, and foreign-peer rows are unchanged.
+
+**Scope when authentication is enabled:** `cao:write` or `cao:admin`.
 
 **Body:**
-- `message_ids` (int[]): the message ids to mark delivered
+- `message_ids` (int[], max 100): the message ids to mark delivered
 
 **Response:**
 ```json
@@ -299,8 +322,14 @@ conductor (or any worker) can reply *back* to the driver over CAO's own inbox �
 polling or terminal scraping. See [Control Planes](control-planes.md) for the cao-ops
 MCP tools (`register_peer` / `receive_messages` / `ack_messages`) that wrap these routes.
 
+`peer_id` is a routing identifier, not a per-peer authorization capability. When
+authentication is enabled, `cao:write` is an operator-level scope over every peer inbox;
+do not issue it to mutually untrusted tenants.
+
 ### POST /peers
 Register a pane-less peer and return its 8-hex id.
+
+**Scope when authentication is enabled:** `cao:write` or `cao:admin`.
 
 **Body (all optional):**
 - `name` (string): human label for the peer
@@ -316,8 +345,13 @@ Register a pane-less peer and return its 8-hex id.
   the sentinel `__peers__` session), so the peer is a valid `receiver_id`.
 - The conductor/worker replies with the existing `POST .../inbox/messages`; delivery is
   skipped (no pane), so messages stay `pending` for the peer to pull + ack.
-- The **poll** lane is shipped and client-agnostic; an MCP push (resource subscription)
-  is deferred because current MCP clients drop server resource-update notifications.
+- The response remains `"mode": "poll"`: long-poll delivery is the authoritative,
+  client-agnostic path. Use the `after_id` cursor when building a persistent consumer.
+- `cao-ops-mcp` also enables `resources/subscribe` for
+  `cao://peers/{peer_id}/inbox`. Each MCP session gets an isolated consumer and one
+  body-free `notifications/resources/updated` wakeup per new message-id range. The
+  client must re-read the resource for message bodies. Notification-send failure stops
+  that consumer and requires resubscription; it never disables the long-poll fallback.
 
 ---
 

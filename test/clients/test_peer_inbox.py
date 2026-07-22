@@ -86,6 +86,53 @@ def test_ack_scoped_to_receiver(real_db):
     assert [x.id for x in get_inbox_messages(peer_a, status=MessageStatus.PENDING)] == [m.id]
 
 
+def test_ack_updates_only_pending_messages(real_db):
+    peer_id = create_peer()
+    pending = create_inbox_message("cond0001", peer_id, "pending")
+    delivered = create_inbox_message("cond0001", peer_id, "delivered")
+    failed = create_inbox_message("cond0001", peer_id, "failed")
+
+    with real_db() as session:
+        session.query(db.InboxModel).filter(db.InboxModel.id == delivered.id).update(
+            {db.InboxModel.status: MessageStatus.DELIVERED.value}
+        )
+        session.query(db.InboxModel).filter(db.InboxModel.id == failed.id).update(
+            {db.InboxModel.status: MessageStatus.FAILED.value}
+        )
+        session.commit()
+
+    assert mark_messages_delivered(peer_id, [pending.id, delivered.id, failed.id]) == 1
+    statuses = {message.id: message.status for message in get_inbox_messages(peer_id, limit=10)}
+    assert statuses == {
+        pending.id: MessageStatus.DELIVERED,
+        delivered.id: MessageStatus.DELIVERED,
+        failed.id: MessageStatus.FAILED,
+    }
+
+
+def test_cursor_filters_by_id_and_orders_ascending(real_db):
+    peer_id = create_peer()
+    first = create_inbox_message("cond0001", peer_id, "one")
+    second = create_inbox_message("cond0001", peer_id, "two")
+    third = create_inbox_message("cond0001", peer_id, "three")
+
+    page_one = get_inbox_messages(
+        peer_id,
+        limit=1,
+        status=MessageStatus.PENDING,
+        after_id=first.id,
+    )
+    page_two = get_inbox_messages(
+        peer_id,
+        limit=10,
+        status=MessageStatus.PENDING,
+        after_id=second.id,
+    )
+
+    assert [message.id for message in page_one] == [second.id]
+    assert [message.id for message in page_two] == [third.id]
+
+
 def test_create_peer_ids_are_unique(real_db):
     ids = {create_peer() for _ in range(20)}
     assert len(ids) == 20
