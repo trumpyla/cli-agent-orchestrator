@@ -681,6 +681,44 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
         mock_delete.assert_not_called()
 
+    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
+    @patch("cli_agent_orchestrator.clients.database.delete_terminal")
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    def test_startup_cleanup_preserves_peer_terminal(self, mock_list, mock_delete, mock_run):
+        """Pane-less peer records are not ghosts and must survive startup cleanup."""
+        service = HerdrInboxService(socket_path="/tmp/test.sock")
+
+        ws_response = json.dumps(
+            {
+                "result": {
+                    "workspaces": [
+                        {
+                            "workspace_id": "ws-abc",
+                            "label": "cao-test",
+                        }
+                    ]
+                }
+            }
+        )
+        tab_response = json.dumps({"result": {"tabs": []}})
+        mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
+        mock_list.return_value = [
+            {
+                "id": "peer-keep",
+                "tmux_window": "driver",
+                "provider": "peer",
+            },
+            {
+                "id": "ghost-delete",
+                "tmux_window": "dead-window",
+                "provider": "claude_code",
+            },
+        ]
+
+        _run_async(service._startup_db_cleanup())
+
+        mock_delete.assert_called_once_with("ghost-delete")
+
 
 class TestHerdrInboxServiceSingleSubscribePerConnection:
     """Guard against regressing to multiple events.subscribe calls per connection.
