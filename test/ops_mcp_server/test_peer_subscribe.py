@@ -94,6 +94,15 @@ class TestReceiveMessagesLanes:
         assert kwargs["params"]["wait"] == 60.0
         assert kwargs["timeout"] == 65.0  # wait + 5 headroom
 
+    async def test_after_id_forwards_exclusive_cursor(self):
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data=[]),
+        ) as mock_req:
+            await receive_messages(PEER, wait_seconds=60.0, after_id=41)
+        _, kwargs = mock_req.call_args
+        assert kwargs["params"]["after_id"] == 41
+
 
 def test_peer_uri_regex_accepts_only_8hex():
     assert _PEER_URI_RE.match("cao://peers/deadbeef/inbox").group(1) == "deadbeef"

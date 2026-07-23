@@ -1,0 +1,81 @@
+schema: spec-driven
+
+context: |
+  CLI Agent Orchestrator (CAO) is a Python service and CLI for launching and
+  coordinating interactive AI-agent terminals. Runtime code lives under
+  src/cli_agent_orchestrator/. FastAPI provides the external control boundary,
+  SQLite persists sessions, terminals, inbox messages, and peers, and the Web
+  UI and MCP surfaces consume those capabilities.
+
+  External and in-session MCP planes are different products. The external
+  cao-ops-mcp-server manages profiles and sessions through authenticated HTTP.
+  The in-session cao-mcp-server serves conductor/worker orchestration and may
+  use local services for deliberately process-local paths. Do not use those
+  local paths as precedent for bypassing HTTP from an external client. The
+  full-PTY WebSocket is a separate localhost-only, unauthenticated surface; any
+  proposal that widens its bind or trust boundary must address terminal-content
+  confidentiality and input injection.
+
+  Authentication and OpenTelemetry are default-off compatibility features.
+  Protected HTTP operations use cao:read, cao:write, or cao:admin scopes.
+  cao:write and cao:admin are fleet-wide authority, not per-session or per-peer
+  capabilities. Never log bearer tokens, secrets, or unredacted PII. Test
+  fixtures follow CONTRIBUTING.md's PII rules and security-sensitive changes
+  include the existing gitleaks gate.
+
+  ProviderType contains three semantic categories: real launchable agent
+  providers; launchable test-only mock_cli; and persistence-only peer. peer must
+  remain serializable but must never enter install, profile-validation, launch,
+  or provider-manager workflows. Provider inventories and current feature
+  support are owned by src/ and pyproject.toml rather than this configuration.
+
+  tmux is the stable default backend. Herdr is experimental and can differ in
+  terminal capture, native status, and lifecycle behavior. Designs that touch
+  terminal I/O, readiness, status, cleanup, or concurrency must state how both
+  backends behave or why one is out of scope.
+
+  The HTTP API is the authoritative external service boundary. Long-polling is
+  the reliable peer-inbox delivery mechanism; MCP resource notifications are
+  body-free supplemental wakeups. Asynchronous work must define ownership,
+  task lifecycle, cancellation, retry/backoff, timeout, deduplication, ordering,
+  cursor progression, acknowledgement ownership/idempotency, cleanup, and
+  failure recovery. Persistence changes use the ordered migration mechanism in
+  src/cli_agent_orchestrator/clients/database.py.
+
+  Preserve named public HTTP, MCP, CLI, and serialized-data contracts unless a
+  proposal specifies validation, migration, compatibility window, and rollback.
+  Private Python implementation details do not carry an implied compatibility
+  promise. Update maintained user-facing documentation for behavior changes.
+  Canonical architecture and contract sources include README.md, docs/api.md,
+  docs/control-planes.md, docs/herdr.md, and the source itself.
+
+  Use tests-first changes. Select applicable gates from
+  .github/workflows/ci.yml: focused tests; the complete non-E2E Python suite
+  with CI exclusions; Web UI build; MCP Apps typecheck, tests, build, scan:jit,
+  size, HTTP-boundary, and coverage checks; Black; isort; and zero mypy
+  errors. Documentation changes run scripts/validate_markdown_links.py after
+  new files are staged because it scans git-tracked files. All changes run
+  git diff --check. Root skills/ is canonical; verify its generated package
+  mirror with scripts/sync_skills.py --check when affected.
+
+rules:
+  proposal:
+    - State the problem, user impact, evidence, and explicit non-goals.
+    - Identify every affected HTTP, Web UI, external MCP, in-session MCP, CLI, provider, backend, persistence, and WebSocket surface.
+    - Explain compatibility and migration impact for each named public contract.
+    - Analyze authorization scope, privacy, secret handling, observability, and default-off compatibility where relevant.
+  spec:
+    - Use normative MUST, MUST NOT, SHOULD, and MAY language with testable scenarios.
+    - Cover success, validation, authorization, timeout, cancellation, retry, partial failure, and cleanup behavior when applicable.
+    - For asynchronous or inbox behavior, define ownership, ordering, deduplication, cursor progression, acknowledgement authority, idempotency, and recovery.
+    - Identify the authoritative mechanism and any supplemental notification, wakeup, cache, or presentation layer.
+  design:
+    - Map component ownership, data flow, trust boundaries, concurrency boundaries, persistence effects, and cross-plane error mapping.
+    - Describe provider and backend differences, including startup readiness, terminal status, and teardown semantics when applicable.
+    - Explain task lifecycle, cancellation and awaiting, retry/backoff, observability, backward compatibility, migration, and rollback.
+    - Cite canonical source or maintained documentation for architectural claims instead of copying volatile inventories.
+  tasks:
+    - Order implementation as failing regression test, smallest production change, focused verification, then refactor.
+    - Name exact files, commands, and expected outcomes; include negative authorization and failure-path tests.
+    - Select all applicable current CI gates without inventing new linters; mypy is a required zero-error gate.
+    - Include documentation, migration, generated-mirror, security, integration, and cleanup work when the design requires them.

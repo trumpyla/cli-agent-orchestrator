@@ -62,7 +62,9 @@ An MCP server that exposes the same set of management operations as structured t
   let the driving agent register a pane-less **peer** and receive replies from a
   conductor (or any worker) over CAO's inbox — closing the loop so the conductor can
   call *back* to the driver, not just be driven. Long-polling `receive_messages` is the
-  authoritative client-agnostic delivery path. The server also enables
+  authoritative client-agnostic delivery path; its optional `after_id` cursor waits for
+  messages newer than an observed row without requiring that older row to be acknowledged.
+  The server also enables
   `resources/subscribe` on `cao://peers/{id}/inbox` as a supplemental wakeup: updates
   are body-free, are cursor-deduplicated per MCP session, and require the client to
   re-read the resource. A failed notification ends that session's consumer, so the
@@ -76,6 +78,13 @@ An MCP server that exposes the same set of management operations as structured t
   be shared across mutually untrusted tenants. Authentication remains default-off.
 
 See [CAO Ops MCP Server](../README.md#cao-ops-mcp-server) in the README for setup and the tool catalog.
+
+For worker prompts, `send_session_message` is the durable inbox path and waits
+for provider readiness. `send_terminal_input` and `send_terminal_key` are
+non-durable operator controls for an approval or picker that is already visible
+in the terminal. Both go through the authenticated HTTP API and therefore keep
+the API's `cao:write|admin` scope and key/input validation; they do not provide
+an MCP-side bypass.
 
 ### Choosing between `cao session` and `cao-ops-mcp`
 

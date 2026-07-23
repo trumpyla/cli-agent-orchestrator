@@ -129,13 +129,14 @@ BYPASS_PROMPT_PATTERN = r"Yes, I accept"  # Bypass permissions confirmation dial
 _DIALOG_BOTTOM_LINES = 15
 IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # New Claude Code TUI completion summary, e.g. "✻ Sautéed for 1s" /
-# "✶ Cultivated for 12s". Unlike the active spinner (PROCESSING_PATTERN, which
-# always ends with the … ellipsis), the summary is past-tense + "for Ns" with NO
-# ellipsis. The newest TUI shows this (above an empty ❯ box) after a finished
-# turn INSTEAD of the old ⏺ response marker, so it is the COMPLETED signal there.
+# "✶ Cultivated for 12s" / "✻ Churned for 6m 18s". Unlike the active spinner
+# (PROCESSING_PATTERN, which always ends with the … ellipsis), the summary is
+# past-tense + a duration with NO ellipsis. The newest TUI shows this (above an
+# empty ❯ box) after a finished turn INSTEAD of the old ⏺ response marker, so it
+# is the COMPLETED signal there.
 # The ``·`` glyph is intentionally excluded from the leading class so footer
 # lines like "high · /effort" cannot false-match.
-COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+\d+(?:\.\d+)?\s*s\b"
+COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+(?:\d+(?:\.\d+)?\s*(?:h|m|s)\s*)+\b"
 # get_status completion detection tolerates the duration being CLIPPED off by
 # the raw redraw ("✻ Crunched for " with no "Ns"): past-tense glyph + "for",
 # no ellipsis (so a live "…ing…" spinner never matches). · and * stay excluded
@@ -189,6 +190,14 @@ NEW_TUI_BOX_PATTERN = re.compile(
     r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯][ \t\xa0]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}",
     re.MULTILINE,
 )
+# Completed turns can repaint the idle box with a grey suggested next prompt.
+# Extraction accepts that settled form, while NEW_TUI_BOX_PATTERN deliberately
+# remains stricter for launch/input-readiness checks.
+SETTLED_NEW_TUI_BOX_PATTERN = re.compile(
+    r"─{8,}[^\n]*\n(?:[ \t\xa0]*\n){0,2}[ \t]*[>❯]"
+    r"(?:[ \t\xa0]+[^\n]*)?\n(?:[ \t\xa0]*\n){0,2}[ \t]*─{8,}",
+    re.MULTILINE,
+)
 # Live spinner in the new TUI: spinner glyph + a gerund ("…ing") + the … ellipsis,
 # e.g. "✻ Cultivating…", "· Swirling…". Tighter than PROCESSING_PATTERN so the
 # version status bar ("· latest:…") is not mistaken for a live spinner.
@@ -230,8 +239,8 @@ class ClaudeCodeProvider(BaseProvider):
 
     @staticmethod
     def _tail_hash(output: str, n: int = 30) -> str:
-        """Hash the ANSI-stripped last *n* lines of *output*."""
-        clean = re.sub(ANSI_CODE_PATTERN, "", output)
+        """Hash the terminal-normalized last *n* lines of *output*."""
+        clean = strip_terminal_escapes(output)
         tail = "\n".join(clean.split("\n")[-n:])
         return hashlib.md5(tail.encode()).hexdigest()
 
@@ -594,8 +603,10 @@ class ClaudeCodeProvider(BaseProvider):
 
         # Handle startup prompts (bypass permissions + workspace trust).
         # Pass the resolved timeout as the outer cap so a containerized profile's
-        # longer init budget also governs the startup-prompt handler.
-        self._handle_startup_prompts(outer_timeout=init_timeout)
+        # longer init budget also governs the startup-prompt handler. The handler
+        # polls a synchronous terminal backend and sleeps between frames, so keep
+        # it off the async server loop.
+        await asyncio.to_thread(self._handle_startup_prompts, outer_timeout=init_timeout)
 
         # Wait for Claude Code prompt to be ready.
         # Accept both IDLE and COMPLETED — some CLI versions show a startup
@@ -640,8 +651,11 @@ class ClaudeCodeProvider(BaseProvider):
         previous: Optional[str] = None
         while time.monotonic() < deadline:
             try:
-                current = get_backend().get_history(
-                    self.session_name, self.window_name, tail_lines=40
+                current = await asyncio.to_thread(
+                    get_backend().get_history,
+                    self.session_name,
+                    self.window_name,
+                    tail_lines=40,
                 )
             except Exception as exc:  # backend hiccup: don't fail init for the gate
                 logger.warning("input-ready settle check capture failed: %s", exc)
@@ -688,6 +702,19 @@ class ClaudeCodeProvider(BaseProvider):
         # skip buffer reads. Tmux returns None -- falls through to buffer analysis.
         native = self._resolve_native_status(output)
         if native is not None:
+            # Herdr's process-derived state can lag the rendered Claude TUI.
+            # After the normal 10s flush window, a visibly settled response or
+            # an active approval picker is stronger evidence than a native
+            # state stuck at processing/done. Do not consult the pane during
+            # initial startup or the flush window: that preserves the shared
+            # native lifecycle and avoids reusing pre-dispatch screen content.
+            elapsed_since_dispatch = (
+                time.time() - self._last_dispatch_time if self._task_dispatched else 0.0
+            )
+            if self._task_dispatched and elapsed_since_dispatch >= 10.0:
+                visible_override = self._visible_status_override(output, native)
+                if visible_override is not None:
+                    return visible_override
             return native
 
         # herdr never pushes a buffer (pipe_pane is a no-op there); read live
@@ -929,6 +956,49 @@ class ClaudeCodeProvider(BaseProvider):
 
         return TerminalStatus.UNKNOWN
 
+    def _visible_status_override(
+        self,
+        _output: str,
+        native: TerminalStatus,
+    ) -> Optional[TerminalStatus]:
+        """Return a stronger current-screen status for a stale Herdr state.
+
+        Only explicit interactive prompts and settled completed turns override.
+        An unchanged pre-dispatch frame, a live spinner, or an unrecognized
+        screen keeps the native result. Always capture the current Herdr pane:
+        its push buffer can contain a non-empty startup frame indefinitely.
+        """
+        if native not in (
+            TerminalStatus.IDLE,
+            TerminalStatus.PROCESSING,
+            TerminalStatus.COMPLETED,
+        ):
+            return None
+
+        try:
+            visible_output = get_backend().get_history(self.session_name, self.window_name)
+        except Exception:
+            logger.debug(
+                "live status override capture failed for %s",
+                self.terminal_id,
+                exc_info=True,
+            )
+            return None
+        if not isinstance(visible_output, str) or not visible_output.strip():
+            return None
+        clean = strip_terminal_escapes(visible_output)
+        visible = self.get_status_from_screen(clean.splitlines())
+        if visible == TerminalStatus.WAITING_USER_ANSWER:
+            return visible
+        if visible != TerminalStatus.COMPLETED:
+            return None
+
+        if self._input_generation > 0 and self._snapshot_tail_hash is not None:
+            if self._tail_hash(clean, self._TAIL_HASH_LINES) == self._snapshot_tail_hash:
+                return None
+
+        return TerminalStatus.COMPLETED
+
     # Opt in to pyte rendered-screen detection (gated by CAO_PYTE_STATUS). The
     # detector below is tuned for a COMPOSITED viewport, not the raw stream.
     supports_screen_detection = True
@@ -1041,6 +1111,11 @@ class ClaudeCodeProvider(BaseProvider):
         """
         return self._initialized
 
+    @property
+    def is_input_ready(self) -> bool:
+        """Do not let inbox delivery race Claude's settling Ink input box."""
+        return self._initialized
+
     def mark_input_received(self) -> None:
         """Capture content-based snapshots for the staleness guard (issue #407).
 
@@ -1065,12 +1140,12 @@ class ClaudeCodeProvider(BaseProvider):
     _SOL_IDLE_RE = re.compile(r"^\s*(?:\x1b\[[0-9;]*m)*[>❯](?:\x1b\[[0-9;]*m)*[\s\xa0]")
 
     def extract_last_message_from_script(self, script_output: str) -> str:
-        """Extract Claude's final response message using the ⏺/● response marker."""
+        """Extract Claude's final response, including newest-TUI boxless turns."""
         # Find all matches of the response pattern (legacy ⏺ or newest-TUI ●).
         matches = list(re.finditer(EXTRACTION_RESPONSE_PATTERN, script_output))
 
         if not matches:
-            raise ValueError("No Claude Code response found - no ⏺/● pattern detected")
+            return self._extract_boxless_completed_response(script_output)
 
         # Get the last match (final answer)
         last_match = matches[-1]
@@ -1122,6 +1197,61 @@ class ClaudeCodeProvider(BaseProvider):
         # Remove ANSI codes from the final message
         final_answer = re.sub(ANSI_CODE_PATTERN, "", final_answer)
         return final_answer.strip()
+
+    def _extract_boxless_completed_response(self, script_output: str) -> str:
+        """Extract a bounded newest-TUI turn that has no ``⏺``/``●`` marker.
+
+        The fallback is intentionally strict: it requires a non-empty newest-TUI
+        ``❯`` query when one remains visible, a later completion-summary line,
+        and a settled boxed empty prompt after that summary. When a long response
+        has scrolled its query out of Herdr's fixed viewport, an indented visible
+        response tail may start at the viewport boundary instead. This excludes
+        startup chrome, active approval dialogs, and incomplete turns.
+        """
+        clean = strip_terminal_escapes(script_output)
+        completion_matches = list(re.finditer(COMPLETION_SUMMARY_PATTERN, clean))
+        if not completion_matches:
+            raise ValueError("No Claude Code response found - no ⏺/● pattern detected")
+        completion = completion_matches[-1]
+
+        after_completion = clean[completion.end() :]
+        if SETTLED_NEW_TUI_BOX_PATTERN.search(after_completion) is None:
+            raise ValueError("No Claude Code response found - incomplete boxless turn")
+
+        query_matches = [
+            match
+            for match in re.finditer(r"^[ \t]*❯[ \t\xa0]+\S.*$", clean, re.MULTILINE)
+            if match.end() <= completion.start()
+        ]
+        if query_matches:
+            candidate_start = query_matches[-1].end()
+        else:
+            candidate_start = completion_matches[-2].end() if len(completion_matches) > 1 else 0
+            visible_tail = clean[candidate_start : completion.start()]
+            if re.search(r"^[ \t]{2,}\S", visible_tail, re.MULTILINE) is None:
+                raise ValueError("No Claude Code response found - no boxless query boundary")
+
+        candidate = clean[candidate_start : completion.start()]
+        response_lines: List[str] = []
+        for line in candidate.splitlines():
+            stripped = line.strip()
+            if (
+                re.fullmatch(r"─{8,}", stripped)
+                or EFFORT_FOOTER_LINE_PATTERN.match(stripped)
+                or re.search(NEW_TUI_SPINNER_PATTERN, stripped)
+                or stripped.startswith("⎿")
+            ):
+                continue
+            response_lines.append(stripped)
+
+        while response_lines and not response_lines[0]:
+            response_lines.pop(0)
+        while response_lines and not response_lines[-1]:
+            response_lines.pop()
+        if not response_lines or not any(response_lines):
+            raise ValueError("No Claude Code response found - empty boxless response")
+
+        return "\n".join(response_lines).strip()
 
     def exit_cli(self) -> str:
         """Get the command to exit Claude Code."""

@@ -156,8 +156,6 @@ class FifoManager:
         """
         fifo_path = FIFO_DIR / f"{terminal_id}.fifo"
 
-        enroll = pane_probe is not None and rearm is not None
-
         with self._lock:
             if terminal_id in self._readers:
                 return
@@ -180,12 +178,12 @@ class FifoManager:
             self._last_data_at[terminal_id] = now
             self._registered_at[terminal_id] = now
             self._ever_delivered[terminal_id] = False
-            if enroll:
+            if pane_probe is not None and rearm is not None:
                 self._pane_probe[terminal_id] = pane_probe
                 self._rearm[terminal_id] = rearm
             thread.start()
 
-        if enroll:
+        if pane_probe is not None and rearm is not None:
             self._ensure_watchdog()
 
         logger.info("Started FIFO reader for terminal %s", terminal_id)

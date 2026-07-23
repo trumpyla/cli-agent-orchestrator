@@ -118,6 +118,20 @@ class TestGetSession:
         assert len(result["terminals"]) == 1
         mock_get_backend.return_value.session_exists.assert_called_once_with("cao-test")
 
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_get_session_normalizes_unprefixed_name(self, mock_get_backend, mock_list_terminals):
+        """Public session lookup accepts an alias but resolves the canonical CAO name."""
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-review"}]
+        mock_list_terminals.return_value = []
+
+        result = get_session("review")
+
+        assert result["session"]["id"] == "cao-review"
+        mock_get_backend.return_value.session_exists.assert_called_once_with("cao-review")
+        mock_list_terminals.assert_called_once_with("cao-review")
+
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
@@ -202,6 +216,40 @@ class TestDeleteSession:
         assert mock_delete_terminal.call_count == 2
         mock_delete_terminal.assert_any_call("terminal1", registry=ANY)
         mock_delete_terminal.assert_any_call("terminal2", registry=ANY)
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_normalizes_unprefixed_name(
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+    ):
+        """Shutdown by the requested alias deletes the canonical backend session."""
+        mock_get_backend.return_value.session_exists.return_value = True
+        mock_list_terminals.return_value = []
+
+        result = delete_session("review")
+
+        assert result == {"deleted": ["cao-review"], "errors": []}
+        mock_get_backend.return_value.session_exists.assert_called_once_with("cao-review")
+        mock_get_backend.return_value.kill_session.assert_called_once_with("cao-review")
+        mock_list_terminals.assert_called_once_with("cao-review")
+        mock_delete_terminal.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.services.session_service.get_backend")
+    def test_delete_session_rejects_absent_session(
+        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+    ):
+        """A missing backend session with no persisted terminals is not a successful delete."""
+        mock_get_backend.return_value.session_exists.return_value = False
+        mock_list_terminals.return_value = []
+
+        with pytest.raises(ValueError, match="Session 'cao-missing' not found"):
+            delete_session("missing")
+
+        mock_get_backend.return_value.kill_session.assert_not_called()
+        mock_delete_terminal.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")

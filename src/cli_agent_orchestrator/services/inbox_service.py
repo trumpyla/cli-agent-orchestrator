@@ -82,6 +82,21 @@ class InboxService:
         if not messages:
             return
 
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except ValueError:
+            # Legacy/recovery paths can have a live terminal without an
+            # in-process provider instance. Preserve their existing delivery
+            # behavior; the startup race guard applies when the launching
+            # provider is registered and can report readiness.
+            provider = None
+        if provider is not None and not getattr(provider, "is_input_ready", True):
+            # A status detector can briefly report IDLE while a full-screen TUI
+            # is still mounting. Leave the durable row PENDING so the reconcile
+            # sweep retries after provider initialization instead of losing the
+            # first prompt inside an unready widget.
+            return
+
         status = status_monitor.get_status(terminal_id)
         if status not in (TerminalStatus.IDLE, TerminalStatus.COMPLETED):
             # Not ready on the normal path. Eager delivery (#251) lets providers
@@ -92,7 +107,6 @@ class InboxService:
                 TerminalStatus.PROCESSING,
                 TerminalStatus.WAITING_USER_ANSWER,
             ):
-                provider = provider_manager.get_provider(terminal_id)
                 eager_eligible = provider is not None and getattr(
                     provider, "accepts_input_while_processing", False
                 )

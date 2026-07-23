@@ -30,7 +30,7 @@ import re
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Union
 
-import jsonschema  # type: ignore[import-untyped]  # no bundled stubs; meta-schema API is stable
+import jsonschema
 import yaml
 from pydantic import BaseModel, Field, model_validator
 

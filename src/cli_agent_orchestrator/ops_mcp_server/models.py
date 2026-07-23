@@ -58,10 +58,19 @@ class SendMessageResult(BaseModel):
     terminal_id: str = Field(description="The target terminal ID")
 
 
+class TerminalControlResult(BaseModel):
+    """Result for direct operator input or key controls."""
+
+    success: bool = Field(description="Whether the terminal control succeeded")
+    message: str = Field(description="A message describing the control result")
+    terminal_id: str = Field(description="The target terminal ID")
+
+
 __all__ = [
     "InstallResult",
     "LaunchResult",
     "ProfileListResult",
     "SendMessageResult",
     "SessionListResult",
+    "TerminalControlResult",
 ]

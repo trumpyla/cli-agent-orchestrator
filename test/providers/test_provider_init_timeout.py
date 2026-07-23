@@ -406,6 +406,7 @@ class TestAntigravityInitTimeoutWiring:
     """
 
     @pytest.mark.asyncio
+    @patch.object(AntigravityCliProvider, "wait_until_input_ready", return_value=True)
     @patch.object(AntigravityCliProvider, "_handle_startup_dialog")
     @patch(f"{_AGY}.load_agent_profile")
     @patch(f"{_AGY}.wait_for_shell")
@@ -420,6 +421,7 @@ class TestAntigravityInitTimeoutWiring:
         mock_wait_shell,
         mock_load,
         mock_handle,
+        mock_wait_ready,
     ):
         """provider_init_timeout=200 (> the 180s default) reaches both waits."""
         mock_wait_shell.return_value = True
@@ -432,8 +434,10 @@ class TestAntigravityInitTimeoutWiring:
         assert result is True
         assert mock_handle.call_args.kwargs["outer_timeout"] == 200
         assert mock_wait_status.call_args.kwargs["timeout"] == 200
+        mock_wait_ready.assert_awaited_once_with(timeout=200)
 
     @pytest.mark.asyncio
+    @patch.object(AntigravityCliProvider, "wait_until_input_ready", return_value=True)
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
     @patch.object(AntigravityCliProvider, "_handle_startup_dialog")
     @patch(f"{_AGY}.wait_for_shell")
@@ -448,6 +452,7 @@ class TestAntigravityInitTimeoutWiring:
         mock_wait_shell,
         mock_handle,
         mock_settings,
+        mock_wait_ready,
     ):
         """No agent profile -> the 180s agy-specific floor wins over the 60s server default."""
         mock_wait_shell.return_value = True
@@ -459,3 +464,4 @@ class TestAntigravityInitTimeoutWiring:
         assert result is True
         assert mock_handle.call_args.kwargs["outer_timeout"] == 180.0
         assert mock_wait_status.call_args.kwargs["timeout"] == 180.0
+        mock_wait_ready.assert_awaited_once_with(timeout=180.0)

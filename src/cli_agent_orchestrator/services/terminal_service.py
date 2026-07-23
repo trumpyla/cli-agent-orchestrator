@@ -40,7 +40,6 @@ from cli_agent_orchestrator.clients.database import (
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
     PIPE_LIVENESS_TAIL_LINES,
-    SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -215,9 +214,11 @@ async def create_terminal(
 
         # Step 2: Create tmux session or window
         if new_session:
-            # Ensure session name has the CAO prefix for identification
-            if not session_name.startswith(SESSION_PREFIX):
-                session_name = f"{SESSION_PREFIX}{session_name}"
+            # Backends and persistence always use the canonical CAO-prefixed
+            # identity, even when a public caller supplied an unprefixed alias.
+            from cli_agent_orchestrator.utils.terminal import normalize_session_name
+
+            session_name = normalize_session_name(session_name)
 
             # Prevent duplicate sessions
             if get_backend().session_exists(session_name):

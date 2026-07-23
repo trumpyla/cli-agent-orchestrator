@@ -49,6 +49,18 @@ class TestGetTemplateSchema:
         schema = get_template_schema("aws/nonexistent")
         assert schema is None
 
+    def test_rejects_non_object_schema_root(self, tmp_path: Path, monkeypatch):
+        template_dir = tmp_path / "aws" / "invalid"
+        template_dir.mkdir(parents=True)
+        (template_dir / "schema.json").write_text("[]", encoding="utf-8")
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.agent_scaffold._TEMPLATES_ROOT",
+            tmp_path,
+        )
+
+        with pytest.raises(ValueError, match="JSON object"):
+            get_template_schema("aws/invalid")
+
 
 class TestValidateConfig:
     def test_valid_config(self):

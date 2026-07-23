@@ -39,6 +39,7 @@ presence of ``? for shortcuts`` means IDLE / COMPLETED (split on a turn
 counter, since the TUI looks identical in both states).
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -363,10 +364,11 @@ class AntigravityCliProvider(BaseProvider):
             command, args = resolve_cao_mcp_command(
                 cfg.get("command", ""), cfg.get("args", []) or [], persisted=True
             )
-            entry: dict = {
-                "command": command,
-                "args": args,
-            }
+            # Preserve provider-supported options such as type/timeout while
+            # replacing only the runtime fields CAO resolves for this launch.
+            entry: dict = dict(cfg)
+            entry["command"] = command
+            entry["args"] = args
             env = dict(cfg.get("env", {}))
             env["CAO_TERMINAL_ID"] = self.terminal_id
             entry["env"] = env
@@ -517,7 +519,10 @@ class AntigravityCliProvider(BaseProvider):
 
         # Accept the workspace-trust dialog if agy shows one (first launch in an
         # untrusted cwd). Unanswered it blocks init — the picker never reads IDLE.
-        self._handle_startup_dialog(outer_timeout=max(default_ready_timeout, init_timeout))
+        await asyncio.to_thread(
+            self._handle_startup_dialog,
+            outer_timeout=max(default_ready_timeout, init_timeout),
+        )
 
         # agy startup + first MCP connection + the -i acknowledgment can take
         # a while.
@@ -531,8 +536,63 @@ class AntigravityCliProvider(BaseProvider):
                 f"Antigravity CLI initialization timed out after {ready_timeout} seconds"
             )
 
+        if not await self.wait_until_input_ready(timeout=ready_timeout):
+            raise TimeoutError(
+                f"Antigravity CLI input surface did not settle after {ready_timeout} seconds"
+            )
+
         self._initialized = True
         return True
+
+    async def wait_until_input_ready(
+        self,
+        timeout: float = 5.0,
+        poll_interval: float = 0.5,
+    ) -> bool:
+        """Require two identical rendered captures of Agy's interactive prompt.
+
+        Agy can briefly report IDLE while the ``-i`` acknowledgement is still
+        painting. Input sent in that gap is accepted by the PTY but dropped by
+        the TUI. A stable ready footer plus empty prompt proves the input widget
+        has finished mounting.
+        """
+        deadline = time.monotonic() + timeout
+        previous: Optional[str] = None
+        while time.monotonic() < deadline:
+            try:
+                backend = get_backend()
+                current = await asyncio.to_thread(
+                    backend.get_history,
+                    self.session_name,
+                    self.window_name,
+                    tail_lines=40,
+                )
+            except Exception as exc:
+                logger.warning("Antigravity input-ready capture failed: %s", exc)
+                return False
+
+            clean = strip_terminal_escapes(current or "")
+            ready = bool(
+                re.search(IDLE_FOOTER_PATTERN, clean)
+                and re.search(IDLE_PROMPT_PATTERN, clean, re.MULTILINE)
+            )
+            if ready and previous == clean:
+                return True
+
+            previous = clean
+            await asyncio.sleep(poll_interval)
+
+        logger.warning(
+            "Antigravity input surface did not settle within %.1fs for %s",
+            timeout,
+            self.terminal_id,
+        )
+        return False
+
+    @property
+    def is_input_ready(self) -> bool:
+        """Do not let inbox delivery race Agy's startup acknowledgement."""
+        return self._initialized
 
     # ------------------------------------------------------------------ #
     # Status detection

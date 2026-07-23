@@ -6,7 +6,7 @@ Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/340
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 
 import click
 import frontmatter
@@ -26,12 +26,15 @@ for _tools in ROLE_TOOL_DEFAULTS.values():
     _VALID_TOOL_VOCAB.update(_tools)
 
 
-def _load_schema() -> dict:
+def _load_schema() -> dict[str, Any]:
     """Load the agent profile JSON-Schema from package resources."""
     schema_path = (
         Path(__file__).resolve().parent.parent.parent / "schemas" / "agent_profile.schema.json"
     )
-    return json.loads(schema_path.read_text(encoding="utf-8"))
+    value = json.loads(schema_path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ValueError("Agent profile schema root must be a JSON object")
+    return cast(dict[str, Any], value)
 
 
 def _resolve_profile_path(name_or_path: str) -> Optional[Path]:
@@ -83,7 +86,7 @@ def _read_profile_text(name_or_path: str) -> Optional[str]:
         return None
 
 
-def _validate_frontmatter(metadata: dict) -> list[str]:
+def _validate_frontmatter(metadata: dict[str, Any]) -> list[str]:
     """Validate frontmatter dict against schema and CAO conventions.
 
     Returns a list of error/warning messages (empty = valid).
@@ -167,9 +170,10 @@ def show_cmd(name_or_path: str):
         profile_text = path.read_text(encoding="utf-8")
         source_display = str(path)
     else:
-        profile_text = _read_profile_text(name_or_path)
-        if profile_text is None:
+        resolved_text = _read_profile_text(name_or_path)
+        if resolved_text is None:
             raise click.ClickException(f"Profile '{name_or_path}' not found.")
+        profile_text = resolved_text
         source_display = f"{name_or_path} (built-in/provider)"
 
     try:
@@ -221,9 +225,10 @@ def validate_cmd(name_or_path: str):
     if path is not None:
         profile_text = path.read_text(encoding="utf-8")
     else:
-        profile_text = _read_profile_text(name_or_path)
-        if profile_text is None:
+        resolved_text = _read_profile_text(name_or_path)
+        if resolved_text is None:
             raise click.ClickException(f"Profile '{name_or_path}' not found.")
+        profile_text = resolved_text
 
     try:
         post = frontmatter.loads(profile_text)

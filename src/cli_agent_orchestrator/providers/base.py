@@ -205,6 +205,17 @@ class BaseProvider(ABC):
         return True
 
     @property
+    def is_input_ready(self) -> bool:
+        """Whether durable inbox delivery may type into this provider now.
+
+        Most providers complete initialization before the session-create call
+        returns, so the default is ready. Full-screen TUIs with an asynchronous
+        startup surface override this and expose their initialization latch;
+        the inbox service checks it before changing a row from PENDING.
+        """
+        return True
+
+    @property
     def accepts_input_while_processing(self) -> bool:
         """Whether this provider buffers pasted input during PROCESSING for next-turn pickup.
 

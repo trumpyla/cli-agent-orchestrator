@@ -1219,6 +1219,70 @@ class TestGetOutput:
 
         assert result == "last message"
 
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_extracts_boxless_claude_turn(
+        self, mock_get_metadata, mock_backend, mock_status_monitor, mock_pm
+    ):
+        """mode=last returns newest-TUI prose instead of a false NO RESPONSE."""
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "reviewer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = ""
+        boxless = (
+            "❯ Review the change\n"
+            "The repaired bridge is ready for another review.\n"
+            "✻ Worked for 4s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        mock_backend.get_history.return_value = boxless
+        mock_pm.get_provider.return_value = ClaudeCodeProvider(
+            "test1234", "cao-session", "reviewer-abcd"
+        )
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        assert result == "The repaired bridge is ready for another review."
+        assert not result.startswith("[NO RESPONSE")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_last_extracts_visible_tail_after_query_scrolls_out(
+        self, mock_get_metadata, mock_backend, mock_status_monitor, mock_pm
+    ):
+        """Long Herdr output returns the completed visible tail, not NO RESPONSE."""
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "reviewer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = "stale startup buffer"
+        box = "─" * 40
+        completed_viewport = (
+            '  {"verdict":"approve","findings":[]}\n'
+            "  No blocking findings remain.\n"
+            "✻ Churned for 6m 18s\n"
+            f"{box} claude_max ──\n"
+            "❯\n"
+            f"{box}\n"
+        )
+        mock_backend.get_history.return_value = completed_viewport
+        mock_pm.get_provider.return_value = ClaudeCodeProvider(
+            "test1234", "cao-session", "reviewer-abcd"
+        )
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        assert '{"verdict":"approve","findings":[]}' in result
+        assert not result.startswith("[NO RESPONSE")
+
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_output_not_found(self, mock_get_metadata):
         """Test getting output from non-existent terminal."""

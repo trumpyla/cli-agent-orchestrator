@@ -1309,7 +1309,9 @@ async def agui_run(
 
     Accepts a RunAgentInput body (camelCase) and streams lifecycle-legal SSE
     frames using the official ag-ui-protocol EventEncoder. Each frame is a
-    ``data:`` line containing camelCase JSON with a ``type`` field.
+    ``data:`` line containing JSON with a ``type`` field. Official run events
+    use SDK camelCase aliases; CAO projection events preserve their documented
+    snake_case correlation keys.
 
     When ``resume[]`` is non-empty, ``cao:write`` is required (the caller is
     mutating interrupt state). Otherwise ``cao:read`` is the floor.

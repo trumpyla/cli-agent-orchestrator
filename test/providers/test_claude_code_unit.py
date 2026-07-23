@@ -4,7 +4,7 @@ import json
 import shlex
 import time
 from pathlib import Path
-from unittest.mock import MagicMock, mock_open, patch
+from unittest.mock import AsyncMock, MagicMock, mock_open, patch
 
 import pytest
 
@@ -15,6 +15,7 @@ from cli_agent_orchestrator.models.agent_profile import (
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider, ProviderError
+from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 
 @pytest.fixture(autouse=True)
@@ -75,6 +76,31 @@ class TestClaudeCodeProviderInitialization:
         assert provider._initialized is True
         mock_wait_shell.assert_called_once()
         mock_tmux.send_keys.assert_called_once()
+
+    @pytest.mark.asyncio
+    @_PATCH_SETTINGS
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.claude_code.wait_until_status")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_initialize_offloads_startup_prompt_handler(
+        self, mock_backend, mock_wait_status, mock_wait_shell, _
+    ):
+        """Startup prompt polling must not monopolize the async server loop."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        handler = MagicMock()
+        to_thread = AsyncMock(side_effect=lambda func, *args, **kwargs: func(*args, **kwargs))
+
+        with (
+            patch.object(provider, "_handle_startup_prompts", handler),
+            patch.object(provider, "wait_until_input_ready", AsyncMock(return_value=True)),
+            patch("cli_agent_orchestrator.providers.claude_code.asyncio.to_thread", to_thread),
+        ):
+            assert await provider.initialize() is True
+
+        assert to_thread.await_count == 1
+        assert to_thread.await_args.args[0] == handler
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
@@ -1044,6 +1070,96 @@ class TestClaudeCodeProviderNativeStatus:
         assert provider._idle_first_detected == 0.0
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_native_processing_yields_to_stable_visible_completion(self, mock_backend):
+        """A stale Herdr processing state must not mask a settled completed TUI forever."""
+        completed = (
+            "❯ Review the change\n"
+            "● The review is complete.\n"
+            "✻ Worked for 3s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        mock_backend.get_native_status.return_value = TerminalStatus.PROCESSING
+        mock_backend.get_history.return_value = completed
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._task_dispatched = True
+        provider._last_dispatch_time = time.time() - 20.0
+
+        assert provider.get_status("") == TerminalStatus.COMPLETED
+        mock_backend.get_history.assert_called_once()
+
+    def test_tail_hash_normalizes_non_sgr_terminal_escapes(self):
+        """Snapshot and live-pane hashes must represent the same visible frame."""
+        raw = "previous frame\x1b[2K\rsettled response\n❯ "
+        normalized = strip_terminal_escapes(raw)
+
+        assert ClaudeCodeProvider._tail_hash(raw) == ClaudeCodeProvider._tail_hash(normalized)
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_native_processing_ignores_stale_nonempty_push_buffer(self, mock_backend):
+        """The Herdr override must inspect the live pane, not a stale pushed buffer.
+
+        A non-empty StatusMonitor buffer can survive backend/provider setup even
+        though Herdr does not stream subsequent TUI redraws into it. Reusing that
+        buffer pins a visibly completed terminal at PROCESSING forever.
+        """
+        box = "─" * 40
+        completed_viewport = (
+            "  final review evidence\n"
+            "✻ Churned for 6m 18s\n"
+            f"{box} claude_max ──\n"
+            "❯\n"
+            f"{box}\n"
+            "  ⏵⏵ accept edits on\n"
+        )
+        mock_backend.get_native_status.return_value = TerminalStatus.PROCESSING
+        mock_backend.get_history.return_value = completed_viewport
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._task_dispatched = True
+        provider._last_dispatch_time = time.time() - 400.0
+
+        assert provider.get_status("stale startup buffer") == TerminalStatus.COMPLETED
+        mock_backend.get_history.assert_called_once_with("test-session", "window-0")
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_native_processing_does_not_reuse_unchanged_pre_dispatch_screen(self, mock_backend):
+        """The prior completed frame is not completion evidence for a newly sent turn."""
+        completed = (
+            "❯ Previous task\n"
+            "● Previous answer.\n"
+            "✻ Worked for 3s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        mock_backend.get_native_status.return_value = TerminalStatus.PROCESSING
+        mock_backend.get_history.return_value = completed
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._task_dispatched = True
+        provider._last_dispatch_time = time.time() - 20.0
+        provider._input_generation = 1
+        provider._snapshot_tail_hash = provider._tail_hash(completed, provider._TAIL_HASH_LINES)
+
+        assert provider.get_status("") == TerminalStatus.PROCESSING
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    def test_native_completed_yields_to_visible_approval_prompt(self, mock_backend):
+        """A live security picker is authoritative over a stale native done state."""
+        approval = (
+            "Do you want to allow this tool?\n"
+            "❯ 1. Allow once\n"
+            "  2. Reject\n"
+            "↑/↓ to navigate · Enter to select\n"
+        )
+        mock_backend.get_native_status.return_value = TerminalStatus.COMPLETED
+        mock_backend.get_history.return_value = approval
+
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider._task_dispatched = True
+        provider._last_dispatch_time = time.time() - 20.0
+        provider._done_first_detected = time.time() - 11.0
+
+        assert provider.get_status("") == TerminalStatus.WAITING_USER_ANSWER
+
+    @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_native_waiting_user_answer_skips_buffer(self, mock_backend):
         """When native returns WAITING_USER_ANSWER, get_history is not called."""
         mock_backend.get_native_status.return_value = TerminalStatus.WAITING_USER_ANSWER
@@ -1152,6 +1268,7 @@ class TestClaudeCodeProviderNativeStatus:
     def test_native_idle_task_dispatched_5min_timeout_returns_completed(self, mock_backend):
         """Native idle + task dispatched: >5 min since dispatch -> COMPLETED (give up)."""
         mock_backend.get_native_status.return_value = TerminalStatus.IDLE
+        mock_backend.get_history.return_value = ""
 
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         provider._task_dispatched = True
@@ -1161,7 +1278,7 @@ class TestClaudeCodeProviderNativeStatus:
         result = provider.get_status("")
 
         assert result == TerminalStatus.COMPLETED
-        mock_backend.get_history.assert_not_called()
+        mock_backend.get_history.assert_called_once_with("test-session", "window-0")
 
     @patch("cli_agent_orchestrator.backends.registry._backend")
     def test_mark_input_received_resets_detection_flags(self, mock_backend):
@@ -1210,6 +1327,74 @@ that spans multiple lines
         """Test extraction with no response pattern."""
         output = """Some content without response
 > """
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        with pytest.raises(ValueError, match="No Claude Code response found"):
+            provider.extract_last_message_from_script(output)
+
+    def test_extract_boxless_new_tui_response(self):
+        """Newest Claude can render response prose without a leading response glyph."""
+        output = (
+            "❯ Review the OpenSpec configuration\n\n"
+            "The configuration now separates the external and in-session planes.\n"
+            "No blocking authorization issue remains.\n\n"
+            "✻ Worked for 12s\n\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n● high · /effort\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        result = provider.extract_last_message_from_script(output)
+
+        assert result == (
+            "The configuration now separates the external and in-session planes.\n"
+            "No blocking authorization issue remains."
+        )
+
+    def test_extract_boxless_response_uses_latest_completed_turn(self):
+        """The fallback is bounded to the last query/completion pair."""
+        output = (
+            "❯ First task\nOld response\n✻ Worked for 1s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+            "❯ Second task\nLatest response only.\n✻ Worked for 2s\n"
+            + "─" * 32
+            + "\n❯ \n"
+            + "─" * 32
+            + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        result = provider.extract_last_message_from_script(output)
+
+        assert result == "Latest response only."
+
+    def test_extract_boxless_response_tail_when_query_scrolled_out(self):
+        """A long Herdr review still returns its visible tail after the query evicts."""
+        box = "─" * 40
+        output = (
+            "  resolved command/args and preserved the existing environment.\n"
+            '  {"verdict":"approve","findings":[]}\n'
+            "  No blocking findings remain.\n\n"
+            "✻ Churned for 6m 18s\n"
+            f"{box} claude_max ──\n"
+            "❯ Apply the F1 fix to antigravity_cli.py\n"
+            f"{box}\n"
+            "  ⏵⏵ accept edits on\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+
+        result = provider.extract_last_message_from_script(output)
+
+        assert '{"verdict":"approve","findings":[]}' in result
+        assert "No blocking findings remain." in result
+        assert "Churned for" not in result
+
+    @pytest.mark.parametrize(
+        "output",
+        [
+            "Antigravity banner\n✻ Worked for 1s\n────────────────────\n❯ \n",
+            "❯ Run a tool\nDo you want to allow this tool?\n↑/↓ to navigate\n",
+        ],
+    )
+    def test_extract_boxless_response_rejects_incomplete_or_interactive_frames(self, output):
+        """Startup chrome and active pickers are never fabricated into answers."""
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
 
         with pytest.raises(ValueError, match="No Claude Code response found"):
@@ -2266,6 +2451,19 @@ class TestWaitUntilInputReady:
         provider = ClaudeCodeProvider("t1", "sess", "win")
         assert await provider.wait_until_input_ready(timeout=3.0) is True
         assert mock_tmux.get_history.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    async def test_backend_capture_is_offloaded(self, mock_tmux):
+        """A slow terminal capture must not block the orchestrator event loop."""
+        mock_tmux.get_history.side_effect = [self.BOX, self.BOX]
+        to_thread = AsyncMock(side_effect=lambda func, *args, **kwargs: func(*args, **kwargs))
+        provider = ClaudeCodeProvider("t1-thread", "sess", "win")
+
+        with patch("cli_agent_orchestrator.providers.claude_code.asyncio.to_thread", to_thread):
+            assert await provider.wait_until_input_ready(timeout=3.0) is True
+
+        assert to_thread.await_count == 2
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.backends.registry._backend")

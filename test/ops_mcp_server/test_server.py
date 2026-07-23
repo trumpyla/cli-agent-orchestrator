@@ -12,6 +12,7 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     ProfileListResult,
     SendMessageResult,
     SessionListResult,
+    TerminalControlResult,
 )
 from cli_agent_orchestrator.ops_mcp_server.server import (
     _launch_session_impl,
@@ -25,6 +26,8 @@ from cli_agent_orchestrator.ops_mcp_server.server import (
     list_sessions,
     main,
     send_session_message,
+    send_terminal_input,
+    send_terminal_key,
     shutdown_session,
 )
 
@@ -288,7 +291,9 @@ class TestSessionLifecycleTools:
             ),
             patch(
                 "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-                return_value=_response(json_data={"id": "term-123"}),
+                return_value=_response(
+                    json_data={"id": "term-123", "session_name": "cao-generated"}
+                ),
             ) as mock_request,
         ):
             result = await _launch_session_impl(
@@ -318,7 +323,9 @@ class TestSessionLifecycleTools:
         with (
             patch(
                 "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-                return_value=_response(json_data={"id": "term-456"}),
+                return_value=_response(
+                    json_data={"id": "term-456", "session_name": "cao-custom-session"}
+                ),
             ) as mock_request,
         ):
             result = await launch_session(
@@ -330,8 +337,8 @@ class TestSessionLifecycleTools:
 
         assert result == LaunchResult(
             success=True,
-            message="Session 'custom-session' launched successfully",
-            session_name="custom-session",
+            message="Session 'cao-custom-session' launched successfully",
+            session_name="cao-custom-session",
             terminal_id="term-456",
         )
         mock_request.assert_called_once_with(
@@ -346,6 +353,22 @@ class TestSessionLifecycleTools:
             json=None,
         )
 
+    async def test_launch_session_returns_canonical_name_from_api(self) -> None:
+        """The launch result must identify the actual backend session, not the request alias."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(
+                json_data={"id": "term-789", "session_name": "cao-review-session"}
+            ),
+        ):
+            result = await _launch_session_impl(
+                agent_profile="reviewer",
+                session_name="review-session",
+            )
+
+        assert result.session_name == "cao-review-session"
+        assert result.message == "Session 'cao-review-session' launched successfully"
+
     async def test_launch_session_returns_failure_on_api_error(self) -> None:
         """Session API errors should return failed LaunchResults."""
         with patch(
@@ -357,11 +380,20 @@ class TestSessionLifecycleTools:
         assert result.success is False
         assert result.message == "Launch session failed: server exploded"
 
-    async def test_launch_session_returns_failure_on_missing_id_in_response(self) -> None:
-        """Session payloads without an ``id`` field should be treated as failures."""
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            {"session_name": "cao-generated"},
+            {"id": "term-123"},
+        ],
+    )
+    async def test_launch_session_returns_failure_on_missing_identity_in_response(
+        self, payload
+    ) -> None:
+        """Session payloads must contain both terminal and canonical session identity."""
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            return_value=_response(json_data={"foo": "bar"}),
+            return_value=_response(json_data=payload),
         ):
             result = await _launch_session_impl("developer")
 
@@ -573,10 +605,58 @@ class TestTerminalMonitoringTools:
             result = await get_terminal_status(terminal_id="term-123")
 
         assert result == payload
+
+    async def test_send_terminal_input_routes_through_http_api(self) -> None:
+        """Operator prompt input uses the authenticated HTTP control boundary."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"success": True}),
+        ) as mock_request:
+            result = await send_terminal_input("term-123", "1")
+
+        assert result == TerminalControlResult(
+            success=True,
+            message="Input sent to terminal 'term-123'",
+            terminal_id="term-123",
+        )
         mock_request.assert_called_once_with(
-            "get",
-            "http://127.0.0.1:9889/terminals/term-123",
-            params=None,
+            "post",
+            "http://127.0.0.1:9889/terminals/term-123/input",
+            params={"message": "1"},
+            json=None,
+        )
+
+    async def test_send_terminal_input_surfaces_protected_prompt_conflict(self) -> None:
+        """HTTP 409 remains a tool failure rather than bypassing API policy."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(
+                status_code=409,
+                json_data={"detail": "Terminal is waiting for a protected answer"},
+            ),
+        ):
+            result = await send_terminal_input("term-123", "unsafe")
+
+        assert result.success is False
+        assert "protected answer" in result.message
+
+    async def test_send_terminal_key_routes_through_http_api(self) -> None:
+        """Interactive picker keys are sent through the API's key allowlist."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(json_data={"success": True}),
+        ) as mock_request:
+            result = await send_terminal_key("term-123", "Enter")
+
+        assert result == TerminalControlResult(
+            success=True,
+            message="Key 'Enter' sent to terminal 'term-123'",
+            terminal_id="term-123",
+        )
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/terminals/term-123/key",
+            params={"key": "Enter"},
             json=None,
         )
 

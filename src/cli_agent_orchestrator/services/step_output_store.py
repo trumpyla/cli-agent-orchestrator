@@ -24,7 +24,7 @@ import re
 from collections import OrderedDict
 from typing import Any, Dict, List, Optional, Tuple
 
-import jsonschema  # type: ignore[import-untyped]  # stable Draft 2020-12 API, matches N1
+import jsonschema
 
 from cli_agent_orchestrator.constants import (
     WORKFLOW_NAME_RE,

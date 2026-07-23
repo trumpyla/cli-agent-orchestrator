@@ -7,7 +7,7 @@ Publisher: terminal.{id}.status
 import asyncio
 import logging
 import threading
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Protocol, Tuple
 
 from cli_agent_orchestrator.constants import (
     CAO_PYTE_STATUS,
@@ -17,6 +17,7 @@ from cli_agent_orchestrator.constants import (
     STATE_BUFFER_MAX,
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
+from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
@@ -44,6 +45,15 @@ _STICKY_READY_STATUSES = frozenset(
         TerminalStatus.ERROR,
     }
 )
+
+
+class _Screen(Protocol):
+    @property
+    def display(self) -> List[str]: ...
+
+
+class _Stream(Protocol):
+    def feed(self, chars: str) -> None: ...
 
 
 class StatusMonitor:
@@ -75,7 +85,7 @@ class StatusMonitor:
         # on two edges only — rising (output resumed) and quiescence (output
         # stopped for PYTE_QUIESCENCE_DELAY_S) — never mid-burst, which is what
         # keeps status flap-free.
-        self._screens: Dict[str, Tuple[object, object]] = {}
+        self._screens: Dict[str, Tuple[_Screen, _Stream]] = {}
         self._bursting: Dict[str, bool] = {}
         # Pending quiescence-detect timer handle per terminal (loop.call_later).
         self._quiesce_handle: Dict[str, asyncio.TimerHandle] = {}
@@ -90,7 +100,7 @@ class StatusMonitor:
         # keeps a WEAK reference to tasks created via loop.create_task, so without
         # this a detection task can be garbage-collected mid-run and silently drop
         # a status transition. Tasks remove themselves on completion.
-        self._detect_tasks: set = set()
+        self._detect_tasks: set[asyncio.Task[None]] = set()
 
     async def run(self) -> None:
         """Subscribe to output events and detect status changes.
@@ -240,7 +250,11 @@ class StatusMonitor:
             self._screens[terminal_id] = scr
         scr[1].feed(chunk)
 
-    def _detect_screen(self, terminal_id: str, provider) -> TerminalStatus:
+    def _detect_screen(
+        self,
+        terminal_id: str,
+        provider: Optional[BaseProvider],
+    ) -> TerminalStatus:
         """Detect status from the terminal's composited pyte screen."""
         fallback_buffer: Optional[str] = None
         with self._lock:
@@ -276,7 +290,11 @@ class StatusMonitor:
             logger.exception(f"Error detecting screen status for {terminal_id}")
             return TerminalStatus.UNKNOWN
 
-    def _schedule_screen_detection(self, terminal_id: str, provider) -> None:
+    def _schedule_screen_detection(
+        self,
+        terminal_id: str,
+        provider: Optional[BaseProvider],
+    ) -> None:
         """Edge-debounce detection on the pyte screen.
 
         Rising edge (first chunk after quiet) → detect immediately (catches the
@@ -304,7 +322,11 @@ class StatusMonitor:
 
         self._arm_quiesce_timer(loop, terminal_id, self._on_screen_quiescent, provider)
 
-    def _on_screen_quiescent(self, terminal_id: str, provider) -> None:
+    def _on_screen_quiescent(
+        self,
+        terminal_id: str,
+        provider: Optional[BaseProvider],
+    ) -> None:
         """Quiescence timer fired: output stopped, so the screen has settled.
 
         Fires on the loop; offload the (potentially blocking) screen detection

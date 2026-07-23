@@ -321,6 +321,9 @@ A **peer** is a pane-less inbox receiver that represents an external driving CLI
 conductor (or any worker) can reply *back* to the driver over CAO's own inbox — no file
 polling or terminal scraping. See [Control Planes](control-planes.md) for the cao-ops
 MCP tools (`register_peer` / `receive_messages` / `ack_messages`) that wrap these routes.
+The MCP `receive_messages` tool accepts `wait_seconds` and the same exclusive `after_id`
+cursor as the HTTP route, so a driver can wait for newer messages while retaining older
+pending rows for later acknowledgement.
 
 `peer_id` is a routing identifier, not a per-peer authorization capability. When
 authentication is enabled, `cao:write` is an operator-level scope over every peer inbox;

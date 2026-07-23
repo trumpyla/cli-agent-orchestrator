@@ -18,6 +18,7 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     ProfileListResult,
     SendMessageResult,
     SessionListResult,
+    TerminalControlResult,
 )
 from cli_agent_orchestrator.security.auth import get_local_bearer
 from cli_agent_orchestrator.utils.terminal import generate_session_name
@@ -39,10 +40,12 @@ mcp = FastMCP(
     4. launch_session to start a new CAO session
     5. send_session_message to deliver a prompt to a running terminal
     6. get_terminal_status to poll a worker until it finishes a task
-    7. get_terminal_output to read a worker's result (or review its files/git diff)
-    8. read_session_output to read a terminal's captured output by session name
-    9. get_session_info or list_sessions to monitor overall progress
-    10. shutdown_session to clean up when done
+    7. Use send_terminal_input/send_terminal_key only to operate an interactive
+       prompt or picker; durable work prompts belong in send_session_message
+    8. get_terminal_output to read a worker's result (or review its files/git diff)
+    9. read_session_output to read a terminal's captured output by session name
+    10. get_session_info or list_sessions to monitor overall progress
+    11. shutdown_session to clean up when done
 
     ## Bi-directional bridge (conductor/worker -> driver)
     Register the driving CLI as a pane-less peer so a conductor (or any worker) can
@@ -51,9 +54,10 @@ mcp = FastMCP(
       task so the conductor and its workers know where to reply.
     - The conductor/worker replies with the existing send_message(receiver_id=peer_id,
       message=...); it queues in the peer's inbox (no pane, so it stays pending).
-    - receive_messages(peer_id, wait_seconds=60) is the reliable pattern: it long-polls
-      (pseudo-push) and returns the moment a reply arrives or the timeout expires — works
-      on every MCP client. Then ack_messages(peer_id, message_ids) clears them.
+    - receive_messages(peer_id, wait_seconds=60, after_id=<last seen>) is the reliable
+      pattern: it long-polls (pseudo-push) and returns the moment a newer reply arrives or
+      the timeout expires — works on every MCP client. Then
+      ack_messages(peer_id, message_ids) clears processed rows.
     MCP push is also enabled (resources/subscribe on cao://peers/<id>/inbox -> a body-free
     resources/updated wakeup), but long-poll remains authoritative because not every
     client handles notifications. Re-read the resource after a wake; resubscribe if its
@@ -159,7 +163,11 @@ async def _launch_session_impl(
             terminal_id=None,
         )
 
-    if not isinstance(session_data, dict) or "id" not in session_data:
+    if (
+        not isinstance(session_data, dict)
+        or "id" not in session_data
+        or "session_name" not in session_data
+    ):
         return LaunchResult(
             success=False,
             message="Launch session failed: invalid session response",
@@ -168,10 +176,11 @@ async def _launch_session_impl(
         )
 
     terminal_id = str(session_data["id"])
+    canonical_session_name = str(session_data["session_name"])
     return LaunchResult(
         success=True,
-        message=f"Session '{resolved_session_name}' launched successfully",
-        session_name=resolved_session_name,
+        message=f"Session '{canonical_session_name}' launched successfully",
+        session_name=canonical_session_name,
         terminal_id=terminal_id,
     )
 
@@ -363,6 +372,88 @@ async def send_session_message(
     return SendMessageResult(
         success=True,
         message=f"Message queued for terminal '{terminal_id}'",
+        terminal_id=terminal_id,
+    )
+
+
+@mcp.tool()
+async def send_terminal_input(
+    terminal_id: Annotated[str, Field(description="The terminal ID to control")],
+    message: Annotated[
+        str,
+        Field(
+            description=(
+                "Direct input for the terminal's active interactive prompt. "
+                "Use send_session_message for durable work delivery."
+            )
+        ),
+    ],
+) -> TerminalControlResult:
+    """Send direct operator input through CAO's authenticated HTTP API.
+
+    This is intended for an active approval or selection prompt. It is not
+    durable: callers should use ``send_session_message`` for agent work.
+    """
+    data, error = _request_json(
+        "post",
+        f"/terminals/{terminal_id}/input",
+        params={"message": message},
+        operation=f"Send input to terminal '{terminal_id}'",
+    )
+    if error:
+        return TerminalControlResult(
+            success=False,
+            message=error,
+            terminal_id=terminal_id,
+        )
+    if not isinstance(data, dict) or data.get("success") is not True:
+        return TerminalControlResult(
+            success=False,
+            message="Send terminal input failed: invalid response payload",
+            terminal_id=terminal_id,
+        )
+    return TerminalControlResult(
+        success=True,
+        message=f"Input sent to terminal '{terminal_id}'",
+        terminal_id=terminal_id,
+    )
+
+
+@mcp.tool()
+async def send_terminal_key(
+    terminal_id: Annotated[str, Field(description="The terminal ID to control")],
+    key: Annotated[
+        str,
+        Field(
+            description=(
+                "Allowed interactive key name, such as Enter, Escape, Up, Down, "
+                "Tab, or C-c. The HTTP API enforces the allowlist."
+            )
+        ),
+    ],
+) -> TerminalControlResult:
+    """Send one allowlisted key to an interactive terminal prompt."""
+    data, error = _request_json(
+        "post",
+        f"/terminals/{terminal_id}/key",
+        params={"key": key},
+        operation=f"Send key '{key}' to terminal '{terminal_id}'",
+    )
+    if error:
+        return TerminalControlResult(
+            success=False,
+            message=error,
+            terminal_id=terminal_id,
+        )
+    if not isinstance(data, dict) or data.get("success") is not True:
+        return TerminalControlResult(
+            success=False,
+            message="Send terminal key failed: invalid response payload",
+            terminal_id=terminal_id,
+        )
+    return TerminalControlResult(
+        success=True,
+        message=f"Key '{key}' sent to terminal '{terminal_id}'",
         terminal_id=terminal_id,
     )
 
@@ -693,19 +784,29 @@ async def receive_messages(
             le=120.0,
         ),
     ] = 0.0,
+    after_id: Annotated[
+        Optional[int],
+        Field(
+            description="Exclusive cursor: return only pending messages with id greater than this value",
+            ge=0,
+        ),
+    ] = None,
 ) -> JsonDict:
     """Pull pending conductor/worker->driver messages for a peer (does NOT ack them).
 
     The shipped, client-agnostic lane. With ``wait_seconds>0`` this is **pseudo-push**:
     the server holds the call open until a message lands or the timeout, so a driver
     awaiting a reply gets it with push latency over an ordinary tool call (works on every
-    MCP client). Call ``ack_messages`` with the returned ids once processed, or they will
-    be returned again.
+    MCP client). Pass the highest processed or observed id as ``after_id`` to wait for
+    newer messages without first acknowledging older pending rows. Call ``ack_messages``
+    with returned ids once processed, or they will be returned again to uncursored reads.
 
     Returns:
         Dict with ``messages`` (list) and ``count`` — or a failure dict.
     """
     params: Dict[str, Any] = {"status": "pending", "limit": limit}
+    if after_id is not None:
+        params["after_id"] = after_id
     request_timeout: Optional[float] = None
     if wait_seconds > 0:
         params["wait"] = wait_seconds
