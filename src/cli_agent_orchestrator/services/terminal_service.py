@@ -939,6 +939,7 @@ def send_input(
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
         if provider and _prepare_provider_input:
+            # Class lookup prevents permissive MagicMock providers from synthesizing hooks.
             prepare_input = getattr(type(provider), "prepare_input", None)
             if prepare_input is not None:
                 message = prepare_input(provider, message)

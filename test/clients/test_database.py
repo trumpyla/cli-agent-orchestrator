@@ -1,6 +1,7 @@
 """Tests for the database client."""
 
 import tempfile
+from contextlib import closing
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -804,7 +805,7 @@ class TestInboxAutoincrementMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "legacy-inbox.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn:
             conn.execute(
                 "CREATE TABLE inbox ("
                 "id INTEGER NOT NULL PRIMARY KEY, sender_id TEXT NOT NULL, "
@@ -827,7 +828,7 @@ class TestInboxAutoincrementMigration:
         db_mod._migrate_inbox_autoincrement()
         db_mod._migrate_inbox_autoincrement()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn:
             ddl = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='inbox'"
             ).fetchone()[0]
@@ -841,6 +842,38 @@ class TestInboxAutoincrementMigration:
 
         assert "AUTOINCREMENT" in ddl.upper()
         assert cursor.lastrowid == 42
+
+    def test_migration_closes_raw_sqlite_connection(self, tmp_path, monkeypatch):
+        """The migration must release its raw connection after rebuilding the table."""
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "legacy-inbox.db"
+        with closing(sqlite3.connect(str(db_file))) as conn:
+            conn.execute(
+                "CREATE TABLE inbox ("
+                "id INTEGER NOT NULL PRIMARY KEY, sender_id TEXT NOT NULL, "
+                "receiver_id TEXT NOT NULL, message TEXT NOT NULL, "
+                "status TEXT NOT NULL, created_at DATETIME)"
+            )
+            conn.commit()
+
+        migration_connection = sqlite3.connect(str(db_file))
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE",
+            db_file,
+            raising=False,
+        )
+        monkeypatch.setattr(sqlite3, "connect", lambda *_args, **_kwargs: migration_connection)
+
+        try:
+            db_mod._migrate_inbox_autoincrement()
+            with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+                migration_connection.execute("SELECT 1")
+        finally:
+            migration_connection.close()
 
 
 class TestCallerIdRoundTrip:

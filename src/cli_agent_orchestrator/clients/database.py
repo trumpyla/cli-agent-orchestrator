@@ -3,6 +3,7 @@
 import logging
 import os
 import uuid
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
 
@@ -228,7 +229,8 @@ def _migrate_inbox_autoincrement() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        # The connection context owns the transaction; closing owns the handle.
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             row = conn.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='inbox'"
             ).fetchone()
