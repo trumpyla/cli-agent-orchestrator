@@ -5,6 +5,8 @@ Lane #1 (future-ready): resources/subscribe seam + resource-updated consumer.
 """
 
 import asyncio
+import inspect
+import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -12,12 +14,14 @@ import pytest
 
 from cli_agent_orchestrator.ops_mcp_server.server import (
     _PEER_URI_RE,
+    _async_request_json,
     _consume_inbox,
     _long_poll_inbox,
     _peer_consumers,
     _peer_inbox_uri,
     _request_json,
     _setup_peer_subscribe,
+    mcp,
     receive_messages,
 )
 
@@ -75,33 +79,52 @@ def _low_level_server(captured):
 class TestReceiveMessagesLanes:
     async def test_wait_zero_is_immediate_pull(self):
         with patch(
-            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            return_value=_response(json_data=[]),
+            "cli_agent_orchestrator.ops_mcp_server.server._async_request_json",
+            new=AsyncMock(return_value=([], None)),
         ) as mock_req:
             result = await receive_messages(PEER)
         assert result["success"] is True
-        _, kwargs = mock_req.call_args
+        kwargs = mock_req.await_args.kwargs
         assert kwargs["params"] == {"status": "pending", "limit": 10}
         assert "timeout" not in kwargs  # no long-poll -> no timeout override
 
     async def test_wait_forwards_wait_and_timeout(self):
         with patch(
-            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            return_value=_response(json_data=[]),
+            "cli_agent_orchestrator.ops_mcp_server.server._async_request_json",
+            new=AsyncMock(return_value=([], None)),
         ) as mock_req:
             await receive_messages(PEER, wait_seconds=60.0)
-        _, kwargs = mock_req.call_args
+        kwargs = mock_req.await_args.kwargs
         assert kwargs["params"]["wait"] == 60.0
         assert kwargs["timeout"] == 65.0  # wait + 5 headroom
 
     async def test_after_id_forwards_exclusive_cursor(self):
         with patch(
-            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            return_value=_response(json_data=[]),
+            "cli_agent_orchestrator.ops_mcp_server.server._async_request_json",
+            new=AsyncMock(return_value=([], None)),
         ) as mock_req:
             await receive_messages(PEER, wait_seconds=60.0, after_id=41)
-        _, kwargs = mock_req.call_args
+        kwargs = mock_req.await_args.kwargs
         assert kwargs["params"]["after_id"] == 41
+
+    async def test_receive_messages_uses_cancelable_async_http(self):
+        """Long-poll cancellation must not strand a synchronous worker thread."""
+        async_request = AsyncMock(return_value=([], None))
+        with (
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server._async_request_json",
+                async_request,
+                create=True,
+            ),
+            patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.asyncio.to_thread",
+                side_effect=AssertionError("receive_messages used a blocking worker"),
+            ),
+        ):
+            result = await receive_messages(PEER, wait_seconds=60.0)
+
+        assert result["success"] is True
+        async_request.assert_awaited_once()
 
 
 def test_peer_uri_regex_accepts_only_8hex():
@@ -109,6 +132,26 @@ def test_peer_uri_regex_accepts_only_8hex():
     assert _PEER_URI_RE.match("cao://peers/peer-abc/inbox") is None  # non-hex
     assert _PEER_URI_RE.match("cao://peers/DEADBEEF/inbox") is None  # uppercase
     assert _peer_inbox_uri("deadbeef") == "cao://peers/deadbeef/inbox"
+
+
+def test_subscription_long_poll_is_async_and_cancelable():
+    assert inspect.iscoroutinefunction(_long_poll_inbox)
+
+
+@pytest.mark.asyncio
+async def test_peer_inbox_resource_is_fastmcp_readable_json():
+    messages = [{"id": 7, "message": "ready", "status": "pending"}]
+    with patch(
+        "cli_agent_orchestrator.ops_mcp_server.server._request_json",
+        return_value=(messages, None),
+    ):
+        result = await mcp.read_resource(f"cao://peers/{PEER}/inbox")
+
+    assert len(result.contents) == 1
+    assert json.loads(result.contents[0].content) == {
+        "peer_id": PEER,
+        "messages": messages,
+    }
 
 
 def test_setup_advertises_subscribe_and_registers_handlers():
@@ -244,6 +287,37 @@ async def test_subscriptions_are_idempotent_per_session_and_unsubscribe_awaits_c
 
 
 @pytest.mark.asyncio
+async def test_unsubscribe_absorbs_already_failed_consumer():
+    """A same-tick failed task must not fail the resources/unsubscribe request."""
+    captured = {}
+    low, _ = _low_level_server(captured)
+    _setup_peer_subscribe(SimpleNamespace(_mcp_server=low))
+    session = low.request_context.session
+
+    class FailedTask:
+        def done(self):
+            return True
+
+        def cancel(self):
+            return False
+
+        def __await__(self):
+            async def fail():
+                raise RuntimeError("consumer failed")
+
+            return fail().__await__()
+
+    key = (id(session), PEER)
+    _peer_consumers[key] = FailedTask()
+    try:
+        await captured["unsubscribe"](_peer_inbox_uri(PEER))
+    finally:
+        _peer_consumers.pop(key, None)
+
+    assert key not in _peer_consumers
+
+
+@pytest.mark.asyncio
 async def test_completed_subscription_task_is_removed():
     captured = {}
     low, _ = _low_level_server(captured)
@@ -301,18 +375,46 @@ def test_request_json_forwards_local_bearer_without_logging_it(caplog):
     assert "top-secret-token" not in caplog.text
 
 
-def test_subscription_long_poll_forwards_local_bearer():
+@pytest.mark.asyncio
+async def test_subscription_long_poll_forwards_local_bearer():
+    response = _response(json_data=[])
+    response.status_code = 200
+    client = AsyncMock()
+    client.request.return_value = response
+    context = AsyncMock()
+    context.__aenter__.return_value = client
     with (
         patch(
             "cli_agent_orchestrator.ops_mcp_server.server.get_local_bearer",
             return_value="machine-token",
         ),
         patch(
-            "cli_agent_orchestrator.ops_mcp_server.server.requests.get",
-            return_value=_response(json_data=[]),
-        ) as get,
+            "cli_agent_orchestrator.ops_mcp_server.server.httpx.AsyncClient",
+            return_value=context,
+        ),
     ):
-        assert _long_poll_inbox(PEER, 25.0, 7) == []
+        assert await _long_poll_inbox(PEER, 25.0, 7) == []
 
-    assert get.call_args.kwargs["headers"] == {"Authorization": "Bearer machine-token"}
-    assert get.call_args.kwargs["params"]["after_id"] == 7
+    assert client.request.await_args.kwargs["headers"] == {"Authorization": "Bearer machine-token"}
+    assert client.request.await_args.kwargs["params"]["after_id"] == 7
+
+
+@pytest.mark.asyncio
+async def test_async_request_without_override_disables_httpx_default_timeout():
+    response = _response(json_data=[])
+    client = AsyncMock()
+    client.request.return_value = response
+    context = AsyncMock()
+    context.__aenter__.return_value = client
+    with patch(
+        "cli_agent_orchestrator.ops_mcp_server.server.httpx.AsyncClient",
+        return_value=context,
+    ):
+        data, error = await _async_request_json(
+            "get",
+            "/terminals/deadbeef/inbox/messages",
+            operation="Immediate inbox pull",
+        )
+
+    assert error is None and data == []
+    assert client.request.await_args.kwargs["timeout"] is None

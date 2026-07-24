@@ -136,7 +136,9 @@ IDLE_PROMPT_PATTERN_LOG = r"[>❯][\s\xa0]"  # Same pattern for log files
 # is the COMPLETED signal there.
 # The ``·`` glyph is intentionally excluded from the leading class so footer
 # lines like "high · /effort" cannot false-match.
-COMPLETION_SUMMARY_PATTERN = r"[✶✢✽✻✳][^\n…]*\bfor\s+(?:\d+(?:\.\d+)?\s*(?:h|m|s)\s*)+\b"
+COMPLETION_SUMMARY_PATTERN = (
+    r"(?m)^[ \t]*[✶✢✽✻✳][^\n…]*\bfor\s+" r"(?:\d+(?:\.\d+)?\s*(?:h|m|s)\s*)+\b[ \t]*$"
+)
 # get_status completion detection tolerates the duration being CLIPPED off by
 # the raw redraw ("✻ Crunched for " with no "Ns"): past-tense glyph + "for",
 # no ellipsis (so a live "…ing…" spinner never matches). · and * stay excluded
@@ -1213,20 +1215,15 @@ class ClaudeCodeProvider(BaseProvider):
         if not completion_matches:
             raise ValueError("No Claude Code response found - no ⏺/● pattern detected")
         completion = completion_matches[-1]
+        turn_start = completion_matches[-2].end() if len(completion_matches) > 1 else 0
 
         after_completion = clean[completion.end() :]
         if SETTLED_NEW_TUI_BOX_PATTERN.search(after_completion) is None:
             raise ValueError("No Claude Code response found - incomplete boxless turn")
 
-        query_matches = [
-            match
-            for match in re.finditer(r"^[ \t]*❯[ \t\xa0]+\S.*$", clean, re.MULTILINE)
-            if match.end() <= completion.start()
-        ]
-        if query_matches:
-            candidate_start = query_matches[-1].end()
-        else:
-            candidate_start = completion_matches[-2].end() if len(completion_matches) > 1 else 0
+        candidate_start = self._find_boxless_query_end(clean, completion_matches)
+        if candidate_start is None:
+            candidate_start = turn_start
             visible_tail = clean[candidate_start : completion.start()]
             if re.search(r"^[ \t]{2,}\S", visible_tail, re.MULTILINE) is None:
                 raise ValueError("No Claude Code response found - no boxless query boundary")
@@ -1252,6 +1249,117 @@ class ClaudeCodeProvider(BaseProvider):
             raise ValueError("No Claude Code response found - empty boxless response")
 
         return "\n".join(response_lines).strip()
+
+    def _is_known_ascii_query(self, line: str) -> bool:
+        """Distinguish a plain ``>`` prompt from response Markdown blockquotes."""
+        if not self._last_input_message:
+            return False
+        query = re.sub(r"\s+", "", line.lstrip(" \t>").casefold())
+        sent = re.sub(r"\s+", "", self._last_input_message.casefold())
+        return min(len(query), len(sent)) >= 8 and (query in sent or sent in query)
+
+    def _is_known_unicode_query(self, line: str) -> bool:
+        """Validate a Unicode prompt against the task CAO actually submitted."""
+        if not self._last_input_message:
+            return False
+        query = re.sub(r"\s+", "", line.lstrip(" \t❯").casefold())
+        sent = re.sub(r"\s+", "", self._last_input_message.casefold())
+        return bool(query and sent and (query in sent or sent in query))
+
+    def _find_boxless_query_end(
+        self,
+        clean: str,
+        completion_matches: List[re.Match[str]],
+    ) -> Optional[int]:
+        """Return the end offset of the current task's visible prompt.
+
+        Prompt-looking glyphs can occur inside answers (Markdown quotes and
+        shell transcripts). Validate them against the last submitted task and
+        require only terminal chrome between the preceding completed turn and
+        the candidate. This also lets genuine startup chrome precede the first
+        prompt without leaking it into the extracted response.
+        """
+        completion = completion_matches[-1]
+        before_completion = clean[: completion.start()]
+
+        def prefix_for(match: re.Match[str]) -> str:
+            prior_end = 0
+            for prior in completion_matches[:-1]:
+                if prior.end() <= match.start():
+                    prior_end = prior.end()
+                else:
+                    break
+            return clean[prior_end : match.start()]
+
+        unicode_matches = list(
+            re.finditer(
+                r"^[ \t]*❯[ \t\xa0]+\S.*$",
+                before_completion,
+                re.MULTILINE,
+            )
+        )
+        if self._last_input_message:
+            known_unicode = [
+                match
+                for match in unicode_matches
+                if self._is_known_unicode_query(match.group())
+                and self._is_ascii_prompt_position(prefix_for(match))
+            ]
+            if known_unicode:
+                return known_unicode[-1].end()
+        else:
+            turn_start = completion_matches[-2].end() if len(completion_matches) > 1 else 0
+            current_unicode = [match for match in unicode_matches if match.start() >= turn_start]
+            if current_unicode:
+                # With no sent-payload evidence, the first prompt in the
+                # completed turn is safer than a later shell transcript line.
+                return current_unicode[0].end()
+
+        known_ascii = [
+            match
+            for match in re.finditer(
+                r"^[ \t]*>[ \t\xa0]+\S.*$",
+                before_completion,
+                re.MULTILINE,
+            )
+            if self._is_known_ascii_query(match.group())
+            and self._is_ascii_prompt_position(prefix_for(match))
+        ]
+        return known_ascii[-1].end() if known_ascii else None
+
+    @staticmethod
+    def _is_ascii_prompt_position(prefix: str) -> bool:
+        """Allow only terminal chrome before a plain ASCII prompt boundary."""
+        for line in prefix.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if (
+                re.fullmatch(
+                    r"(?:Welcome to )?Claude Code(?:\s+v?\d+(?:\.\d+){1,3})?[!]?",
+                    stripped,
+                )
+                or stripped.startswith(("❯", "─", "╭", "╰", "│", "┃"))
+                or re.fullmatch(
+                    r"(?:Tips for getting started|Directory:.*|Model:.*|Version:.*|Session:.*)",
+                    stripped,
+                )
+                or re.fullmatch(r"[─━═\-\s]{8,}", stripped)
+                or EFFORT_FOOTER_LINE_PATTERN.match(stripped)
+            ):
+                continue
+            return False
+        return True
+
+    def should_retry_extraction_with_more_history(self, script_output: str) -> bool:
+        """Escalate a boxless tail when its user-query boundary has scrolled out."""
+        clean = strip_terminal_escapes(script_output)
+        if EXTRACTION_RESPONSE_PATTERN.search(clean):
+            return False
+        completion_matches = list(re.finditer(COMPLETION_SUMMARY_PATTERN, clean))
+        if not completion_matches:
+            return False
+        return self._find_boxless_query_end(clean, completion_matches) is None
 
     def exit_cli(self) -> str:
         """Get the command to exit Claude Code."""

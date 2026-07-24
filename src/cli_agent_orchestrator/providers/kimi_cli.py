@@ -11,7 +11,7 @@ Key characteristics:
 - Thinking output: Gray italic ``•`` bullets (ANSI color 38;5;244 + italic)
 - User input: Displayed in a bordered box using box-drawing characters (╭│╰)
 - Auto-approve: ``--yolo`` flag bypasses all tool action confirmations
-- Agent profiles: ``--agent-file FILE`` (YAML format, extends built-in 'default' agent)
+- Agent profiles: launch options plus a guarded prompt prepended to the first task
 - MCP config: ``--mcp-config TEXT`` (JSON configuration, repeatable flag)
 - Exit commands: ``/exit``, ``exit``, ``quit``, or Ctrl-D
 - Status bar: ``HH:MM [yolo] agent (model, thinking) ctrl-x: toggle mode context: X.X%``
@@ -215,6 +215,11 @@ class KimiCliProvider(BaseProvider):
         self._agent_profile = agent_profile
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
+        # Kimi 0.29 only accepts --agent/--agent-file in its v2 non-interactive
+        # engine. CAO uses the interactive TUI, so profile instructions are
+        # deferred and prepended to the first delivered task instead.
+        self._first_message_prefix: Optional[str] = None
+        self._input_preparation_error: Optional[str] = None
         # Latching flag: set True when user input box (╭─) is detected in ANY
         # get_status() call. Persists even after the box scrolls out of the
         # tmux capture window (200 lines). This is needed because:
@@ -239,6 +244,11 @@ class KimiCliProvider(BaseProvider):
         """Kimi CLI's prompt_toolkit submits on single Enter after bracketed paste."""
         return 1
 
+    @property
+    def is_input_ready(self) -> bool:
+        """Only accept durable input after startup and profile restoration succeed."""
+        return self._initialized and self._input_preparation_error is None
+
     def mark_input_received(self) -> None:
         """Record a dispatched task (called by terminal_service after send_input).
 
@@ -250,6 +260,59 @@ class KimiCliProvider(BaseProvider):
         """
         super().mark_input_received()
         self._has_received_input = True
+
+    def prepare_input(self, message: str) -> str:
+        """Prepend deferred profile instructions to the first interactive task."""
+        if self._input_preparation_error:
+            raise ProviderError(self._input_preparation_error)
+        prefix = self._first_message_prefix
+        if not prefix:
+            return message
+        return f"{prefix.rstrip()}\n\n{message}"
+
+    def commit_prepared_input(self) -> bool:
+        """Consume the deferred profile prompt only after successful delivery."""
+        if not self._first_message_prefix:
+            return False
+        self._first_message_prefix = None
+        return True
+
+    def _compose_first_message_prefix(self, profile) -> Optional[str]:
+        """Build the interactive profile contract prepended to Kimi's first task."""
+        if not self._skill_prompt and profile.skills:
+            from cli_agent_orchestrator.utils.skills import build_skill_catalog
+
+            self._skill_prompt = build_skill_catalog(profile.skills)
+
+        system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
+        system_prompt = self._apply_skill_prompt(system_prompt)
+
+        if self._allowed_tools and "*" not in self._allowed_tools:
+            from cli_agent_orchestrator.constants import SECURITY_PROMPT
+
+            tools_list = ", ".join(self._allowed_tools)
+            tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
+            system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
+        return system_prompt or None
+
+    def restore_input_preparation(self, delivered: Optional[bool]) -> None:
+        """Rebuild an undelivered profile prefix from persisted launch metadata."""
+        if delivered is not False or self._agent_profile is None:
+            return
+        try:
+            profile = load_agent_profile(self._agent_profile)
+            self._first_message_prefix = self._compose_first_message_prefix(profile)
+        except Exception as exc:
+            logger.warning(
+                "Could not restore Kimi profile instructions for terminal %s: %r",
+                self.terminal_id,
+                exc,
+            )
+            self._first_message_prefix = None
+            self._input_preparation_error = (
+                "Kimi profile instructions could not be restored; "
+                "restore the agent profile and restart the daemon"
+            )
 
     def _try_load_profile(self):
         """Best-effort profile load for timeout resolution only.
@@ -276,7 +339,7 @@ class KimiCliProvider(BaseProvider):
         Uses shlex.join() for safe escaping of all arguments.
 
         Command structure:
-            cd <temp_dir> && TERM=xterm-256color kimi --yolo [--agent-file FILE] [--mcp-config JSON]
+            cd <temp_dir> && TERM=xterm-256color kimi --yolo [--plan] [--mcp-config JSON]
 
         The ``cd`` is required because Kimi CLI v1.20.0+ enforces a per-directory
         single-instance lock — only one kimi process can run in a given directory.
@@ -289,6 +352,10 @@ class KimiCliProvider(BaseProvider):
         non-interactive operation in CAO-managed tmux sessions.
         """
         command_parts = ["kimi", "--yolo"]
+        if self._allowed_tools and "*" not in self._allowed_tools:
+            write_capabilities = {"fs_write", "fs_*", "execute_bash"}
+            if write_capabilities.isdisjoint(self._allowed_tools):
+                command_parts.append("--plan")
 
         # Always create a temp directory for this instance.
         # Kimi CLI v1.20.0+ has a per-directory single-instance lock, so each
@@ -303,42 +370,10 @@ class KimiCliProvider(BaseProvider):
                 if profile.model:
                     command_parts.extend(["--model", profile.model])
 
-                # Build agent file from profile's system prompt.
-                # Kimi uses YAML agent files with a system_prompt_path pointing
-                # to a markdown file. We create both in the temp directory.
-                system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
-                system_prompt = self._apply_skill_prompt(system_prompt)
-
-                # Prepend security constraints for soft enforcement (Kimi CLI has no
-                # native tool restriction mechanism). Only applied when tool
-                # restrictions are active (not unrestricted "*").
-                if self._allowed_tools and "*" not in self._allowed_tools:
-                    from cli_agent_orchestrator.constants import SECURITY_PROMPT
-
-                    tools_list = ", ".join(self._allowed_tools)
-                    tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
-                    system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
-
-                if system_prompt:
-                    # Write the system prompt as a markdown file
-                    prompt_file = os.path.join(self._temp_dir, "system.md")
-                    with open(prompt_file, "w") as f:
-                        f.write(system_prompt)
-
-                    # Create the agent YAML that extends the default agent
-                    # and points to our custom system prompt file.
-                    # Written as plain string to avoid adding PyYAML dependency.
-                    agent_yaml = (
-                        "version: 1\n"
-                        "agent:\n"
-                        "  extend: default\n"
-                        "  system_prompt_path: ./system.md\n"
-                    )
-                    agent_file = os.path.join(self._temp_dir, "agent.yaml")
-                    with open(agent_file, "w") as f:
-                        f.write(agent_yaml)
-
-                    command_parts.extend(["--agent-file", agent_file])
+                # Interactive Kimi 0.29 rejects --agent/--agent-file. Preserve
+                # the profile contract by preparing a one-shot prefix for the
+                # first task delivered through terminal_service.send_input().
+                self._first_message_prefix = self._compose_first_message_prefix(profile)
 
                 # Add MCP server configuration if present in the agent profile.
                 # Kimi accepts --mcp-config as a JSON string (repeatable flag).

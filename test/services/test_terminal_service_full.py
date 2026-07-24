@@ -1016,6 +1016,96 @@ class TestSendInput:
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_applies_provider_message_preparation(
+        self,
+        mock_get_metadata,
+        mock_backend,
+        mock_provider_manager,
+        mock_update,
+        mock_status_monitor,
+    ):
+        """Kimi's deferred profile prompt is prepended to the first delivered task."""
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "reviewer-abcd",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        provider = KimiCliProvider("test1234", "cao-session", "reviewer-abcd")
+        provider._initialized = True
+        provider._first_message_prefix = "Review only."
+        mock_provider_manager.get_provider.return_value = provider
+
+        with patch(
+            "cli_agent_orchestrator.services.terminal_service._persist_profile_prompt_delivered"
+        ) as mock_mark_delivered:
+            send_input("test1234", "Inspect PR #1")
+
+        assert mock_backend.send_keys.call_args.args[2] == "Review only.\n\nInspect PR #1"
+        assert provider._first_message_prefix is None
+        mock_mark_delivered.assert_called_once_with("test1234")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_preserves_provider_preparation_when_backend_send_fails(
+        self,
+        mock_get_metadata,
+        mock_backend,
+        mock_provider_manager,
+        mock_update,
+        mock_status_monitor,
+    ):
+        """A transient first send failure must not consume Kimi's profile contract."""
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "reviewer-abcd",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        provider = KimiCliProvider("test1234", "cao-session", "reviewer-abcd")
+        provider._initialized = True
+        provider._first_message_prefix = "Review only."
+        mock_provider_manager.get_provider.return_value = provider
+        mock_backend.send_keys.side_effect = RuntimeError("transient backend failure")
+
+        with pytest.raises(RuntimeError, match="transient backend failure"):
+            send_input("test1234", "Inspect PR #1")
+
+        assert provider._first_message_prefix == "Review only."
+        assert provider.prepare_input("Inspect PR #1") == "Review only.\n\nInspect PR #1"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_send_input_rejects_provider_that_is_not_input_ready(
+        self,
+        mock_get_metadata,
+        mock_provider_manager,
+        mock_status_monitor,
+    ):
+        """Direct sends must honor the same fail-closed readiness gate as inbox sends."""
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "reviewer-abcd",
+        }
+        mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
+        provider = MagicMock()
+        provider.is_input_ready = False
+        mock_provider_manager.get_provider.return_value = provider
+
+        with pytest.raises(TerminalInputBlockedError, match="not ready"):
+            send_input("test1234", "Inspect PR #1")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_send_input_clears_rolling_buffer_preserving_arm(
         self, mock_get_metadata, mock_tmux, mock_pm, mock_update, mock_status_monitor
     ):
@@ -1282,6 +1372,51 @@ class TestGetOutput:
 
         assert '{"verdict":"approve","findings":[]}' in result
         assert not result.startswith("[NO RESPONSE")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.backends.registry._backend")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_get_output_boxless_tail_escalates_before_accepting_missing_query_boundary(
+        self, mock_get_metadata, mock_backend, mock_status_monitor, mock_pm
+    ):
+        """A bounded tail without its query must not return startup chrome as the answer."""
+        from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
+
+        mock_get_metadata.return_value = {
+            "tmux_session": "cao-session",
+            "tmux_window": "reviewer-abcd",
+        }
+        mock_status_monitor.get_buffer.return_value = ""
+        box = "─" * 32
+        bounded_tail = (
+            "  Claude Code startup chrome\n"
+            "  Only the final response belongs to this turn.\n"
+            "✻ Worked for 4s\n"
+            f"{box}\n❯ \n{box}\n"
+        )
+        full_history = (
+            "Claude Code startup chrome\n"
+            "❯ Review the bridge\n"
+            "Only the final response belongs to this turn.\n"
+            "✻ Worked for 4s\n"
+            f"{box}\n❯ \n{box}\n"
+        )
+
+        def history(*_args, **kwargs):
+            return full_history if kwargs.get("full_history") else bounded_tail
+
+        mock_backend.get_history.side_effect = history
+        mock_pm.get_provider.return_value = ClaudeCodeProvider(
+            "test1234", "cao-session", "reviewer-abcd"
+        )
+
+        result = get_output("test1234", OutputMode.LAST)
+
+        assert result == "Only the final response belongs to this turn."
+        assert any(
+            call.kwargs.get("full_history") for call in mock_backend.get_history.call_args_list
+        )
 
     @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
     def test_get_output_not_found(self, mock_get_metadata):

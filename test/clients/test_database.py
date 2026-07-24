@@ -33,6 +33,8 @@ from cli_agent_orchestrator.clients.database import (
     update_flow_run_times,
     update_last_active,
     update_message_status,
+    update_terminal_profile_prompt_delivered,
+    update_terminal_provider_initialized,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus
@@ -157,6 +159,35 @@ class TestTerminalOperations:
         result = update_terminal_shell_command("nonexistent", "bash")
 
         assert result is False
+
+    @pytest.mark.parametrize(
+        ("update_fn", "attribute", "expected"),
+        [
+            (update_terminal_provider_initialized, "provider_initialized", True),
+            (update_terminal_profile_prompt_delivered, "profile_prompt_delivered", True),
+        ],
+    )
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_update_terminal_lifecycle_marker(
+        self,
+        mock_session_class,
+        update_fn,
+        attribute,
+        expected,
+    ):
+        """Lifecycle markers are committed atomically on the terminal row."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_terminal = MagicMock()
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        assert update_fn("test123") is True
+        assert getattr(mock_terminal, attribute) is expected
+        mock_session.commit.assert_called_once()
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_delete_terminal(self, mock_session_class):
@@ -694,8 +725,8 @@ class TestInitDb:
 class TestTerminalsSchemaMigration:
     """Tests for the terminals-table column-add migration (caller_id, issue #284)."""
 
-    def test_caller_id_column_added_to_legacy_table(self, tmp_path, monkeypatch):
-        """A pre-#284 terminals table gains the caller_id column."""
+    def test_lifecycle_columns_added_to_legacy_table(self, tmp_path, monkeypatch):
+        """A legacy terminals table gains nullable restart lifecycle markers."""
         import sqlite3
 
         from cli_agent_orchestrator.clients import database as db_mod
@@ -724,9 +755,16 @@ class TestTerminalsSchemaMigration:
 
         with sqlite3.connect(str(db_file)) as conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
-            rows = conn.execute("SELECT id, caller_id FROM terminals").fetchall()
+            rows = conn.execute(
+                "SELECT id, caller_id, provider_initialized, profile_prompt_delivered "
+                "FROM terminals"
+            ).fetchall()
         assert "caller_id" in columns
-        assert rows == [("abc12345", None)], "existing rows must get NULL caller_id"
+        assert "provider_initialized" in columns
+        assert "profile_prompt_delivered" in columns
+        assert rows == [
+            ("abc12345", None, None, None)
+        ], "legacy rows must retain an explicit unknown lifecycle state"
 
     def test_migration_is_idempotent(self, tmp_path, monkeypatch):
         """Running the migration twice must not fail or duplicate columns."""
@@ -755,6 +793,54 @@ class TestTerminalsSchemaMigration:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("caller_id") == 1
         assert columns.count("allowed_tools") == 1
+
+
+class TestInboxAutoincrementMigration:
+    """Cursor IDs must never be reused after retention deletes the tail row."""
+
+    def test_legacy_inbox_is_rebuilt_without_reusing_ids(self, tmp_path, monkeypatch):
+        import sqlite3
+
+        from cli_agent_orchestrator.clients import database as db_mod
+
+        db_file = tmp_path / "legacy-inbox.db"
+        with sqlite3.connect(str(db_file)) as conn:
+            conn.execute(
+                "CREATE TABLE inbox ("
+                "id INTEGER NOT NULL PRIMARY KEY, sender_id TEXT NOT NULL, "
+                "receiver_id TEXT NOT NULL, message TEXT NOT NULL, "
+                "status TEXT NOT NULL, created_at DATETIME)"
+            )
+            conn.execute(
+                "INSERT INTO inbox "
+                "(id, sender_id, receiver_id, message, status, created_at) "
+                "VALUES (41, 'sender', 'deadbeef', 'old', 'delivered', CURRENT_TIMESTAMP)"
+            )
+            conn.commit()
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.constants.DATABASE_FILE",
+            db_file,
+            raising=False,
+        )
+
+        db_mod._migrate_inbox_autoincrement()
+        db_mod._migrate_inbox_autoincrement()
+
+        with sqlite3.connect(str(db_file)) as conn:
+            ddl = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='inbox'"
+            ).fetchone()[0]
+            conn.execute("DELETE FROM inbox WHERE id = 41")
+            cursor = conn.execute(
+                "INSERT INTO inbox "
+                "(sender_id, receiver_id, message, status, created_at) "
+                "VALUES ('sender', 'deadbeef', 'new', 'pending', CURRENT_TIMESTAMP)"
+            )
+            conn.commit()
+
+        assert "AUTOINCREMENT" in ddl.upper()
+        assert cursor.lastrowid == 42
 
 
 class TestCallerIdRoundTrip:

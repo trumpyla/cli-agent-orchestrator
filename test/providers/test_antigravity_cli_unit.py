@@ -801,6 +801,47 @@ async def test_wait_until_input_ready_offloads_backend_capture(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_wait_until_input_ready_retries_transient_capture_failure(monkeypatch):
+    """One backend read failure must not consume the entire readiness timeout."""
+    p = make_provider()
+    ready = "────────────────────\n> \n────────────────────\n? for shortcuts"
+    captures = [RuntimeError("transient read failure"), ready, ready]
+
+    class FakeBackend:
+        def get_history(self, session, window, tail_lines):
+            value = captures.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+
+    assert await p.wait_until_input_ready(timeout=0.2, poll_interval=0.01) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_until_input_ready_caps_persistent_capture_failures(monkeypatch):
+    """A dead backend must fail promptly instead of consuming the full init timeout."""
+    p = make_provider()
+    calls = 0
+
+    class FakeBackend:
+        def get_history(self, session, window, tail_lines):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("pane is gone")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+
+    assert await p.wait_until_input_ready(timeout=0.05, poll_interval=0.0) is False
+    assert calls == 3
+
+
+@pytest.mark.asyncio
 async def test_wait_until_input_ready_rejects_changing_startup_surface(monkeypatch):
     p = make_provider()
     counter = 0

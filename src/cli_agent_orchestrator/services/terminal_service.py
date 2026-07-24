@@ -35,6 +35,8 @@ from cli_agent_orchestrator.clients.database import delete_terminal as db_delete
 from cli_agent_orchestrator.clients.database import (
     get_terminal_metadata,
     update_last_active,
+    update_terminal_profile_prompt_delivered,
+    update_terminal_provider_initialized,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.constants import (
@@ -82,6 +84,37 @@ _memory_injected_lock = threading.Lock()
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
+
+
+def _persist_provider_initialized(terminal_id: str) -> None:
+    """Best-effort lifecycle persistence after successful provider startup.
+
+    Server startup applies the schema migration before terminals can be
+    created. This remains non-fatal for embedded callers that initialize a
+    provider against an older database without first calling ``init_db``.
+    """
+    try:
+        if not update_terminal_provider_initialized(terminal_id):
+            logger.warning("Could not persist initialized state for terminal %s", terminal_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not persist initialized state for terminal %s: %r",
+            terminal_id,
+            exc,
+        )
+
+
+def _persist_profile_prompt_delivered(terminal_id: str) -> None:
+    """Best-effort persistence for the first-message profile delivery commit."""
+    try:
+        if not update_terminal_profile_prompt_delivered(terminal_id):
+            logger.warning("Could not persist profile delivery for terminal %s", terminal_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not persist profile delivery for terminal %s: %r",
+            terminal_id,
+            exc,
+        )
 
 
 class TerminalInputBlockedError(Exception):
@@ -379,6 +412,7 @@ async def create_terminal(
             )
         else:
             await provider_instance.initialize()
+            _persist_provider_initialized(terminal_id)
 
             # Persist shell_command baseline if the provider captured one
             shell_command = provider_instance.shell_baseline
@@ -632,6 +666,7 @@ async def _confirm_worker_started_or_resubmit(
                 registry=registry,
                 sender_id=sender_id,
                 orchestration_type=orchestration_type,
+                _commit_prepared_input=False,
             )
         if await wait_until_status(
             terminal_id,
@@ -670,6 +705,7 @@ def _schedule_deferred_init(
         caller_id: Optional[str] = None
         try:
             await provider_instance.initialize()
+            _persist_provider_initialized(terminal_id)
             shell_command = provider_instance.shell_baseline
             if isinstance(shell_command, str) and shell_command:
                 update_terminal_shell_command(terminal_id, shell_command)
@@ -692,6 +728,7 @@ def _schedule_deferred_init(
                     registry=registry,
                     sender_id=caller_id,
                     orchestration_type=orchestration_type,
+                    _commit_prepared_input=False,
                 )
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
@@ -721,6 +758,11 @@ def _schedule_deferred_init(
                         ),
                         registry,
                         True,  # delete_worker
+                    )
+                elif provider_instance.commit_prepared_input():
+                    await asyncio.to_thread(
+                        _persist_profile_prompt_delivered,
+                        terminal_id,
                     )
                     return
         except TerminalInputBlockedError as e:
@@ -834,6 +876,9 @@ def send_input(
     registry: PluginRegistry | None = None,
     sender_id: str | None = None,
     orchestration_type: OrchestrationType | None = None,
+    *,
+    _commit_prepared_input: bool = True,
+    _prepare_provider_input: bool = True,
 ) -> bool:
     """Send input to terminal via tmux paste buffer.
 
@@ -866,6 +911,12 @@ def send_input(
                     "(provider process may have exited). Refusing to deliver input."
                 )
 
+            if _prepare_provider_input and getattr(provider, "is_input_ready", True) is False:
+                raise TerminalInputBlockedError(
+                    f"Terminal {terminal_id} provider is not ready for input. "
+                    "Wait for initialization or repair its profile before retrying."
+                )
+
             if (
                 provider.blocks_orchestrated_input_while_waiting_user_answer is True
                 and orchestration_value
@@ -887,6 +938,10 @@ def send_input(
         # plugins/webhooks see what the caller sent — not the
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
+        if provider and _prepare_provider_input:
+            prepare_input = getattr(type(provider), "prepare_input", None)
+            if prepare_input is not None:
+                message = prepare_input(provider, message)
         message = inject_memory_context(message, terminal_id)
 
         # Check how many Enter keys the provider needs after paste
@@ -922,11 +977,17 @@ def send_input(
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
 
+        if provider and _prepare_provider_input and _commit_prepared_input:
+            commit_prepared_input = getattr(type(provider), "commit_prepared_input", None)
+            if commit_prepared_input is not None and commit_prepared_input(provider):
+                _persist_profile_prompt_delivered(terminal_id)
+
         # Notify the provider that external input was received.
         # This allows providers to adjust status
         # detection — specifically to stop reporting IDLE for the post-init
         # state and resume normal COMPLETED detection after a real task.
-        if provider:
+        if provider and _prepare_provider_input:
+            provider.record_input_message(message)
             provider.mark_input_received()
 
         update_last_active(terminal_id)
@@ -1026,7 +1087,7 @@ def exit_terminal_cli(terminal_id: str) -> None:
     if exit_command.startswith(("C-", "M-")):
         send_special_key(terminal_id, exit_command)
     else:
-        send_input(terminal_id, exit_command)
+        send_input(terminal_id, exit_command, _prepare_provider_input=False)
 
 
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
@@ -1123,6 +1184,18 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
                 )
                 try:
                     result = provider.extract_last_message_from_script(full_output)
+                    retry_with_more = getattr(
+                        type(provider),
+                        "should_retry_extraction_with_more_history",
+                        None,
+                    )
+                    if retry_with_more is not None and retry_with_more(provider, full_output):
+                        logger.debug(
+                            "get_output: %s needs a wider query boundary at %d lines",
+                            terminal_id,
+                            step_lines,
+                        )
+                        continue
                     if step_lines > _ESCALATION_STEPS[0]:
                         logger.debug(
                             "get_output: %s marker found at %d lines",

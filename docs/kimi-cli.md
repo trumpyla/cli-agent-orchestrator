@@ -71,20 +71,17 @@ Both thinking and response lines use the `•` (bullet) prefix. The provider dis
 
 Agent profiles are **optional** for Kimi CLI. If provided, the provider:
 
-1. Creates a temporary YAML agent file that extends Kimi's built-in `default` agent
-2. Writes the system prompt as a separate markdown file
-3. Passes the agent file via `--agent-file`
+1. Applies the profile's model and MCP launch options
+2. Prepends the system, skill, and tool-restriction instructions to the first task
+3. Adds Kimi's native `--plan` mode when the resolved tool set is read-only
 
-### Agent File Format
+Kimi 0.29 restricts `--agent` and `--agent-file` to its v2 non-interactive
+engine. CAO operates the interactive TUI, so passing those flags prevents the
+session from starting. First-task prompt delivery preserves profile behavior
+without selecting an incompatible engine.
 
-```yaml
-version: 1
-agent:
-  extend: default
-  system_prompt_path: ./system.md
-```
-
-Temp files are automatically cleaned up when the provider's `cleanup()` method is called.
+The unique temporary working directory used for Kimi's per-directory lock is
+still removed by `cleanup()`.
 
 ## MCP Server Configuration
 
@@ -98,7 +95,7 @@ kimi --yolo --mcp-config '{"server-name": {"command": "npx", "args": ["-y", "cao
 
 Kimi CLI defaults to a 60-second MCP tool call timeout (`tool_call_timeout_ms=60000` in `~/.kimi/config.toml`). This is too short for `handoff` operations, which create a worker terminal, wait for completion, and extract output — routinely exceeding 60 seconds.
 
-The provider automatically modifies `~/.kimi/config.toml` to set `tool_call_timeout_ms=600000` when MCP servers are configured, increasing the timeout to 600 seconds (10 minutes) to match CAO's default handoff timeout. The original value is restored during `cleanup()`. This is the same direct-config-write pattern used by the Antigravity CLI provider (`~/.gemini/config/mcp_config.json`).
+The provider automatically modifies `~/.kimi/config.toml` to set `tool_call_timeout_ms=600000` when MCP servers are configured, increasing the timeout to 600 seconds (10 minutes) to match CAO's default handoff timeout. The shared value is intentionally not restored during `cleanup()`, because other Kimi sessions may still be using it.
 
 **Why not `--config` flag?** Kimi CLI's `--config` flag causes it to bypass the default config file (`~/.kimi/config.toml`), which breaks OAuth authentication — the CLI shows "model: not set" and `/login` refuses to work. Modifying the config file directly avoids this issue.
 
@@ -113,7 +110,7 @@ Kimi CLI does not automatically forward parent shell environment variables to MC
 | Flag | Purpose |
 |------|---------|
 | `--yolo` | Auto-approve all tool action confirmations |
-| `--agent-file FILE` | Custom agent YAML file |
+| `--plan` | Native read-only planning guardrail for restricted reviewer profiles |
 | `--mcp-config TEXT` | MCP server configuration (JSON, repeatable) |
 | `--work-dir DIR` | Set working directory |
 | `--no-thinking` | Disable thinking mode (changes prompt to ✨) |
@@ -122,7 +119,7 @@ Kimi CLI does not automatically forward parent shell environment variables to MC
 
 ### Provider Lifecycle
 
-1. **Initialize**: Create unique temp dir → set MCP timeout in `~/.kimi/config.toml` (if MCP servers) → wait for shell → send `cd <tempdir> && TERM=xterm-256color kimi --yolo` → wait for IDLE or COMPLETED (up to 120s)
+1. **Initialize**: Create unique temp dir → set MCP timeout in `~/.kimi/config.toml` (if MCP servers) → wait for shell → send `cd <tempdir> && TERM=xterm-256color kimi --yolo [--plan]` → wait for IDLE or COMPLETED (up to 120s)
 2. **Status Detection**: Check bottom 50 lines for idle prompt pattern (end-of-line anchored)
 3. **Message Extraction**: Line-based approach mapping raw and clean output for thinking filtering
 4. **Exit**: Send `/exit` command
@@ -144,7 +141,7 @@ def greet(name):
 💫
 ```
 
-### Kimi CLI v1.20.0 Compatibility
+### Kimi CLI v1.20.0–0.29 Compatibility
 
 The provider handles several v1.20.0 behavioral changes:
 
@@ -152,6 +149,7 @@ The provider handles several v1.20.0 behavioral changes:
 - **Input display**: Removed bordered input boxes (`╭─...╰─`). User input now appears inline on the prompt line (`💫 message text`).
 - **TERM variable**: Kimi CLI silently exits when `TERM=tmux-256color` (the tmux default). The provider overrides with `TERM=xterm-256color`.
 - **Per-directory lock**: Only one Kimi instance can run in a given directory. Each provider instance uses its own temp directory via `cd`.
+- **Interactive profiles**: Kimi 0.29 rejects `--agent` and `--agent-file` outside the v2 non-interactive engine. CAO delivers profile instructions with the first interactive task instead.
 
 ## E2E Testing
 

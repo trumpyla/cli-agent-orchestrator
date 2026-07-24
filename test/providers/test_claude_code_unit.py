@@ -1365,6 +1365,147 @@ that spans multiple lines
 
         assert result == "Latest response only."
 
+    def test_extract_boxless_response_recognizes_ascii_query_marker(self):
+        """ASCII ``>`` query markers bound the response like the Unicode prompt."""
+        output = (
+            "Welcome to Claude Code\n"
+            "> Review the bridge\n"
+            "Only the completed response should be returned.\n"
+            "✻ Worked for 2s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.record_input_message("Review the bridge")
+
+        result = provider.extract_last_message_from_script(output)
+
+        assert result == "Only the completed response should be returned."
+
+    def test_extract_boxless_ascii_query_after_real_startup_chrome(self):
+        """A real startup banner must not force chrome and query text into the answer."""
+        output = (
+            "Welcome to Claude Code v1.2.3\n"
+            "│ Tips for getting started\n"
+            "│ Directory: /tmp/review\n"
+            "│ Model: claude-opus\n"
+            "> Review the bridge\n"
+            "Only the completed response should be returned.\n"
+            "✻ Worked for 2s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.record_input_message("Review the bridge")
+
+        result = provider.extract_last_message_from_script(output)
+
+        assert result == "Only the completed response should be returned."
+
+    def test_extract_boxless_response_keeps_markdown_blockquote_after_ascii_query(self):
+        """A response blockquote must not replace the turn's ASCII prompt boundary."""
+        output = (
+            "> Review the bridge\n"
+            "First paragraph of the answer.\n"
+            "> quoted evidence from the PR\n"
+            "Final paragraph of the answer.\n"
+            "✻ Worked for 2s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.record_input_message("Review the bridge")
+
+        result = provider.extract_last_message_from_script(output)
+
+        assert result == (
+            "First paragraph of the answer.\n"
+            "> quoted evidence from the PR\n"
+            "Final paragraph of the answer."
+        )
+
+    def test_boxless_markdown_quote_without_known_query_requests_more_history(self):
+        """A tail blockquote cannot suppress escalation when its prompt scrolled out."""
+        output = (
+            "> quoted evidence from the PR\n"
+            "Final paragraph of the answer.\n"
+            "✻ Worked for 2s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.record_input_message("Review the bridge")
+
+        assert provider.should_retry_extraction_with_more_history(output) is True
+
+    def test_boxless_quote_matching_sent_payload_is_not_a_late_prompt(self):
+        """A response quoting the task text cannot become a replacement boundary."""
+        output = (
+            "First paragraph of the answer.\n"
+            "> Review the bridge\n"
+            "Final paragraph of the answer.\n"
+            "✻ Worked for 2s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.record_input_message("Review the bridge")
+
+        assert provider.should_retry_extraction_with_more_history(output) is True
+
+    def test_boxless_claude_code_prose_is_not_terminal_chrome(self):
+        """Ordinary prose beginning with the product name cannot whitelist a quote."""
+        output = (
+            "Claude Code can quote the requested task here.\n"
+            "> Review the bridge\n"
+            "Final paragraph of the answer.\n"
+            "✻ Worked for 2s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.record_input_message("Review the bridge")
+
+        assert provider.should_retry_extraction_with_more_history(output) is True
+
+    def test_boxless_prior_unicode_prompt_does_not_bound_current_turn(self):
+        """A previous turn's visible prompt cannot suppress current-turn escalation."""
+        output = (
+            "❯ Old task\n"
+            "Old answer.\n"
+            "✻ Worked for 1s\n"
+            "Current answer tail without its query.\n"
+            "✻ Worked for 2s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.record_input_message("Current task")
+
+        assert provider.should_retry_extraction_with_more_history(output) is True
+
+    def test_boxless_response_keeps_embedded_unicode_shell_prompt(self):
+        """A response shell transcript cannot replace the actual Unicode query."""
+        output = (
+            "❯ Fix the build script\n"
+            "The fix is applied. Verify with:\n"
+            "❯ npm run build\n"
+            "build OK\n"
+            "✻ Worked for 3s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.record_input_message("Fix the build script")
+
+        result = provider.extract_last_message_from_script(output)
+
+        assert result == "The fix is applied. Verify with:\n❯ npm run build\nbuild OK"
+
+    def test_boxless_response_keeps_quoted_completion_summary(self):
+        """A quoted TUI summary inside the answer cannot re-anchor the current turn."""
+        output = (
+            "❯ Explain completion detection\n"
+            "The detector matches lines like:\n"
+            "✻ Churned for 6m 18s\n"
+            "and treats them as summaries.\n"
+            "✻ Worked for 4s\n" + "─" * 32 + "\n❯ \n" + "─" * 32 + "\n"
+        )
+        provider = ClaudeCodeProvider("test123", "test-session", "window-0")
+        provider.record_input_message("Explain completion detection")
+
+        result = provider.extract_last_message_from_script(output)
+
+        assert result == (
+            "The detector matches lines like:\n"
+            "✻ Churned for 6m 18s\n"
+            "and treats them as summaries."
+        )
+
     def test_extract_boxless_response_tail_when_query_scrolled_out(self):
         """A long Herdr review still returns its visible tail after the query evicts."""
         box = "─" * 40

@@ -480,8 +480,14 @@ class AntigravityCliProvider(BaseProvider):
                     last_prompt_time = time.monotonic()  # reset idle timer
                     time.sleep(1.0)
                     continue
-                # At the ready footer with no dialog pending → done.
-                if re.search(IDLE_FOOTER_PATTERN, clean):
+                # A footer can paint one frame before a late feedback survey.
+                # Require the actual empty input widget too; otherwise keep the
+                # dialog watcher alive long enough to dismiss that survey.
+                if re.search(IDLE_FOOTER_PATTERN, clean) and re.search(
+                    IDLE_PROMPT_PATTERN,
+                    clean,
+                    re.MULTILINE,
+                ):
                     return
             time.sleep(1.0)
 
@@ -558,6 +564,7 @@ class AntigravityCliProvider(BaseProvider):
         """
         deadline = time.monotonic() + timeout
         previous: Optional[str] = None
+        capture_failures = 0
         while time.monotonic() < deadline:
             try:
                 backend = get_backend()
@@ -568,9 +575,21 @@ class AntigravityCliProvider(BaseProvider):
                     tail_lines=40,
                 )
             except Exception as exc:
+                capture_failures += 1
                 logger.warning("Antigravity input-ready capture failed: %s", exc)
-                return False
+                previous = None
+                if capture_failures >= 3:
+                    logger.error(
+                        "Antigravity input-ready capture failed %d consecutive times; "
+                        "aborting readiness wait for %s",
+                        capture_failures,
+                        self.terminal_id,
+                    )
+                    return False
+                await asyncio.sleep(poll_interval)
+                continue
 
+            capture_failures = 0
             clean = strip_terminal_escapes(current or "")
             ready = bool(
                 re.search(IDLE_FOOTER_PATTERN, clean)

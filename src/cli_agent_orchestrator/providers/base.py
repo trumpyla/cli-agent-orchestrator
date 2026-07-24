@@ -81,6 +81,7 @@ class BaseProvider(ABC):
         self._last_dispatch_time: float = 0.0
         self._done_first_detected: float = 0.0
         self._idle_first_detected: float = 0.0
+        self._last_input_message: Optional[str] = None
 
     @property
     def shell_baseline(self) -> Optional[str]:
@@ -204,6 +205,21 @@ class BaseProvider(ABC):
         """
         return True
 
+    def commit_prepared_input(self) -> bool:
+        """Commit one-shot input preparation after delivery succeeds.
+
+        Returns True when durable provider-specific preparation was consumed.
+        Providers without one-shot preparation keep the default no-op.
+        """
+        return False
+
+    def record_input_message(self, message: str) -> None:
+        """Remember the successfully pasted payload for provider-aware parsing."""
+        self._last_input_message = message
+
+    def restore_input_preparation(self, delivered: Optional[bool]) -> None:
+        """Restore durable one-shot input state after a daemon restart."""
+
     @property
     def is_input_ready(self) -> bool:
         """Whether durable inbox delivery may type into this provider now.
@@ -249,6 +265,25 @@ class BaseProvider(ABC):
         with re-capture between attempts.  Default is 0 (no retries).
         """
         return 0
+
+    def prepare_input(self, message: str) -> str:
+        """Transform a message immediately before it is pasted into the provider.
+
+        Most providers pass input through unchanged. Providers whose interactive
+        CLI cannot accept a launch-time system prompt may override this hook to
+        prefix the first delivered task.
+        """
+        return message
+
+    def should_retry_extraction_with_more_history(self, script_output: str) -> bool:
+        """Whether a successful tail extraction still needs a wider capture.
+
+        The default trusts the extracted tail. Full-screen providers may return
+        ``True`` when a bounded viewport lacks the user-turn boundary needed to
+        exclude startup chrome. The terminal service ignores this hook for the
+        final full-history attempt.
+        """
+        return False
 
     @abstractmethod
     def extract_last_message_from_script(self, script_output: str) -> str:

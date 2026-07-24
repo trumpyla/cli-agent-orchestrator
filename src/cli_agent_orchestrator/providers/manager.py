@@ -175,6 +175,7 @@ class ProviderManager:
             metadata["tmux_session"],
             metadata["tmux_window"],
             metadata["agent_profile"],
+            metadata.get("allowed_tools"),
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since
@@ -184,8 +185,14 @@ class ProviderManager:
         # misreported as PROCESSING indefinitely.
         if metadata.get("shell_command"):
             provider.shell_baseline = metadata["shell_command"]
-            if hasattr(provider, "_initialized"):
-                provider._initialized = True
+        # New rows persist an explicit lifecycle marker. NULL/missing is a
+        # legacy row created before the marker existed; preserve compatibility
+        # for those established sessions while never promoting an explicitly
+        # half-initialized deferred worker after a daemon restart.
+        initialized = metadata.get("provider_initialized")
+        if hasattr(provider, "_initialized") and initialized is not False:
+            provider._initialized = True
+        provider.restore_input_preparation(metadata.get("profile_prompt_delivered"))
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 

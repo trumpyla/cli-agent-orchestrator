@@ -8,6 +8,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
+from cli_agent_orchestrator.providers.kimi_cli import ProviderError
 from cli_agent_orchestrator.providers.manager import ProviderManager
 
 
@@ -99,6 +100,117 @@ def test_get_provider_creates_copilot_on_demand_from_metadata():
 
     assert isinstance(provider, CopilotCliProvider)
     assert manager.get_provider("t1") is provider
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [ProviderType.CLAUDE_CODE.value, ProviderType.ANTIGRAVITY_CLI.value],
+)
+def test_get_provider_marks_persisted_initialized_tui_ready_without_shell_baseline(
+    provider_type,
+):
+    """A restored live TUI must accept durable inbox delivery after an API restart."""
+    manager = ProviderManager()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": provider_type,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": None,
+            "shell_command": None,
+            "provider_initialized": True,
+        },
+    ):
+        provider = manager.get_provider("t1")
+
+    assert provider.is_input_ready is True
+
+
+@pytest.mark.parametrize(
+    "provider_type",
+    [ProviderType.CLAUDE_CODE.value, ProviderType.ANTIGRAVITY_CLI.value],
+)
+def test_get_provider_does_not_mark_deferred_uninitialized_tui_ready(provider_type):
+    """A daemon restart must not make a half-started deferred worker input-ready."""
+    manager = ProviderManager()
+
+    with patch(
+        "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+        return_value={
+            "provider": provider_type,
+            "tmux_session": "s1",
+            "tmux_window": "w1",
+            "agent_profile": None,
+            "shell_command": None,
+            "provider_initialized": False,
+        },
+    ):
+        provider = manager.get_provider("t1")
+
+    assert provider.is_input_ready is False
+
+
+def test_get_provider_restores_undelivered_kimi_profile_prompt():
+    """A restart before Kimi's first task keeps its profile/security prefix."""
+    manager = ProviderManager()
+    profile = MagicMock(system_prompt="Review only.", skills=None)
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.KIMI_CLI.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "reviewer",
+                "allowed_tools": ["fs_read"],
+                "shell_command": None,
+                "provider_initialized": True,
+                "profile_prompt_delivered": False,
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.kimi_cli.load_agent_profile",
+            return_value=profile,
+        ),
+    ):
+        provider = manager.get_provider("t1")
+
+    prepared = provider.prepare_input("Inspect PR #1")
+    assert "Review only." in prepared
+    assert "You only have access to these tools: fs_read" in prepared
+
+
+def test_get_provider_quarantines_kimi_when_undelivered_profile_cannot_load():
+    """A missing profile must not crash restoration or permit unrestricted input."""
+    manager = ProviderManager()
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.KIMI_CLI.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "deleted-reviewer",
+                "allowed_tools": ["fs_read"],
+                "shell_command": None,
+                "provider_initialized": True,
+                "profile_prompt_delivered": False,
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.kimi_cli.load_agent_profile",
+            side_effect=FileNotFoundError("deleted"),
+        ),
+    ):
+        provider = manager.get_provider("t1")
+
+    assert provider.is_input_ready is False
+    with pytest.raises(ProviderError, match="profile instructions could not be restored"):
+        provider.prepare_input("Inspect PR #1")
 
 
 def test_cleanup_provider_calls_cleanup_and_removes():
@@ -243,6 +355,7 @@ def test_get_provider_restores_shell_baseline_from_metadata():
             "tmux_window": "w1",
             "agent_profile": "developer",
             "shell_command": "bash",
+            "provider_initialized": True,
         },
     ):
         provider = manager.get_provider("t1")
@@ -268,6 +381,7 @@ def test_get_provider_marks_kiro_initialized_on_restore():
             "tmux_window": "w1",
             "agent_profile": "developer",
             "shell_command": "zsh",
+            "provider_initialized": True,
         },
     ):
         provider = manager.get_provider("t1")
@@ -287,11 +401,13 @@ def test_get_provider_no_shell_baseline_when_metadata_missing_shell_command():
             "tmux_session": "s1",
             "tmux_window": "w1",
             "agent_profile": "developer",
+            "provider_initialized": True,
         },
     ):
         provider = manager.get_provider("t1")
 
     assert provider.shell_baseline is None
+    assert provider._initialized is True
 
 
 def test_create_provider_mock_cli_stores_mapping():

@@ -10,6 +10,7 @@ import re
 
 import pytest
 from sqlalchemy import create_engine
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
 import cli_agent_orchestrator.clients.database as db
@@ -137,3 +138,25 @@ def test_create_peer_ids_are_unique(real_db):
     ids = {create_peer() for _ in range(20)}
     assert len(ids) == 20
     assert all(HEX8.match(i) for i in ids)
+
+
+def test_create_peer_retries_integrity_collision(real_db, monkeypatch):
+    """The database uniqueness constraint, not a preflight read, drives retries."""
+    original_create_terminal = db.create_terminal
+    generated = iter(["deadbeef", "feedface"])
+    first_attempt = True
+
+    def collide_once(**kwargs):
+        nonlocal first_attempt
+        if first_attempt:
+            first_attempt = False
+            original_create_terminal(**kwargs)
+            raise IntegrityError("concurrent peer insert", params={}, orig=Exception("collision"))
+        return original_create_terminal(**kwargs)
+
+    monkeypatch.setattr("secrets.token_hex", lambda _n: next(generated))
+    monkeypatch.setattr(db, "create_terminal", collide_once)
+
+    assert create_peer("driver") == "feedface"
+    assert is_peer("deadbeef") is True
+    assert is_peer("feedface") is True
