@@ -174,6 +174,12 @@ class TestResolveProvider:
             assert result == provider_value
 
     @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_peer_profile_provider_falls_back(self, mock_load):
+        mock_load.return_value = AgentProfile(name="agent", description="test", provider="peer")
+
+        assert resolve_provider("agent", fallback_provider="kiro_cli") == "kiro_cli"
+
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
     def test_returns_fallback_when_provider_is_empty_string(self, mock_load):
         """Empty string provider should be treated as absent and fall back."""
         mock_load.return_value = AgentProfile(

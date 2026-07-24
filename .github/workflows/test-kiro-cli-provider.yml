@@ -91,4 +91,3 @@ jobs:
 
       - name: Run type checker with mypy
         run: uv run mypy src/
-        continue-on-error: true

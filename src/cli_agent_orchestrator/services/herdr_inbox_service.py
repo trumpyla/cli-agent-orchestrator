@@ -210,6 +210,8 @@ class HerdrInboxService:
             live_labels = live_tabs_by_workspace.get(ws_id, set())
             db_terminals = list_terminals_by_session(session_name)
             for term in db_terminals:
+                if term.get("provider") == "peer":
+                    continue  # peers are pane-less (bi-directional bridge); never a ghost
                 window = term.get("tmux_window", "")
                 if window and window not in live_labels:
                     logger.info(

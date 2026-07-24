@@ -35,6 +35,7 @@ from cli_agent_orchestrator.services.plugin_dispatch import dispatch_plugin_even
 from cli_agent_orchestrator.services.session_env import clear_session_env
 from cli_agent_orchestrator.services.terminal_service import create_terminal
 from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.terminal import normalize_session_name
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ def list_sessions() -> List[Dict]:
 
 def get_session(session_name: str) -> Dict:
     """Get session with terminals."""
+    session_name = normalize_session_name(session_name)
     try:
         if not get_backend().session_exists(session_name):
             raise ValueError(f"Session '{session_name}' not found")
@@ -128,12 +130,15 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         Dict with 'deleted' (list of deleted session names) and 'errors' (list of error dicts).
     """
     result: Dict = {"deleted": [], "errors": []}
+    session_name = normalize_session_name(session_name)
     try:
         session_alive = get_backend().session_exists(session_name)
 
         from cli_agent_orchestrator.services import terminal_service
 
         terminals = list_terminals_by_session(session_name)
+        if not session_alive and not terminals:
+            raise ValueError(f"Session '{session_name}' not found")
 
         # Clean up each terminal (snapshot, kill window, FIFO reader,
         # status buffer, provider, DB) via the event-driven teardown path.

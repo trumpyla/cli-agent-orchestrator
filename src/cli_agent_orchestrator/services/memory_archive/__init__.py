@@ -9,7 +9,7 @@ maps to a ``click.ClickException`` and the API maps to HTTP 400.
 format registers later as ``cao``.
 """
 
-from typing import Dict, Type
+from typing import TYPE_CHECKING, Dict, Protocol
 
 from cli_agent_orchestrator.services.memory_archive.base import (
     ExportReport,
@@ -17,26 +17,37 @@ from cli_agent_orchestrator.services.memory_archive.base import (
     MemoryArchiveBackend,
 )
 
+if TYPE_CHECKING:
+    from cli_agent_orchestrator.services.memory_service import MemoryService
+
 __all__ = [
     "ExportReport",
     "ImportReport",
     "MemoryArchiveBackend",
+    "MemoryArchiveBackendFactory",
     "OkfArchiveBackend",
     "get_backend",
     "register_backend",
 ]
 
-# Module-level registry: format name → backend class.
-_backends: Dict[str, Type[MemoryArchiveBackend]] = {}
+
+class MemoryArchiveBackendFactory(Protocol):
+    """Callable that binds an archive backend to the active memory service."""
+
+    def __call__(self, memory_service: "MemoryService") -> MemoryArchiveBackend: ...
 
 
-def register_backend(name: str, cls: Type[MemoryArchiveBackend]) -> None:
-    """Register an archive backend class under ``name`` (e.g. "okf")."""
-    _backends[name] = cls
+# Module-level registry: format name → backend factory.
+_backends: Dict[str, MemoryArchiveBackendFactory] = {}
 
 
-def get_backend(name: str) -> Type[MemoryArchiveBackend]:
-    """Return the backend class registered under ``name``.
+def register_backend(name: str, factory: MemoryArchiveBackendFactory) -> None:
+    """Register an archive backend factory under ``name`` (e.g. "okf")."""
+    _backends[name] = factory
+
+
+def get_backend(name: str) -> MemoryArchiveBackendFactory:
+    """Return the backend factory registered under ``name``.
 
     Raises ``ValueError`` on unknown names — the CLI/API boundary maps it
     to a user-facing error per project rules.

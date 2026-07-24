@@ -37,6 +37,7 @@ dependencies = [
     "click>=8.2.0",
     "python-dotenv>=1.2.2",
     "python-frontmatter>=1.1.0",
+    "httpx>=0.28.0,<1.0.0",
     "requests>=2.32.0",
     "rank-bm25>=0.2.2",
     "pyte>=0.8.2",
@@ -127,6 +128,7 @@ dev = [
     # JWT/JWKS test fixtures (test/fixtures/jwt_factory.py) mint RS256 tokens
     # with authlib; runtime verification needs only pyjwt[crypto].
     "authlib>=1.7.1",
+    "types-jsonschema>=4.26.0.20260518",
 ]
 
 [tool.black]

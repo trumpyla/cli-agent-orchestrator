@@ -105,6 +105,12 @@ class TestInstallCommand:
         assert result.exit_code == 0
         assert "frontmatter" in result.output
 
+    def test_install_rejects_peer_provider(self, runner: CliRunner) -> None:
+        result = runner.invoke(install, ["developer", "--provider", "peer"])
+
+        assert result.exit_code != 0
+        assert "Invalid value for '--provider'" in result.output
+
     def test_install_url_source_prints_download_confirmation(self, runner: CliRunner) -> None:
         """URL installs should print a download confirmation line."""
         service_result = InstallResult(

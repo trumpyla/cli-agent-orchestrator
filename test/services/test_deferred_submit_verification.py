@@ -85,6 +85,7 @@ class TestConfirmWorkerStartedOrResubmit:
         send.assert_called_once()
         assert send.call_args.args[0] == "t1"
         assert send.call_args.args[1] == "Analyze the logs"
+        assert send.call_args.kwargs["_commit_prepared_input"] is False
 
     async def test_returns_false_when_worker_never_starts(self):
         # Every confirm fails through all resubmit attempts.

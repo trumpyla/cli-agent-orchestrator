@@ -8,6 +8,7 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.profile import (
+    _load_schema,
     _validate_frontmatter,
     profile,
 )
@@ -136,6 +137,11 @@ class TestValidateFrontmatter:
     def test_valid_tools(self):
         meta = {"name": "x", "allowedTools": ["execute_bash", "@cao-mcp-server"]}
         assert _validate_frontmatter(meta) == []
+
+    def test_schema_loader_rejects_non_object_json(self):
+        with patch("pathlib.Path.read_text", return_value="[]"):
+            with pytest.raises(ValueError, match="JSON object"):
+                _load_schema()
 
 
 class TestAgentsListCommand:

@@ -391,6 +391,13 @@ class TestOpenCodeConstants:
 
         assert "opencode_cli" in PROVIDERS
 
+    def test_peer_is_serializable_but_not_launchable(self):
+        from cli_agent_orchestrator.constants import PROVIDERS
+        from cli_agent_orchestrator.models.provider import ProviderType
+
+        assert ProviderType("peer") is ProviderType.PEER
+        assert ProviderType.PEER.value not in PROVIDERS
+
 
 class TestOpenCodeProviderType:
     """Tests for OPENCODE_CLI entry in ProviderType enum."""

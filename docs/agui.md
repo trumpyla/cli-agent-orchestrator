@@ -243,9 +243,21 @@ library. No request body is required; the client is a pure observer. Replay is
 
 The **run plane** is the `POST /agui/v1/run` endpoint. It speaks the stock
 [ag-ui-protocol](https://github.com/ag-ui-protocol/ag-ui) wire dialect:
-`data:`-only camelCase JSON frames with a `type` field, produced by the official
-`EventEncoder`. This is what CopilotKit, the AG-UI Dojo, and other stock AG-UI
-clients expect.
+`data:`-only JSON frames with a `type` field, produced by the official
+`EventEncoder`. Official run-lifecycle fields retain the SDK's camelCase wire
+aliases; CAO correlation fields on extended projection events retain the
+snake_case contract that predates the SDK alias convention:
+
+| Event family | Correlation keys | Event-specific keys |
+|---|---|---|
+| Official `RUN_STARTED`, `RUN_FINISHED` | `threadId`, `runId` | SDK-defined |
+| CAO `RUN_ERROR`, `STATE_SNAPSHOT`, `STATE_DELTA`, `CUSTOM` | `thread_id`, `run_id` | SDK-defined |
+| CAO `STEP_STARTED`, `STEP_FINISHED` | `thread_id`, `run_id`, `step_id` | `stepName` |
+| CAO `TOOL_CALL_START`, `TOOL_CALL_END` | `thread_id`, `run_id` | `toolCallId`; starts also include `toolCallName` |
+
+The distinction is intentional and covered by exact serialization tests. Stock
+clients continue to receive SDK event types and payload shapes, while existing
+CAO consumers do not lose their shipped correlation keys.
 
 A client POSTs a `RunAgentInput` (threadId, runId, optional resume[]) and
 receives a lifecycle-legal stream: `RUN_STARTED` then `STATE_SNAPSHOT` then live

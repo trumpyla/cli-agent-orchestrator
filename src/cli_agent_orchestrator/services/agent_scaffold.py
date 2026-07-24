@@ -8,7 +8,7 @@ Ref: https://github.com/awslabs/cli-agent-orchestrator/issues/340
 
 import json
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, cast
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from jsonschema import Draft202012Validator
@@ -33,12 +33,12 @@ def _check_containment(path: Path, root: Path) -> None:
         raise FileNotFoundError(f"Template path escapes templates root: {path}")
 
 
-def list_templates() -> list[dict]:
+def list_templates() -> list[dict[str, str]]:
     """List available templates.
 
     Returns a list of dicts with keys: name, description, path.
     """
-    templates = []
+    templates: list[dict[str, str]] = []
     if not _TEMPLATES_ROOT.exists():
         return templates
 
@@ -58,7 +58,8 @@ def list_templates() -> list[dict]:
             if schema_file.exists():
                 try:
                     schema = json.loads(schema_file.read_text(encoding="utf-8"))
-                    description = schema.get("description", "")
+                    description_value = schema.get("description", "")
+                    description = description_value if isinstance(description_value, str) else ""
                 except (json.JSONDecodeError, OSError):
                     pass
 
@@ -73,7 +74,7 @@ def list_templates() -> list[dict]:
     return templates
 
 
-def get_template_schema(template_name: str) -> Optional[dict]:
+def get_template_schema(template_name: str) -> Optional[dict[str, Any]]:
     """Load the JSON-Schema for a template.
 
     template_name: category/name format (e.g., 'aws/stepfunction').
@@ -83,10 +84,13 @@ def get_template_schema(template_name: str) -> Optional[dict]:
     _check_containment(schema_path, _TEMPLATES_ROOT)
     if not schema_path.exists():
         return None
-    return json.loads(schema_path.read_text(encoding="utf-8"))
+    value = json.loads(schema_path.read_text(encoding="utf-8"))
+    if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
+        raise ValueError(f"Template schema for '{template_name}' must be a JSON object")
+    return cast(dict[str, Any], value)
 
 
-def validate_config(template_name: str, config: dict) -> list[str]:
+def validate_config(template_name: str, config: dict[str, Any]) -> list[str]:
     """Validate a config dict against a template's schema.
 
     Returns a list of error messages (empty = valid).
@@ -104,7 +108,7 @@ def validate_config(template_name: str, config: dict) -> list[str]:
     return errors
 
 
-def render_template(template_name: str, config: dict) -> str:
+def render_template(template_name: str, config: dict[str, Any]) -> str:
     """Render a template with the given config.
 
     template_name: category/name format (e.g., 'aws/stepfunction').

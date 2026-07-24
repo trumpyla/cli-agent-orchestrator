@@ -33,24 +33,29 @@ AG_UI_AVAILABLE = False
 
 try:
     from ag_ui.core.events import (
-        CustomEvent,
+        BaseEvent,
+        EventType,
     )
     from ag_ui.core.events import Interrupt as AgUiInterrupt
     from ag_ui.core.events import (
         RunAgentInput,
-        RunErrorEvent,
         RunFinishedEvent,
         RunFinishedInterruptOutcome,
         RunFinishedSuccessOutcome,
         RunStartedEvent,
-        StateDeltaEvent,
-        StateSnapshotEvent,
-        StepFinishedEvent,
-        StepStartedEvent,
-        ToolCallEndEvent,
-        ToolCallStartEvent,
     )
     from ag_ui.encoder import EventEncoder
+
+    from cli_agent_orchestrator.services.agui.run_plane_events import (
+        CaoCustomEvent,
+        CaoRunErrorEvent,
+        CaoStateDeltaEvent,
+        CaoStateSnapshotEvent,
+        CaoStepFinishedEvent,
+        CaoStepStartedEvent,
+        CaoToolCallEndEvent,
+        CaoToolCallStartEvent,
+    )
 
     AG_UI_AVAILABLE = True
 except ImportError:  # pragma: no cover - optional [agui] extra absent
@@ -132,6 +137,13 @@ def _extract_edited_text(payload: Any) -> Optional[str]:
 RUN_PLANE_HEARTBEAT_SECONDS = float(os.environ.get("CAO_AGUI_HEARTBEAT_SECONDS", "15.0"))
 
 
+def _new_event_encoder(accept: Optional[str]) -> "EventEncoder":
+    """Construct the SDK encoder without passing its incorrectly typed None."""
+    if accept is None:
+        return EventEncoder()
+    return EventEncoder(accept=accept)
+
+
 def get_run_plane_content_type(accept: Optional[str] = None) -> str:
     """Return the negotiated content type for the run plane response.
 
@@ -141,7 +153,7 @@ def get_run_plane_content_type(accept: Optional[str] = None) -> str:
     """
     if not AG_UI_AVAILABLE:
         return "text/event-stream"
-    encoder = EventEncoder(accept=accept)
+    encoder = _new_event_encoder(accept)
     return encoder.get_content_type() or "text/event-stream"
 
 
@@ -179,7 +191,7 @@ async def run_plane_stream(
     thread_id = run_input.thread_id
     run_id = run_input.run_id
 
-    encoder = EventEncoder(accept=accept)
+    encoder = _new_event_encoder(accept)
 
     # Guard: heartbeat comment frames are SSE-specific. If content negotiation
     # ever yields a non-SSE type, fall back to text/event-stream to avoid
@@ -188,7 +200,7 @@ async def run_plane_stream(
     _is_sse = "text/event-stream" in (_content_type or "text/event-stream")
 
     # Helper to emit one event.
-    def _emit(event: Any) -> str:
+    def _emit(event: "BaseEvent") -> str:
         return encoder.encode(event)
 
     # Track lifecycle state for legality.
@@ -196,7 +208,7 @@ async def run_plane_stream(
 
     # ── 1. RUN_STARTED ──────────────────────────────────────────────────
     run_started = RunStartedEvent(
-        type="RUN_STARTED",
+        type=EventType.RUN_STARTED,
         thread_id=thread_id,
         run_id=run_id,
     )
@@ -214,8 +226,8 @@ async def run_plane_stream(
             interrupt = approval_construct.get_interrupt(interrupt_id)
             if interrupt is None:
                 # Unknown interrupt -> RUN_ERROR
-                err = RunErrorEvent(
-                    type="RUN_ERROR",
+                err = CaoRunErrorEvent(
+                    type=EventType.RUN_ERROR,
                     thread_id=thread_id,
                     run_id=run_id,
                     message=f"Unknown interrupt: {interrupt_id}",
@@ -234,8 +246,8 @@ async def run_plane_stream(
                 decision_str = "deny"
 
             if decision_str is None:
-                err = RunErrorEvent(
-                    type="RUN_ERROR",
+                err = CaoRunErrorEvent(
+                    type=EventType.RUN_ERROR,
                     thread_id=thread_id,
                     run_id=run_id,
                     message=(
@@ -257,8 +269,8 @@ async def run_plane_stream(
                     edited_text=edited_text,
                 )
             except (KeyError, ValueError) as e:
-                err = RunErrorEvent(
-                    type="RUN_ERROR",
+                err = CaoRunErrorEvent(
+                    type=EventType.RUN_ERROR,
                     thread_id=thread_id,
                     run_id=run_id,
                     message=f"Resume failed for interrupt {interrupt_id}: {e}",
@@ -270,8 +282,8 @@ async def run_plane_stream(
                 # Delivery to the terminal failed; the interrupt is left
                 # unresolved (retryable). Surface an explicit error rather than
                 # finishing the run as a success (P1).
-                err = RunErrorEvent(
-                    type="RUN_ERROR",
+                err = CaoRunErrorEvent(
+                    type=EventType.RUN_ERROR,
                     thread_id=thread_id,
                     run_id=run_id,
                     message=f"Delivery failed for interrupt {interrupt_id} (retryable): {e}",
@@ -288,8 +300,8 @@ async def run_plane_stream(
             if snapshot_fn is not None:
                 try:
                     snapshot = snapshot_fn()
-                    snap_evt = StateSnapshotEvent(
-                        type="STATE_SNAPSHOT",
+                    snap_evt = CaoStateSnapshotEvent(
+                        type=EventType.STATE_SNAPSHOT,
                         thread_id=thread_id,
                         run_id=run_id,
                         snapshot=snapshot,
@@ -333,15 +345,15 @@ async def run_plane_stream(
                 ag_interrupts.append(ag_intr)
 
             # Emit RUN_FINISHED with interrupt outcome
-            outcome = RunFinishedInterruptOutcome(
+            interrupt_outcome = RunFinishedInterruptOutcome(
                 type="interrupt",
                 interrupts=ag_interrupts,
             )
             run_finished = RunFinishedEvent(
-                type="RUN_FINISHED",
+                type=EventType.RUN_FINISHED,
                 thread_id=thread_id,
                 run_id=run_id,
-                outcome=outcome,
+                outcome=interrupt_outcome,
             )
             yield _emit(run_finished)
             finished = True
@@ -351,8 +363,8 @@ async def run_plane_stream(
     if snapshot_fn is not None:
         try:
             snapshot = snapshot_fn()
-            snap_evt = StateSnapshotEvent(
-                type="STATE_SNAPSHOT",
+            snap_evt = CaoStateSnapshotEvent(
+                type=EventType.STATE_SNAPSHOT,
                 thread_id=thread_id,
                 run_id=run_id,
                 snapshot=snapshot,
@@ -409,12 +421,12 @@ async def run_plane_stream(
 
     # ── 6. RUN_FINISHED (success) ───────────────────────────────────────
     if not finished:
-        outcome = RunFinishedSuccessOutcome(type="success")
+        success_outcome = RunFinishedSuccessOutcome(type="success")
         run_finished = RunFinishedEvent(
-            type="RUN_FINISHED",
+            type=EventType.RUN_FINISHED,
             thread_id=thread_id,
             run_id=run_id,
-            outcome=outcome,
+            outcome=success_outcome,
         )
         yield _emit(run_finished)
 
@@ -437,120 +449,120 @@ def _translate_live_frame(
         if agui_type == _AGUI_STATE_SNAPSHOT:
             # data should contain a snapshot payload (from state_snapshot_frame)
             snapshot_value = data.get("snapshot") or data
-            evt = StateSnapshotEvent(
-                type="STATE_SNAPSHOT",
+            snapshot_event = CaoStateSnapshotEvent(
+                type=EventType.STATE_SNAPSHOT,
                 thread_id=thread_id,
                 run_id=run_id,
                 snapshot=snapshot_value,
             )
-            return encoder.encode(evt)
+            return encoder.encode(snapshot_event)
 
         elif agui_type == _AGUI_STATE_DELTA:
             delta = data.get("delta") or data.get("ops") or []
-            evt = StateDeltaEvent(
-                type="STATE_DELTA",
+            delta_event = CaoStateDeltaEvent(
+                type=EventType.STATE_DELTA,
                 thread_id=thread_id,
                 run_id=run_id,
                 delta=delta,
             )
-            return encoder.encode(evt)
+            return encoder.encode(delta_event)
 
         elif agui_type == _AGUI_STEP_STARTED:
             step_id = data.get("step_id") or data.get("terminal_id") or str(uuid.uuid4())
             step_name = data.get("step_name") or data.get("provider") or "step"
-            evt = StepStartedEvent(
-                type="STEP_STARTED",
+            step_started_event = CaoStepStartedEvent(
+                type=EventType.STEP_STARTED,
                 thread_id=thread_id,
                 run_id=run_id,
                 step_id=step_id,
                 step_name=step_name,
             )
-            return encoder.encode(evt)
+            return encoder.encode(step_started_event)
 
         elif agui_type == _AGUI_STEP_FINISHED:
             step_id = data.get("step_id") or data.get("terminal_id") or "unknown"
             step_name = data.get("step_name") or "step"
-            evt = StepFinishedEvent(
-                type="STEP_FINISHED",
+            step_finished_event = CaoStepFinishedEvent(
+                type=EventType.STEP_FINISHED,
                 thread_id=thread_id,
                 run_id=run_id,
                 step_id=step_id,
                 step_name=step_name,
             )
-            return encoder.encode(evt)
+            return encoder.encode(step_finished_event)
 
         elif agui_type == _AGUI_TOOL_CALL_START:
             tool_call_id = data.get("tool_call_id") or str(uuid.uuid4())
             tool_call_name = data.get("tool_call_name") or "unknown"
-            evt = ToolCallStartEvent(
-                type="TOOL_CALL_START",
+            tool_call_start_event = CaoToolCallStartEvent(
+                type=EventType.TOOL_CALL_START,
                 thread_id=thread_id,
                 run_id=run_id,
                 tool_call_id=tool_call_id,
                 tool_call_name=tool_call_name,
             )
-            return encoder.encode(evt)
+            return encoder.encode(tool_call_start_event)
 
         elif agui_type == _AGUI_TOOL_CALL_END:
             tool_call_id = data.get("tool_call_id") or "unknown"
-            evt = ToolCallEndEvent(
-                type="TOOL_CALL_END",
+            tool_call_end_event = CaoToolCallEndEvent(
+                type=EventType.TOOL_CALL_END,
                 thread_id=thread_id,
                 run_id=run_id,
                 tool_call_id=tool_call_id,
             )
-            return encoder.encode(evt)
+            return encoder.encode(tool_call_end_event)
 
         elif agui_type == _AGUI_GENERATIVE_UI:
-            evt = CustomEvent(
-                type="CUSTOM",
+            generative_ui_event = CaoCustomEvent(
+                type=EventType.CUSTOM,
                 thread_id=thread_id,
                 run_id=run_id,
                 name="cao.generative_ui",
                 value=data,
             )
-            return encoder.encode(evt)
+            return encoder.encode(generative_ui_event)
 
         elif agui_type == _AGUI_TEXT_MESSAGE_CONTENT:
-            evt = CustomEvent(
-                type="CUSTOM",
+            message_delivery_event = CaoCustomEvent(
+                type=EventType.CUSTOM,
                 thread_id=thread_id,
                 run_id=run_id,
                 name="cao.message_delivery",
                 value=data,
             )
-            return encoder.encode(evt)
+            return encoder.encode(message_delivery_event)
 
         elif agui_type == _AGUI_RAW:
-            evt = CustomEvent(
-                type="CUSTOM",
+            raw_event = CaoCustomEvent(
+                type=EventType.CUSTOM,
                 thread_id=thread_id,
                 run_id=run_id,
                 name="cao.raw",
                 value=data,
             )
-            return encoder.encode(evt)
+            return encoder.encode(raw_event)
 
         elif agui_type == _AGUI_RUN_ERROR:
             message = data.get("message") or "unknown error"
-            evt = RunErrorEvent(
-                type="RUN_ERROR",
+            run_error_event = CaoRunErrorEvent(
+                type=EventType.RUN_ERROR,
                 thread_id=thread_id,
                 run_id=run_id,
                 message=message,
             )
-            return encoder.encode(evt)
+            return encoder.encode(run_error_event)
 
         else:
             # Unmapped type -> custom event with the raw data
-            evt = CustomEvent(
-                type="CUSTOM",
+            fallback_event = CaoCustomEvent(
+                type=EventType.CUSTOM,
                 thread_id=thread_id,
                 run_id=run_id,
                 name=f"cao.{agui_type.lower()}",
                 value=data,
             )
-            return encoder.encode(evt)
+            return encoder.encode(fallback_event)
 
     except Exception:
         logger.warning("run_plane: failed to translate frame %s", agui_type, exc_info=True)

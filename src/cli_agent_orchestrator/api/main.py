@@ -41,9 +41,12 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     create_inbox_message,
+    create_peer,
     get_inbox_messages,
     get_terminal_metadata,
     init_db,
+    is_peer,
+    mark_messages_delivered,
 )
 from cli_agent_orchestrator.constants import (
     ALLOWED_HOSTS,
@@ -1306,7 +1309,9 @@ async def agui_run(
 
     Accepts a RunAgentInput body (camelCase) and streams lifecycle-legal SSE
     frames using the official ag-ui-protocol EventEncoder. Each frame is a
-    ``data:`` line containing camelCase JSON with a ``type`` field.
+    ``data:`` line containing JSON with a ``type`` field. Official run events
+    use SDK camelCase aliases; CAO projection events preserve their documented
+    snake_case correlation keys.
 
     When ``resume[]`` is non-empty, ``cao:write`` is required (the caller is
     mutating interrupt state). Otherwise ``cao:read`` is the floor.
@@ -2761,6 +2766,14 @@ async def create_inbox_message_endpoint(
             detail=f"Failed to create inbox message: {str(e)}",
         )
 
+    # Notify inbox subscribers (peer channel / cao-ops resource-update push) that a new
+    # message was stored. Body-free to preserve the event/telemetry privacy boundary —
+    # the message body travels only via the authenticated inbox read.
+    bus.publish(
+        f"terminal.{receiver_id}.inbox",
+        {"message_id": inbox_msg.id, "sender_id": inbox_msg.sender_id},
+    )
+
     # Attempt immediate delivery if terminal is already IDLE.
     # If not, InboxService will deliver on next IDLE status event.
     try:
@@ -2784,6 +2797,18 @@ async def get_inbox_messages_endpoint(
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
     ),
+    wait: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=120.0,
+        description="Long-poll seconds: block until a new pending message arrives (0 = immediate)",
+    ),
+    after_id: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Exclusive message-id cursor; returns only pending rows with id > after_id",
+    ),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:
     """Get inbox messages for a terminal.
 
@@ -2791,6 +2816,7 @@ async def get_inbox_messages_endpoint(
         terminal_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10, max: 100)
         status_param: Optional filter by message status ('pending', 'delivered', 'failed')
+        after_id: Optional exclusive message-id cursor
 
     Returns:
         List of inbox messages with sender_id, message, created_at, status
@@ -2807,8 +2833,44 @@ async def get_inbox_messages_endpoint(
                     detail=f"Invalid status: {status_param}. Valid values: pending, delivered, failed",
                 )
 
-        # Get messages using existing database function
-        messages = get_inbox_messages(terminal_id, limit=limit, status=status_filter)
+        # Waiting and cursored reads are delivery operations, so they always target
+        # pending messages. Preserve the legacy all-status immediate read only when
+        # neither behavior is requested.
+        delivery_read = wait > 0 or after_id is not None
+        if delivery_read and status_filter is None:
+            status_filter = MessageStatus.PENDING
+        if delivery_read and status_filter != MessageStatus.PENDING:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=(
+                    "wait>0 or after_id is only valid with status=pending " "or no status filter"
+                ),
+            )
+
+        # Subscribe FIRST (before the DB read) to close the check/wait race, then block
+        # up to `wait`s for a new inbox event if nothing is pending yet. Universal
+        # pseudo-push: works through any MCP client via an ordinary tool call.
+        queue = None
+        topic = f"terminal.{terminal_id}.inbox"
+        if wait > 0:
+            queue = bus.subscribe(topic)
+        try:
+            inbox_query: Dict[str, Any] = {
+                "limit": limit,
+                "status": status_filter,
+            }
+            if after_id is not None:
+                inbox_query["after_id"] = after_id
+            messages = get_inbox_messages(terminal_id, **inbox_query)
+            if wait > 0 and not messages and queue is not None:
+                try:
+                    await asyncio.wait_for(queue.get(), timeout=wait)
+                except asyncio.TimeoutError:
+                    pass
+                messages = get_inbox_messages(terminal_id, **inbox_query)
+        finally:
+            if queue is not None:
+                bus.unsubscribe(topic, queue)
 
         # Convert to response format
         result = []
@@ -2836,6 +2898,104 @@ async def get_inbox_messages_endpoint(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to retrieve inbox messages: {str(e)}",
         )
+
+
+class RegisterPeerRequest(BaseModel):
+    """Body for POST /peers (all fields optional)."""
+
+    name: Optional[str] = Field(default=None, description="Optional human label for the peer")
+    mode: Optional[str] = Field(
+        default=None,
+        description=(
+            "Forward-compat; only 'poll' is honored (MCP subscription is a " "supplemental wakeup)"
+        ),
+    )
+
+
+class PeerResponse(BaseModel):
+    """A registered pane-less peer inbox receiver."""
+
+    peer_id: str = Field(description="8-hex TerminalId of the peer inbox receiver")
+    name: Optional[str] = Field(default=None, description="The human label, if one was supplied")
+    mode: str = Field(description="Delivery mode; always 'poll' (the driver pulls)")
+
+
+class AckRequest(BaseModel):
+    """Body for POST /terminals/{id}/inbox/ack."""
+
+    message_ids: List[int] = Field(
+        default_factory=list,
+        max_length=100,
+        description="Inbox message ids to mark delivered (maximum 100 per request)",
+    )
+
+
+class AckResponse(BaseModel):
+    """Result of acking pulled peer-inbox messages."""
+
+    acked: int = Field(description="Number of messages marked delivered")
+
+
+@app.post(
+    "/peers",
+    response_model=PeerResponse,
+    tags=["peers"],
+    summary="Register a pane-less peer (bi-directional bridge)",
+)
+async def register_peer_endpoint(
+    body: RegisterPeerRequest = Body(default=RegisterPeerRequest()),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> PeerResponse:
+    """Register the driving CLI as a pane-less peer inbox receiver.
+
+    The peer is a valid inbox ``receiver_id`` with no tmux pane, so a conductor or
+    worker ``send_message(receiver_id=peer_id)`` lands in its inbox and stays PENDING
+    until the driver pulls it (``GET .../inbox/messages?status=pending``) and acks it
+    (``POST .../inbox/ack``). Only the **poll** delivery mode is honored — the
+    MCP resource subscription is an optional body-free wakeup, but the response remains
+    ``mode=poll`` because long-poll delivery is the reliable client-agnostic contract.
+    """
+    try:
+        peer_id = create_peer(name=body.name)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to register peer: {str(e)}",
+        )
+    return PeerResponse(peer_id=peer_id, name=body.name, mode="poll")
+
+
+@app.post(
+    "/terminals/{terminal_id}/inbox/ack",
+    response_model=AckResponse,
+    tags=["inbox"],
+    summary="Ack pulled peer-inbox messages (explicit delivered-marking)",
+)
+async def ack_inbox_messages_endpoint(
+    terminal_id: TerminalId,
+    body: AckRequest = Body(default=AckRequest()),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> AckResponse:
+    """Explicitly mark peer-inbox messages ``delivered`` (the GET does not ack on read).
+
+    A peer pulls pending messages, processes them, then acks the ids here so they are
+    not re-returned. ``terminal_id`` is validated as 8-hex by ``TerminalId`` (a
+    non-8-hex id such as ``peer-abc`` returns 422).
+    """
+    if not is_peer(terminal_id):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Peer '{terminal_id}' not found",
+        )
+
+    try:
+        acked = mark_messages_delivered(terminal_id, body.message_ids)
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to ack messages: {str(e)}",
+        )
+    return AckResponse(acked=acked)
 
 
 @app.websocket("/terminals/{terminal_id}/ws")

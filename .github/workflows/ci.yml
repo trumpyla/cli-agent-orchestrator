@@ -227,11 +227,6 @@ jobs:
 
       - name: Run type checker with mypy
         run: uv run mypy src/
-        # Pre-existing repo-wide mypy errors (agent_scaffold/profile/
-        # memory_service — unrelated to AG-UI) are tolerated as non-blocking on
-        # main; this PR introduces none. Mirror main's policy so Code Quality
-        # stays green rather than silently making mypy a hard gate here.
-        continue-on-error: true
 
   ag-ui-demo:
     name: AG-UI demo (shift-left recording)

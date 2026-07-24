@@ -321,6 +321,12 @@ class TestInstallAgent:
         assert "kiro_cli" in result.message
         assert not install_paths["env_file"].exists()
 
+    def test_install_rejects_synthetic_peer_provider(self, install_paths: dict[str, Path]) -> None:
+        result = install_agent("missing-agent", "peer")
+
+        assert result.success is False
+        assert result.message.startswith("Invalid provider 'peer'.")
+
     def test_install_returns_failure_for_download_errors(
         self, install_paths: dict[str, Path]
     ) -> None:

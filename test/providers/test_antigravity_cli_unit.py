@@ -1,7 +1,7 @@
 """Unit tests for the Antigravity CLI (``agy``) provider."""
 
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -443,6 +443,45 @@ def test_mcp_registration_accepts_pydantic_mcpserver(tmp_path):
     assert data["mcpServers"]["other"]["command"] == "keep"  # untouched
 
 
+def test_mcp_registration_preserves_profile_entry_fields(tmp_path):
+    """Agy registration only resolves runtime fields; it must retain MCP options."""
+    import json
+
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="reviewer_gemini",
+        description="Reviewer",
+        system_prompt="You review code.",
+        mcpServers={
+            "cao-mcp-server": {
+                "type": "stdio",
+                "command": "uvx",
+                "args": ["cao-mcp-server"],
+                "timeout": 120_000,
+            }
+        },
+    )
+    p = make_provider(agent_profile="reviewer_gemini")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()
+
+    entry = json.loads(cfg.read_text())["mcpServers"]["cao-mcp-server"]
+    assert entry["type"] == "stdio"
+    assert entry["timeout"] == 120_000
+
+
 def test_mcp_registration_recovers_from_corrupt_config(tmp_path):
     import json
 
@@ -708,10 +747,149 @@ async def test_initialize_success(monkeypatch):
         "cli_agent_orchestrator.providers.antigravity_cli.wait_until_status",
         fake_wait_until_status,
     )
+    monkeypatch.setattr(p, "wait_until_input_ready", AsyncMock(return_value=True))
+    to_thread = AsyncMock(side_effect=lambda func, *args, **kwargs: func(*args, **kwargs))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.asyncio.to_thread", to_thread
+    )
 
     assert await p.initialize() is True
     assert p._initialized is True
+    assert p.is_input_ready is True
     assert sent["command"].startswith("agy --dangerously-skip-permissions")
+    assert to_thread.await_count == 1
+    assert to_thread.await_args.args[0] == p._handle_startup_dialog
+
+
+@pytest.mark.asyncio
+async def test_wait_until_input_ready_requires_stable_interactive_surface(monkeypatch):
+    p = make_provider()
+    ready = "────────────────────\n> \n────────────────────\n? for shortcuts"
+
+    class FakeBackend:
+        def get_history(self, session, window, tail_lines):
+            return ready
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+
+    assert await p.wait_until_input_ready(timeout=0.2, poll_interval=0.01) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_until_input_ready_offloads_backend_capture(monkeypatch):
+    """A slow Herdr pane read must not block the server event loop."""
+    p = make_provider()
+    ready = "────────────────────\n> \n────────────────────\n? for shortcuts"
+
+    class FakeBackend:
+        def get_history(self, session, window, tail_lines):
+            return ready
+
+    backend = FakeBackend()
+    to_thread = AsyncMock(side_effect=lambda func, *args, **kwargs: func(*args, **kwargs))
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: backend
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.asyncio.to_thread", to_thread
+    )
+
+    assert await p.wait_until_input_ready(timeout=0.2, poll_interval=0.01) is True
+    assert to_thread.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_wait_until_input_ready_retries_transient_capture_failure(monkeypatch):
+    """One backend read failure must not consume the entire readiness timeout."""
+    p = make_provider()
+    ready = "────────────────────\n> \n────────────────────\n? for shortcuts"
+    captures = [RuntimeError("transient read failure"), ready, ready]
+
+    class FakeBackend:
+        def get_history(self, session, window, tail_lines):
+            value = captures.pop(0)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+
+    assert await p.wait_until_input_ready(timeout=0.2, poll_interval=0.01) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_until_input_ready_caps_persistent_capture_failures(monkeypatch):
+    """A dead backend must fail promptly instead of consuming the full init timeout."""
+    p = make_provider()
+    calls = 0
+
+    class FakeBackend:
+        def get_history(self, session, window, tail_lines):
+            nonlocal calls
+            calls += 1
+            raise RuntimeError("pane is gone")
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+
+    assert await p.wait_until_input_ready(timeout=0.05, poll_interval=0.0) is False
+    assert calls == 3
+
+
+@pytest.mark.asyncio
+async def test_wait_until_input_ready_rejects_changing_startup_surface(monkeypatch):
+    p = make_provider()
+    counter = 0
+
+    class FakeBackend:
+        def get_history(self, session, window, tail_lines):
+            nonlocal counter
+            counter += 1
+            return f"starting frame {counter}\n? for shortcuts"
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+
+    assert await p.wait_until_input_ready(timeout=0.04, poll_interval=0.01) is False
+    assert p.is_input_ready is False
+
+
+@pytest.mark.asyncio
+async def test_initialize_raises_when_input_surface_never_settles(monkeypatch):
+    p = make_provider()
+
+    class FakeBackend:
+        def send_keys(self, session, window, command):
+            pass
+
+    async def always_true(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+        lambda b: "/usr/local/bin/agy",
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.wait_for_shell", always_true
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.wait_until_status", always_true
+    )
+    monkeypatch.setattr(p, "wait_until_input_ready", AsyncMock(return_value=False))
+
+    with pytest.raises(TimeoutError, match="input surface"):
+        await p.initialize()
+
+    assert p.is_input_ready is False
 
 
 @pytest.mark.asyncio

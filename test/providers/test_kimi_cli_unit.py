@@ -102,7 +102,7 @@ class TestKimiCliProviderInitialization:
     async def test_initialize_with_agent_profile(
         self, mock_load, mock_tmux, mock_wait_shell, mock_wait_status
     ):
-        """Test initialization with agent profile creates temp files."""
+        """Interactive Kimi starts without v2-only agent-file flags."""
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         mock_profile = MagicMock()
@@ -116,11 +116,14 @@ class TestKimiCliProviderInitialization:
         result = await provider.initialize()
         assert result is True
 
-        # Verify kimi command includes --agent-file
+        # Kimi 0.29 limits --agent-file to the v2 non-interactive engine.
         call_args = mock_tmux.return_value.send_keys.call_args
         command = call_args[0][2]
-        assert "--agent-file" in command
+        assert "--agent-file" not in command
         assert "--yolo" in command
+        assert provider.prepare_input("Review this") == (
+            "You are a helpful assistant\n\nReview this"
+        )
 
         # Cleanup temp files
         provider.cleanup()
@@ -560,7 +563,7 @@ class TestKimiCliProviderBuildCommand:
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_with_system_prompt(self, mock_load):
-        """Test command with agent profile containing system prompt."""
+        """Profile prompts are deferred to first input for interactive Kimi."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "You are a developer"
@@ -572,7 +575,10 @@ class TestKimiCliProviderBuildCommand:
 
         assert "kimi" in command
         assert "--yolo" in command
-        assert "--agent-file" in command
+        assert "--agent-file" not in command
+        assert provider.prepare_input("Implement it") == "You are a developer\n\nImplement it"
+        assert provider.commit_prepared_input() is True
+        assert provider.prepare_input("Second turn") == "Second turn"
         # Temp directory should be created
         assert provider._temp_dir is not None
 
@@ -627,8 +633,8 @@ class TestKimiCliProviderBuildCommand:
         provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
-    def test_build_command_creates_agent_yaml(self, mock_load):
-        """Test that agent YAML and system prompt files are created correctly."""
+    def test_build_command_does_not_create_v2_agent_files(self, mock_load):
+        """Interactive Kimi 0.29 must not receive v2-only agent-file configuration."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = "Custom system prompt"
@@ -636,25 +642,38 @@ class TestKimiCliProviderBuildCommand:
         mock_load.return_value = mock_profile
 
         provider = KimiCliProvider("term-1", "session-1", "window-1", agent_profile="dev")
-        provider._build_kimi_command()
+        command = provider._build_kimi_command()
 
-        # Check temp files were created
         assert provider._temp_dir is not None
-        assert os.path.exists(os.path.join(provider._temp_dir, "agent.yaml"))
-        assert os.path.exists(os.path.join(provider._temp_dir, "system.md"))
-
-        # Check system prompt content
-        with open(os.path.join(provider._temp_dir, "system.md")) as f:
-            assert f.read() == "Custom system prompt"
-
-        # Check agent YAML content
-        with open(os.path.join(provider._temp_dir, "agent.yaml")) as f:
-            content = f.read()
-            assert "extend: default" in content
-            assert "system_prompt_path: ./system.md" in content
+        assert "--agent-file" not in command
+        assert not os.path.exists(os.path.join(provider._temp_dir, "agent.yaml"))
+        assert not os.path.exists(os.path.join(provider._temp_dir, "system.md"))
+        assert provider.prepare_input("Task") == "Custom system prompt\n\nTask"
 
         # Cleanup
         provider.cleanup()
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_uses_plan_mode_for_read_only_profile(self, mock_load):
+        """Reviewer profiles use Kimi's interactive plan mode as a native guardrail."""
+        mock_profile = MagicMock()
+        mock_profile.model = "kimi-code/k3"
+        mock_profile.system_prompt = "Review only."
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider(
+            "term-1",
+            "session-1",
+            "window-1",
+            agent_profile="reviewer",
+            allowed_tools=["@builtin", "fs_read", "fs_list", "@cao-mcp-server"],
+        )
+
+        command = provider._build_kimi_command()
+
+        assert "--plan" in command
+        assert "--agent-file" not in command
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_with_pydantic_mcp_config(self, mock_load):

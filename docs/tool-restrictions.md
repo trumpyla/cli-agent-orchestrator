@@ -241,7 +241,7 @@ As described in [How Tool Restrictions Are Enforced](#how-tool-restrictions-are-
 | **Claude Code** | Hard | `--disallowedTools` flags block specific tools |
 | **Kiro CLI** | Hard | `allowedTools` in agent JSON at install time |
 | **Copilot CLI** | Hard | `--deny-tool` flags override `--allow-all` |
-| **Kimi CLI** | Soft | Security system prompt only |
+| **Kimi CLI** | Soft + plan guardrail | Security prompt; read-only profiles also launch with `--plan` |
 | **Codex** | Soft | Security system prompt only |
 | **Hermes** | Profile-defined | CAO launches default `hermes` or the optional `hermesProfile` wrapper declared by the CAO profile; restrict tools in that Hermes profile |
 
@@ -273,6 +273,12 @@ copilot --allow-all --deny-tool shell --deny-tool write
 You may ONLY use these tools: @cao-mcp-server, fs_read, fs_list
 Do NOT attempt to use: execute_bash, fs_write
 ```
+
+For Kimi profiles whose resolved CAO tools contain no `fs_write`, `fs_*`, or
+`execute_bash`, CAO also launches the interactive CLI with `--plan`. This is a
+useful native guardrail for reviewer sessions, but it does not turn Kimi into a
+hard-enforcement provider: Kimi plan mode still permits shell-tool behavior, so
+the prompt restriction remains part of the boundary.
 
 ## Cross-Provider Inheritance
 

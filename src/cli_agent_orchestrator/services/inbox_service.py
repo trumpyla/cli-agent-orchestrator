@@ -10,6 +10,7 @@ from itertools import groupby
 from cli_agent_orchestrator.backends.base import TerminalNotFoundError
 from cli_agent_orchestrator.clients.database import (
     get_pending_messages,
+    is_peer,
     list_pending_receiver_ids_by_provider,
     list_pending_receiver_ids_older_than,
     update_message_status,
@@ -71,9 +72,29 @@ class InboxService:
         ``send_message`` orchestration type are threaded to ``terminal_service``
         so ``PostSendMessageEvent`` hooks fire with correct attribution.
         """
+        # Peers (external drivers) have no tmux pane: never pane-inject. Leave their
+        # messages PENDING for pull via the peer channel (bi-directional bridge).
+        if is_peer(terminal_id):
+            return
+
         limit = num_messages if num_messages > 0 else 100
         messages = get_pending_messages(terminal_id, limit=limit)
         if not messages:
+            return
+
+        try:
+            provider = provider_manager.get_provider(terminal_id)
+        except ValueError:
+            # Legacy/recovery paths can have a live terminal without an
+            # in-process provider instance. Preserve their existing delivery
+            # behavior; the startup race guard applies when the launching
+            # provider is registered and can report readiness.
+            provider = None
+        if provider is not None and not getattr(provider, "is_input_ready", True):
+            # A status detector can briefly report IDLE while a full-screen TUI
+            # is still mounting. Leave the durable row PENDING so the reconcile
+            # sweep retries after provider initialization instead of losing the
+            # first prompt inside an unready widget.
             return
 
         status = status_monitor.get_status(terminal_id)
@@ -86,7 +107,6 @@ class InboxService:
                 TerminalStatus.PROCESSING,
                 TerminalStatus.WAITING_USER_ANSWER,
             ):
-                provider = provider_manager.get_provider(terminal_id)
                 eager_eligible = provider is not None and getattr(
                     provider, "accepts_input_while_processing", False
                 )

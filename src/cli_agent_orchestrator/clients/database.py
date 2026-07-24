@@ -3,6 +3,7 @@
 import logging
 import os
 import uuid
+from contextlib import closing
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, cast
 
@@ -17,6 +18,7 @@ from sqlalchemy import (
     UniqueConstraint,
     create_engine,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
@@ -40,6 +42,12 @@ class TerminalModel(Base):
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
+    # NULL identifies rows created before lifecycle persistence was introduced.
+    # New rows start False and flip True only after provider.initialize() succeeds.
+    provider_initialized = Column(Boolean, nullable=True)
+    # Kimi's interactive profile prompt is delivered with its first task.
+    # NULL is the legacy state; False/True provide restart-safe two-phase delivery.
+    profile_prompt_delivered = Column(Boolean, nullable=True)
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
     last_active = Column(DateTime, default=datetime.now)
 
@@ -48,6 +56,7 @@ class InboxModel(Base):
     """SQLAlchemy model for inbox messages."""
 
     __tablename__ = "inbox"
+    __table_args__ = {"sqlite_autoincrement": True}
 
     id = Column(Integer, primary_key=True, autoincrement=True)
     sender_id = Column(String, nullable=False)
@@ -173,6 +182,7 @@ def init_db() -> None:
     _migrate_project_aliases_schema()
     Base.metadata.create_all(bind=engine)
     _restrict_db_file_permissions()
+    _migrate_inbox_autoincrement()
     _migrate_terminals_schema()
     _migrate_memory_indexes()
     _migrate_add_access_count()
@@ -204,6 +214,50 @@ def _restrict_db_file_permissions() -> None:
             os.chmod(path, 0o600)
         except OSError as e:
             logger.warning(f"Could not restrict DB file permissions on {path}: {e}")
+
+
+def _migrate_inbox_autoincrement() -> None:
+    """Rebuild legacy inbox tables so cursor IDs can never be reused.
+
+    SQLite's ordinary ``INTEGER PRIMARY KEY`` reuses the deleted maximum rowid.
+    Peer long-poll and subscription cursors are exclusive message IDs, so reuse
+    could make a new durable row permanently invisible behind an old cursor.
+    ``AUTOINCREMENT`` records the high-water mark in ``sqlite_sequence``.
+    """
+    import sqlite3
+
+    from cli_agent_orchestrator.constants import DATABASE_FILE
+
+    try:
+        # The connection context owns the transaction; closing owns the handle.
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
+            row = conn.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='inbox'"
+            ).fetchone()
+            if row is None or "AUTOINCREMENT" in (row[0] or "").upper():
+                return
+
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                "CREATE TABLE inbox_autoincrement_new ("
+                "id INTEGER NOT NULL PRIMARY KEY AUTOINCREMENT, "
+                "sender_id VARCHAR NOT NULL, "
+                "receiver_id VARCHAR NOT NULL, "
+                "message VARCHAR NOT NULL, "
+                "status VARCHAR NOT NULL, "
+                "created_at DATETIME)"
+            )
+            conn.execute(
+                "INSERT INTO inbox_autoincrement_new "
+                "(id, sender_id, receiver_id, message, status, created_at) "
+                "SELECT id, sender_id, receiver_id, message, status, created_at FROM inbox"
+            )
+            conn.execute("DROP TABLE inbox")
+            conn.execute("ALTER TABLE inbox_autoincrement_new RENAME TO inbox")
+            conn.commit()
+            logger.info("Migration: rebuilt inbox with non-reusing AUTOINCREMENT ids")
+    except Exception as exc:
+        logger.warning("Migration check for inbox AUTOINCREMENT failed: %s", exc)
 
 
 def _migrate_project_aliases_schema() -> None:
@@ -495,7 +549,7 @@ def _migrate_workflow_run_step() -> None:
 
 
 def _migrate_terminals_schema() -> None:
-    """Add allowed_tools and shell_command columns to terminals table if missing (schema migration)."""
+    """Add backward-compatible terminal lifecycle columns when missing."""
     import sqlite3
 
     from cli_agent_orchestrator.constants import DATABASE_FILE
@@ -516,6 +570,18 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
             conn.commit()
             logger.info("Migration: added caller_id column to terminals table")
+        if "provider_initialized" not in columns:
+            conn.execute(
+                "ALTER TABLE terminals ADD COLUMN provider_initialized BOOLEAN DEFAULT NULL"
+            )
+            conn.commit()
+            logger.info("Migration: added provider_initialized column to terminals table")
+        if "profile_prompt_delivered" not in columns:
+            conn.execute(
+                "ALTER TABLE terminals ADD COLUMN profile_prompt_delivered BOOLEAN DEFAULT NULL"
+            )
+            conn.commit()
+            logger.info("Migration: added profile_prompt_delivered column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -543,6 +609,8 @@ def create_terminal(
             agent_profile=agent_profile,
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
+            provider_initialized=False,
+            profile_prompt_delivered=False,
             caller_id=caller_id,
         )
         db.add(terminal)
@@ -555,8 +623,68 @@ def create_terminal(
             "agent_profile": terminal.agent_profile,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
+            "provider_initialized": terminal.provider_initialized,
+            "profile_prompt_delivered": terminal.profile_prompt_delivered,
             "caller_id": terminal.caller_id,
         }
+
+
+PEER_PROVIDER = "peer"  # ProviderType.PEER.value; pane-less external-driver receiver
+PEER_TMUX_SESSION = "__peers__"  # sentinel session for peers (no real tmux pane/tab)
+
+
+def create_peer(name: Optional[str] = None) -> str:
+    """Register a pane-less peer (external driver) as an inbox receiver.
+
+    Mints an 8-hex terminal id (the ``TerminalId`` ``^[a-f0-9]{8}$`` shape) and inserts
+    a terminal row with ``provider='peer'`` and a sentinel session, so the peer is a
+    valid inbox ``receiver_id`` but has no tmux pane. Returns the peer id.
+    """
+    import secrets
+
+    for _ in range(5):
+        peer_id = secrets.token_hex(4)  # 8 lowercase-hex chars
+        try:
+            create_terminal(
+                terminal_id=peer_id,
+                tmux_session=PEER_TMUX_SESSION,
+                tmux_window=name or peer_id,
+                provider=PEER_PROVIDER,
+            )
+        except IntegrityError:
+            logger.debug("Peer id collision for %s; retrying", peer_id)
+            continue
+        return peer_id
+    raise RuntimeError("could not mint a unique 8-hex peer id after 5 attempts")
+
+
+def is_peer(terminal_id: str) -> bool:
+    """Return True if the terminal is a pane-less peer receiver."""
+    with SessionLocal() as db:
+        row = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        return bool(row and row.provider == PEER_PROVIDER)
+
+
+def mark_messages_delivered(receiver_id: str, message_ids: List[int]) -> int:
+    """Explicitly mark peer-inbox messages ``delivered`` (ack); returns the count updated.
+
+    The inbox GET does not ack on read (verified), so a peer pulls with
+    ``get_inbox_messages`` then acks here — otherwise a message is re-returned forever.
+    """
+    if not message_ids:
+        return 0
+    with SessionLocal() as db:
+        updated = (
+            db.query(InboxModel)
+            .filter(
+                InboxModel.receiver_id == receiver_id,
+                InboxModel.id.in_(message_ids),
+                InboxModel.status == MessageStatus.PENDING.value,
+            )
+            .update({InboxModel.status: MessageStatus.DELIVERED.value}, synchronize_session=False)
+        )
+        db.commit()
+        return int(updated)
 
 
 def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
@@ -580,6 +708,8 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "agent_profile": terminal.agent_profile,
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
+            "provider_initialized": terminal.provider_initialized,
+            "profile_prompt_delivered": terminal.profile_prompt_delivered,
             "caller_id": terminal.caller_id,
             "last_active": terminal.last_active,
         }
@@ -619,6 +749,28 @@ def update_terminal_shell_command(terminal_id: str, shell_command: str) -> bool:
         terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
         if terminal:
             terminal.shell_command = shell_command
+            db.commit()
+            return True
+        return False
+
+
+def update_terminal_provider_initialized(terminal_id: str, initialized: bool = True) -> bool:
+    """Persist whether provider initialization completed successfully."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.provider_initialized = initialized
+            db.commit()
+            return True
+        return False
+
+
+def update_terminal_profile_prompt_delivered(terminal_id: str) -> bool:
+    """Persist that a provider's deferred first-message profile prompt was sent."""
+    with SessionLocal() as db:
+        terminal = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).first()
+        if terminal:
+            terminal.profile_prompt_delivered = True
             db.commit()
             return True
         return False
@@ -739,17 +891,24 @@ def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]
 
 
 def get_inbox_messages(
-    receiver_id: str, limit: int = 10, status: Optional[MessageStatus] = None
+    receiver_id: str,
+    limit: int = 10,
+    status: Optional[MessageStatus] = None,
+    after_id: Optional[int] = None,
 ) -> List[InboxMessage]:
-    """Get inbox messages with optional status filter ordered by created_at ASC (oldest first).
+    """Get inbox messages in stable oldest-first order.
+
+    Uncursored reads order by ``created_at``. Cursored reads order by ascending
+    message id so ``after_id`` pagination cannot skip or repeat a newer row.
 
     Args:
         receiver_id: Terminal ID to get messages for
         limit: Maximum number of messages to return (default: 10)
         status: Optional filter by message status (None = all statuses)
+        after_id: Optional exclusive message-id cursor
 
     Returns:
-        List of inbox messages ordered by creation time (oldest first)
+        List of inbox messages in the ordering described above.
     """
     with SessionLocal() as db:
         query = db.query(InboxModel).filter(InboxModel.receiver_id == receiver_id)
@@ -757,7 +916,13 @@ def get_inbox_messages(
         if status is not None:
             query = query.filter(InboxModel.status == status.value)
 
-        messages = query.order_by(InboxModel.created_at.asc()).limit(limit).all()
+        if after_id is not None:
+            query = query.filter(InboxModel.id > after_id)
+            order_by = InboxModel.id.asc()
+        else:
+            order_by = InboxModel.created_at.asc()
+
+        messages = query.order_by(order_by).limit(limit).all()
 
         return [
             InboxMessage(

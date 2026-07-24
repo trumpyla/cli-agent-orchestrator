@@ -6,6 +6,7 @@ exact counter sets.
 """
 
 import dataclasses
+from typing import cast
 
 import pytest
 
@@ -18,10 +19,14 @@ from cli_agent_orchestrator.services.memory_archive import (
     get_backend,
     register_backend,
 )
+from cli_agent_orchestrator.services.memory_service import MemoryService
 
 
 class _FakeBackend(MemoryArchiveBackend):
     format_name = "fake"
+
+    def __init__(self, memory_service: MemoryService):
+        self.memory_service = memory_service
 
     def export_bundle(self, scope, scope_id, dest, include_history, redact, prune=False):
         return ExportReport(exported=1)
@@ -50,7 +55,9 @@ class TestRegistry:
 
     def test_registered_backend_round_trips_reports(self, tmp_path):
         register_backend("fake", _FakeBackend)
-        backend = get_backend("fake")()
+        memory_service = cast(MemoryService, object())
+        backend = get_backend("fake")(memory_service)
+        assert backend.memory_service is memory_service
         export = backend.export_bundle("global", None, tmp_path, False, False)
         assert isinstance(export, ExportReport)
         assert export.exported == 1

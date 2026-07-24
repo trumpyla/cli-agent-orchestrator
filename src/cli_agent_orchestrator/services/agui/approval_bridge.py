@@ -11,18 +11,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Callable, Optional
 
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.agui.handoff_approval import (
     AgentHandoffWithApproval,
-    AnswerDelivery,
-    RecordingUiEmitter,
 )
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
+
+OutputGetter = Callable[[str], str]
+ProviderGetter = Callable[[str], Optional[str]]
+SessionGetter = Callable[[str], Optional[str]]
 
 
 class ApprovalBridge:
@@ -38,9 +40,9 @@ class ApprovalBridge:
     def __init__(
         self,
         construct: AgentHandoffWithApproval,
-        get_output_fn: Optional[object] = None,
-        get_provider_fn: Optional[object] = None,
-        get_session_fn: Optional[object] = None,
+        get_output_fn: Optional[OutputGetter] = None,
+        get_provider_fn: Optional[ProviderGetter] = None,
+        get_session_fn: Optional[SessionGetter] = None,
     ) -> None:
         """Initialize the bridge.
 
@@ -57,8 +59,8 @@ class ApprovalBridge:
         self._get_provider_fn = get_provider_fn
         self._get_session_fn = get_session_fn
         # Track which terminals are in WAITING_USER_ANSWER
-        self._waiting_terminals: set = set()
-        self._task: Optional[asyncio.Task] = None
+        self._waiting_terminals: set[str] = set()
+        self._task: Optional[asyncio.Task[None]] = None
 
     @property
     def construct(self) -> AgentHandoffWithApproval:

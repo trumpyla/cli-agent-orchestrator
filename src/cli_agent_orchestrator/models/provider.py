@@ -15,3 +15,4 @@ class ProviderType(str, Enum):
     ANTIGRAVITY_CLI = "antigravity_cli"
     # Credentials-free mock provider for tests/CI (no real CLI binary).
     MOCK_CLI = "mock_cli"
+    PEER = "peer"  # pane-less external-driver inbox receiver (bi-directional bridge)

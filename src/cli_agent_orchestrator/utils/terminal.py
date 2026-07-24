@@ -55,6 +55,21 @@ def generate_session_name() -> str:
     return validate_tmux_name(f"{SESSION_PREFIX}{session_uuid}", "session_name")
 
 
+def normalize_session_name(session_name: str) -> str:
+    """Return the validated canonical CAO session name.
+
+    Public callers may use either ``review`` or ``cao-review``. Backends and
+    persistence always use the canonical prefixed form so create/get/delete
+    cannot accidentally address different sessions.
+    """
+    canonical = (
+        session_name
+        if session_name.startswith(SESSION_PREFIX)
+        else f"{SESSION_PREFIX}{session_name}"
+    )
+    return validate_tmux_name(canonical, "session_name")
+
+
 def generate_terminal_id() -> str:
     """Generate terminal ID without prefix."""
     return uuid.uuid4().hex[:8]

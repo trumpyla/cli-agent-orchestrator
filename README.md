@@ -372,9 +372,27 @@ Other agents: use the equivalent stdio MCP command:
 uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao-ops-mcp-server
 ```
 
-**Available tools** — `list_profiles`, `get_profile_details`, `install_profile`, `launch_session`, `send_session_message`, `list_sessions`, `get_session_info`, `shutdown_session`.
+**Available tools** — `list_profiles`, `get_profile_details`, `install_profile`,
+`launch_session`, `send_session_message`, `send_terminal_input`,
+`send_terminal_key`, `get_terminal_status`, `get_terminal_output`,
+`read_session_output`, `list_sessions`, `get_session_info`,
+`shutdown_session`, `register_peer`, `receive_messages`, and `ack_messages`.
 
 Typical workflow: `list_profiles` → `install_profile` → `launch_session` → `send_session_message` → `get_session_info` → `shutdown_session`.
+
+`send_session_message` is the durable work-delivery path. Use
+`send_terminal_input` or `send_terminal_key` only to operate a currently visible
+approval, selection, or picker prompt. Those direct controls call the existing
+`cao:write|admin` HTTP endpoints, inherit their input/key validation, and are
+not queued for retry.
+
+For conductor/worker replies to the driving agent, call `register_peer`, pass the
+returned id into the task, long-poll with `receive_messages`, then acknowledge processed
+ids with `ack_messages`. Pass the highest observed id as `after_id` when waiting for a
+newer message while older rows remain unacknowledged. MCP resource subscription is also
+enabled as a body-free supplemental wakeup, but long-poll remains the reliable fallback.
+When API authentication is enabled, set `CAO_AUTH_LOCAL_TOKEN` for `cao-ops-mcp`; it
+forwards that bearer token on all API requests without exposing it in tool output.
 
 ### Flows — scheduled agent sessions
 

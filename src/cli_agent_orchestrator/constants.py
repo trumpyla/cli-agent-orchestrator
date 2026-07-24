@@ -54,8 +54,9 @@ SESSION_PREFIX = "cao-"
 # =============================================================================
 # Provider Configuration
 # =============================================================================
-# Available CLI providers - derived from the ProviderType enum for consistency
-PROVIDERS = [p.value for p in ProviderType]
+# Launchable CLI providers. ``peer`` remains a serializable ProviderType for
+# pane-less inbox records, but it has no process to install or launch.
+PROVIDERS = [p.value for p in ProviderType if p is not ProviderType.PEER]
 
 # Default provider used when --provider flag is not specified
 # Kiro CLI is the recommended provider for new projects
