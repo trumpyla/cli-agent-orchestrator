@@ -178,9 +178,11 @@ class TestCodexBuildCommand:
         assert "uvx" in command
         assert "mcp_servers.cao-mcp-server.args=" in command
         assert "cao-mcp-server" in command
-        # CAO_TERMINAL_ID must be forwarded for handoff to work
-        assert "mcp_servers.cao-mcp-server.env_vars=" in command
-        assert "CAO_TERMINAL_ID" in command
+        # The created terminal's id must reach cao-mcp-server for handoff to
+        # work — set explicitly via env, NOT inherited through env_vars (which
+        # would copy cao-server's own, possibly stale, CAO_TERMINAL_ID).
+        assert 'mcp_servers.cao-mcp-server.env.CAO_TERMINAL_ID="test1234"' in command
+        assert "mcp_servers.cao-mcp-server.env_vars=" not in command
         # Tool timeout must be a TOML float (600.0) for Codex's f64 deserializer
         assert "mcp_servers.cao-mcp-server.tool_timeout_sec=600.0" in command
 
@@ -314,9 +316,10 @@ class TestCodexBuildCommand:
         assert "mcp_servers.test-server.command=" in command
         assert "mcp_servers.test-server.env.API_KEY=" in command
         assert "secret123" in command
-        # CAO_TERMINAL_ID always forwarded even without explicit env_vars
-        assert "mcp_servers.test-server.env_vars=" in command
-        assert "CAO_TERMINAL_ID" in command
+        # A third-party MCP server is not the orchestration server, so no
+        # terminal identity is synthesized for it by either mechanism.
+        assert "CAO_TERMINAL_ID" not in command
+        assert "mcp_servers.test-server.env_vars=" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env_vars(self, mock_load_profile):
@@ -336,10 +339,11 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
         command = provider._build_codex_command()
 
-        # Existing env_vars preserved and CAO_TERMINAL_ID appended
-        assert "HOME" in command
-        assert "PATH" in command
-        assert "CAO_TERMINAL_ID" in command
+        # Existing env_vars are preserved verbatim; CAO_TERMINAL_ID is not
+        # appended — inheriting it from the parent process is the stale-identity
+        # path, and this server is not the orchestration server anyway.
+        assert 'mcp_servers.my-server.env_vars=["HOME", "PATH"]' in command
+        assert "CAO_TERMINAL_ID" not in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_empty_system_prompt(self, mock_load_profile):

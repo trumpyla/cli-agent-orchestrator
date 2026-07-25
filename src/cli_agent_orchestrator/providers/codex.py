@@ -8,10 +8,19 @@ import time
 from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.models.mcp_server import HttpMcpServer, parse_mcp_server_entry
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.mcp_translation import codex_http_fields
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_launch import (
+    TERMINAL_ID_ENV_VAR,
+    apply_terminal_identity,
+    is_identity_bearing_command,
+    resolve_http_url,
+    snapshot_process_env,
+)
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -337,6 +346,9 @@ class CodexProvider(BaseProvider):
             # Add MCP servers via -c config overrides (per-session, no global config changes).
             # Each server field is set via dotted path: mcp_servers.<name>.<field>=<value>
             if profile.mcpServers:
+                # One process-environment snapshot per launch drives every HTTP
+                # URL reference resolution below.
+                env_snapshot = snapshot_process_env()
                 for server_name, server_config in profile.mcpServers.items():
                     # Codex-only validation: the server name becomes part of
                     # the -c override PATH (a TOML dotted path), so it must be
@@ -346,13 +358,41 @@ class CodexProvider(BaseProvider):
                     # string key is valid, so they don't need this.
                     _validate_config_key(server_name, source="mcpServers name")
                     prefix = f"mcp_servers.{server_name}"
-                    if isinstance(server_config, dict):
-                        cfg = dict(server_config)
-                    else:
-                        cfg = server_config.model_dump(exclude_none=True)
+                    # Narrow to a strict variant. HTTP entries emit only the
+                    # native url (+ client-side tool_timeout_sec) — no command,
+                    # args, env, or env_vars — and never CAO_TERMINAL_ID.
+                    entry = parse_mcp_server_entry(server_config, server_name=server_name)
+                    if isinstance(entry, HttpMcpServer):
+                        url = resolve_http_url(entry.url, env_snapshot, server_name=server_name)
+                        fields = codex_http_fields(url)
+                        command_parts.extend(["-c", f"{prefix}.url={_toml_scalar(fields['url'])}"])
+                        command_parts.extend(
+                            ["-c", f"{prefix}.tool_timeout_sec={fields['tool_timeout_sec']}"]
+                        )
+                        continue
+                    # The narrowed model is the single serialization source: it
+                    # round-trips a legacy command entry byte-for-byte (declared
+                    # fields plus provider extras, unset keys dropped).
+                    cfg = entry.model_dump(exclude_none=True)
+                    # Decided from what the PROFILE declared, before the command
+                    # is rewritten below.
+                    identity_bearing = is_identity_bearing_command(
+                        cfg.get("command"), cfg.get("args")
+                    )
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
                     cfg = resolve_mcp_server_config(cfg)
+                    # Fresh callback identity for THIS terminal, set explicitly
+                    # via ``env`` rather than inherited through ``env_vars``.
+                    # env_vars would copy CAO_TERMINAL_ID from cao-server's OWN
+                    # process environment — a stale source (cao-server frequently
+                    # runs inside another CAO terminal), so the MCP subprocess
+                    # would answer callbacks as the wrong terminal.
+                    cfg = apply_terminal_identity(
+                        cfg,
+                        terminal_id=self.terminal_id,
+                        identity_bearing=identity_bearing,
+                    )
                     if "command" in cfg:
                         command_parts.extend(
                             ["-c", f"{prefix}.command={_toml_scalar(cfg['command'])}"]
@@ -366,15 +406,16 @@ class CodexProvider(BaseProvider):
                             command_parts.extend(
                                 ["-c", f"{prefix}.env.{env_key}={_toml_scalar(str(env_val))}"]
                             )
-                    # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                    # can identify the current session for handoff/assign operations.
-                    # Codex does not forward env vars to MCP subprocesses by default;
-                    # env_vars lists names to inherit from the parent shell environment.
-                    env_vars = cfg.get("env_vars", [])
-                    if "CAO_TERMINAL_ID" not in env_vars:
-                        env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
-                    env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
-                    command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
+                    # Any other env_vars the profile asked to inherit are kept;
+                    # CAO_TERMINAL_ID is deliberately not among them.
+                    env_vars = [
+                        name
+                        for name in cfg.get("env_vars", []) or []
+                        if name != TERMINAL_ID_ENV_VAR
+                    ]
+                    if env_vars:
+                        env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
+                        command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
                     # Set a generous tool timeout for MCP calls like handoff, which
                     # create a new terminal, initialize the provider, send a message,
                     # wait for the agent to complete, and extract the output.

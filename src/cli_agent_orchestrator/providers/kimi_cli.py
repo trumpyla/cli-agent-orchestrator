@@ -37,15 +37,62 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.models.mcp_server import (
+    HttpMcpServer,
+    McpConfigError,
+    parse_mcp_server_entry,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.mcp_translation import kimi_http_entry
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_launch import (
+    apply_terminal_identity,
+    is_identity_bearing_command,
+    resolve_http_url,
+    snapshot_process_env,
+)
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Kimi MCP configuration discovery
+# =============================================================================
+
+# Kimi 0.29 resolves MCP configuration from three documented scopes, with LATER
+# scopes overriding earlier ones. It has no ``--mcp-config`` flag, so CAO cannot
+# hand it a config path — it must write one of these locations instead.
+KIMI_MCP_HOME_ENV_VAR = "KIMI_CODE_HOME"
+KIMI_MCP_HOME_DEFAULT_DIRNAME = ".kimi-code"
+
+#: Path of the cwd-scoped file, relative to the working directory Kimi is
+#: launched in. This is the LAST scope, so it wins over the two shared ones —
+#: which is why CAO writes here (beneath the terminal's unique temp cwd) and
+#: never touches the user-global or repository-shared files.
+KIMI_CWD_MCP_RELPATH = f"{KIMI_MCP_HOME_DEFAULT_DIRNAME}/mcp.json"
+
+KIMI_MCP_DISCOVERY_SCOPES = (
+    f"${KIMI_MCP_HOME_ENV_VAR}/mcp.json",  # user scope, default ~/.kimi-code
+    ".mcp.json",  # project root
+    KIMI_CWD_MCP_RELPATH,  # cwd — overrides the two above
+)
+
+
+def kimi_mcp_home() -> Path:
+    """The user-scope Kimi config directory, resolved at call time.
+
+    ``$KIMI_CODE_HOME`` wins; otherwise ``~/.kimi-code``. CAO only needs this to
+    *avoid* the location — it is never written.
+    """
+    override = os.environ.get(KIMI_MCP_HOME_ENV_VAR)
+    if override:
+        return Path(override)
+    return Path.home() / KIMI_MCP_HOME_DEFAULT_DIRNAME
 
 
 # Custom exception for provider errors
@@ -332,6 +379,29 @@ class KimiCliProvider(BaseProvider):
         except Exception:
             return None
 
+    def _write_kimi_mcp_config(self, mcp_config: Dict[str, Any], *, cwd: str) -> None:
+        """Write the cwd-scoped MCP config file for this terminal's ``cwd``.
+
+        Kimi 0.29 has no ``--mcp-config`` flag, so CAO writes one of the three
+        documented discovery scopes (:data:`KIMI_MCP_DISCOVERY_SCOPES`) instead.
+        It writes the *last* one, ``<cwd>/.kimi-code/mcp.json``, for two reasons:
+        later scopes override earlier ones, so a user-global or repository-shared
+        file cannot displace CAO's wiring; and ``cwd`` is this terminal's unique
+        temp directory, so per-terminal config never collides. The user-scope
+        (:func:`kimi_mcp_home`) and project-root ``.mcp.json`` files are never
+        read or written. The map itself is Claude-compatible ``mcpServers``.
+
+        ``cwd`` is passed in rather than read from ``self`` so the file provably
+        lands in the same directory the launch command ``cd``s into.
+        """
+        mcp_file = Path(cwd) / KIMI_CWD_MCP_RELPATH
+        mcp_file.parent.mkdir(parents=True, exist_ok=True)
+        mcp_file.write_text(json.dumps({"mcpServers": mcp_config}, indent=2), encoding="utf-8")
+        try:
+            mcp_file.chmod(0o600)
+        except OSError:
+            pass
+
     def _build_kimi_command(self) -> str:
         """Build Kimi CLI command with agent profile and MCP config if provided.
 
@@ -339,7 +409,7 @@ class KimiCliProvider(BaseProvider):
         Uses shlex.join() for safe escaping of all arguments.
 
         Command structure:
-            cd <temp_dir> && TERM=xterm-256color kimi --yolo [--plan] [--mcp-config JSON]
+            cd <temp_dir> && TERM=xterm-256color kimi --yolo [--plan]
 
         The ``cd`` is required because Kimi CLI v1.20.0+ enforces a per-directory
         single-instance lock — only one kimi process can run in a given directory.
@@ -362,6 +432,9 @@ class KimiCliProvider(BaseProvider):
         # provider instance needs its own working directory.
         if not self._temp_dir:
             self._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_")
+        # The cwd the launch command below ``cd``s into, and the directory whose
+        # ``.kimi-code/mcp.json`` Kimi will therefore discover.
+        launch_cwd = self._temp_dir
 
         if self._agent_profile is not None:
             try:
@@ -375,38 +448,59 @@ class KimiCliProvider(BaseProvider):
                 # first task delivered through terminal_service.send_input().
                 self._first_message_prefix = self._compose_first_message_prefix(profile)
 
-                # Add MCP server configuration if present in the agent profile.
-                # Kimi accepts --mcp-config as a JSON string (repeatable flag).
+                # MCP servers: Kimi 0.29 has NO --mcp-config flag. It reads a
+                # project-local <cwd>/.kimi-code/mcp.json (Claude-compatible
+                # ``mcpServers`` map), which we write beneath this terminal's
+                # unique temp working directory — the cwd we `cd` into below.
                 if profile.mcpServers:
-                    # Set MCP tool call timeout to 600s by modifying ~/.kimi/config.toml
-                    # directly. We cannot use --config flag because it causes Kimi CLI
-                    # to bypass its default config file, which breaks OAuth authentication
-                    # (shows "model: not set" and /login says "restart without --config").
-                    # Class-level guard ensures this runs only once per process.
+                    # The MCP tool-call timeout still lives in ~/.kimi/config.toml;
+                    # the --config flag is avoided because it breaks OAuth.
                     self._ensure_mcp_timeout()
 
-                    mcp_config = {}
+                    # One process-environment snapshot per launch drives HTTP
+                    # URL reference resolution.
+                    env_snapshot = snapshot_process_env()
+                    mcp_config: Dict[str, Any] = {}
                     for server_name, server_config in profile.mcpServers.items():
-                        if isinstance(server_config, dict):
-                            mcp_config[server_name] = dict(server_config)
-                        else:
-                            mcp_config[server_name] = server_config.model_dump(exclude_none=True)
+                        entry = parse_mcp_server_entry(server_config, server_name=server_name)
+                        if isinstance(entry, HttpMcpServer):
+                            # Native HTTP entry: {"url": ...} only — no command,
+                            # args, env, or CAO_TERMINAL_ID.
+                            url = resolve_http_url(entry.url, env_snapshot, server_name=server_name)
+                            mcp_config[server_name] = kimi_http_entry(url)
+                            continue
 
+                        # The narrowed model is the single serialization source:
+                        # it round-trips a legacy command entry byte-for-byte
+                        # (declared fields plus extras, unset keys dropped).
+                        resolved = entry.model_dump(exclude_none=True)
+
+                        # Decided from what the PROFILE declared, before the
+                        # command is rewritten below.
+                        identity_bearing = is_identity_bearing_command(
+                            resolved.get("command"), resolved.get("args")
+                        )
                         # Resolve the bundled cao-mcp-server console script to a
                         # PATH-independent invocation.
-                        mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
+                        resolved = resolve_mcp_server_config(resolved)
 
-                        # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-                        # can identify the current terminal for handoff/assign operations.
-                        # Kimi CLI does not automatically forward parent shell env vars
-                        # to MCP subprocesses, so we inject it explicitly via the env field.
-                        env = mcp_config[server_name].get("env", {})
-                        if "CAO_TERMINAL_ID" not in env:
-                            env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
+                        # Fresh callback identity for THIS terminal. Kimi does
+                        # not forward parent shell env vars to MCP subprocesses,
+                        # so the identity-bearing cao-mcp-server entry gets it
+                        # injected into ``env`` — overriding any stale value.
+                        mcp_config[server_name] = apply_terminal_identity(
+                            resolved,
+                            terminal_id=self.terminal_id,
+                            identity_bearing=identity_bearing,
+                        )
 
-                    command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
+                    self._write_kimi_mcp_config(mcp_config, cwd=launch_cwd)
 
+            except McpConfigError:
+                # A sanitized MCP profile/URL-resolution failure must fail closed
+                # with its own value-free type — never be reshaped into a generic
+                # profile-load error (matches codex/claude/antigravity behavior).
+                raise
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
