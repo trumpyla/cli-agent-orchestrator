@@ -1,5 +1,7 @@
 """Tests for cleanup service."""
 
+import asyncio
+import logging
 import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -7,7 +9,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from cli_agent_orchestrator.services.cleanup_service import cleanup_old_data
+from cli_agent_orchestrator.services.cleanup_service import (
+    cleanup_expired_memories,
+    cleanup_old_data,
+)
 
 
 class TestCleanupOldData:
@@ -225,3 +230,36 @@ class TestCleanupOldData:
 
         # Verify filter was called (terminals: .all() + .delete(), inbox: .delete())
         assert len(filter_calls) >= 2
+
+
+def test_memory_retention_logs_are_content_free(tmp_path, monkeypatch, caplog):
+    index_path = tmp_path / "project-secret" / "wiki" / "index.md"
+    index_path.parent.mkdir(parents=True)
+    index_path.write_text("# Memory\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.cleanup_service.MEMORY_BASE_DIR",
+        tmp_path,
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.cleanup_service._find_expired_entries",
+        lambda *_args: [
+            {
+                "key": "memory-key-secret",
+                "scope": "project",
+                "scope_id": "scope-secret",
+                "memory_type": "project",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.services.cleanup_service._forget_sync",
+        lambda *_args: None,
+    )
+
+    with caplog.at_level(logging.INFO):
+        asyncio.run(cleanup_expired_memories())
+
+    assert "expired=1" in caplog.text
+    assert "memory-key-secret" not in caplog.text
+    assert "scope-secret" not in caplog.text
+    assert "project-secret" not in caplog.text

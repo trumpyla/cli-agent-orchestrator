@@ -52,6 +52,31 @@ class TestDbPermissions:
         db_mod._ensure_db_dir()
         assert _mode(db_dir) == 0o700
 
+    def test_ensure_db_dir_skips_chmod_when_already_owner_only(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ):
+        """Read-only workers must not attempt a redundant metadata mutation."""
+        db_dir = tmp_path / "secure-db"
+        db_dir.mkdir(mode=0o700)
+        db_dir.chmod(0o700)
+        chmod_calls: list[tuple[object, int]] = []
+
+        def unexpected_chmod(path: object, mode: int) -> None:
+            chmod_calls.append((path, mode))
+            raise PermissionError("sandbox rejects redundant chmod")
+
+        monkeypatch.setattr(db_mod, "DB_DIR", db_dir)
+        monkeypatch.setattr(db_mod.os, "chmod", unexpected_chmod)
+
+        with caplog.at_level("WARNING"):
+            db_mod._ensure_db_dir()
+
+        assert chmod_calls == []
+        assert "Could not restrict DB dir permissions" not in caplog.text
+
     def test_init_db_restricts_wal_and_shm_siblings(self, isolated_db):
         db_dir, db_file = isolated_db
         # Simulate leftover WAL/SHM siblings from a prior run with loose perms.

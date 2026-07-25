@@ -202,7 +202,15 @@ def list_agent_profiles() -> List[Dict]:
     # name -> every enabled directory the name was found in (winner first), used
     # to flag same-named profiles defined in more than one dir (GH #280).
     name_sources: Dict[str, List[str]] = {}
-    disabled = {normalized_path(d) for d in get_disabled_agent_dirs()}
+    disabled: Set[str] = set()
+    for index, configured in enumerate(get_disabled_agent_dirs()):
+        try:
+            disabled.add(normalized_path(configured))
+        except ValueError:
+            logger.warning(
+                "Skipping disabled agent directory index=%d reason=sensitive_root",
+                index,
+            )
     scanned_paths: Set[str] = set()
 
     # 1. Local agent store (~/.aws/cli-agent-orchestrator/agent-store/).
@@ -229,19 +237,33 @@ def list_agent_profiles() -> List[Dict]:
         "cao_installed": "installed",
     }
     for provider, dir_path in agent_dirs.items():
-        norm = normalized_path(dir_path)
+        try:
+            norm = normalized_path(dir_path)
+        except ValueError:
+            logger.warning(
+                "Skipping provider agent directory provider=%s reason=sensitive_root",
+                provider,
+            )
+            continue
         if norm in disabled or norm in scanned_paths:
             continue
         label = provider_source_labels.get(provider, provider)
-        _scan_directory(Path(dir_path), label, profiles, name_sources)
+        _scan_directory(Path(norm), label, profiles, name_sources)
         scanned_paths.add(norm)
 
     # 3. Extra user-added directories
-    for extra_dir in get_extra_agent_dirs():
-        norm = normalized_path(extra_dir)
+    for index, extra_dir in enumerate(get_extra_agent_dirs()):
+        try:
+            norm = normalized_path(extra_dir)
+        except ValueError:
+            logger.warning(
+                "Skipping extra agent directory index=%d reason=sensitive_root",
+                index,
+            )
+            continue
         if norm in disabled or norm in scanned_paths:
             continue
-        _scan_directory(Path(extra_dir), "custom", profiles, name_sources)
+        _scan_directory(Path(norm), "custom", profiles, name_sources)
         scanned_paths.add(norm)
 
     # 4. Built-in agent store — scanned LAST so on-disk copies win (matches
@@ -312,7 +334,15 @@ def _read_agent_profile_source(agent_name: str) -> str:
     # Honour the disable toggle on the load path too, so disabling a directory
     # actually swaps which same-named profile wins (GH #280), not just what the
     # Settings list shows.
-    disabled = {normalized_path(d) for d in get_disabled_agent_dirs()}
+    disabled: Set[str] = set()
+    for index, configured in enumerate(get_disabled_agent_dirs()):
+        try:
+            disabled.add(normalized_path(configured))
+        except ValueError:
+            logger.warning(
+                "Skipping disabled agent directory index=%d reason=sensitive_root",
+                index,
+            )
 
     # Every filesystem read below goes through _safe_join so the path is
     # normalised and verified to stay inside its configured root. This is
@@ -335,17 +365,33 @@ def _read_agent_profile_source(agent_name: str) -> str:
             return nested.read_text(encoding="utf-8")
         return None
 
-    for dir_path in get_agent_dirs().values():
-        if normalized_path(dir_path) in disabled:
+    for provider, dir_path in get_agent_dirs().items():
+        try:
+            normalized = normalized_path(dir_path)
+        except ValueError:
+            logger.warning(
+                "Skipping provider agent directory provider=%s reason=sensitive_root",
+                provider,
+            )
             continue
-        found = _lookup_in_directory(Path(dir_path))
+        if normalized in disabled:
+            continue
+        found = _lookup_in_directory(Path(normalized))
         if found is not None:
             return found
 
-    for extra_dir in get_extra_agent_dirs():
-        if normalized_path(extra_dir) in disabled:
+    for index, extra_dir in enumerate(get_extra_agent_dirs()):
+        try:
+            normalized = normalized_path(extra_dir)
+        except ValueError:
+            logger.warning(
+                "Skipping extra agent directory index=%d reason=sensitive_root",
+                index,
+            )
             continue
-        found = _lookup_in_directory(Path(extra_dir))
+        if normalized in disabled:
+            continue
+        found = _lookup_in_directory(Path(normalized))
         if found is not None:
             return found
 

@@ -128,6 +128,29 @@ Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults
 | `flush_threshold` | `0.85` | Context-usage fraction that triggers a memory flush. |
 | `compile_timeout_s` | `120.0` | Wall-clock timeout for the wiki compile call. |
 
+For a low-token append-only memory mode:
+
+```bash
+cao config set memory.compile_mode append
+```
+
+### Completed-session cleanup (`cleanup`)
+
+Irreversible completed-session cleanup is default-off and Herdr-only. The
+daemon hot-reloads this section before every delayed, bounded sweep:
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `completed_sessions_enabled` | `false` | Enables future completed-session sweeps. |
+| `completed_session_grace_s` | `900` | Minimum seconds since the newest terminal activity; minimum 60. |
+| `sweep_interval_s` | `300` | Delay before the first and later sweeps; minimum 30. |
+| `max_sessions_per_sweep` | `5` | Oldest-first deletion bound, 1–50. |
+| `preserve_patterns` | `[]` | Case-sensitive glob patterns for complete CAO session labels. |
+
+See [Runtime resource cleanup](runtime-resource-cleanup.md) for stable-ID
+revalidation, pending-inbox protection, teardown ordering, observability,
+backup/rollback steps, and the irreversible-delete warning.
+
 ### Terminal backend (`terminal`)
 
 CAO's default backend is [tmux](tmux.md). [herdr](https://herdr.dev/) is an experimental, opt-in alternative — a terminal-native agent runtime that exposes real-time status events instead of requiring CAO to poll and pattern-match terminal output.
@@ -209,6 +232,8 @@ Every `CAO_*` variable below maps 1:1 to a `settings.json` key and is resolved t
 | `CAO_MEMORY_ENABLED` | `memory.enabled` | bool |
 | `CAO_MEMORY_COMPILE_MODE` | `memory.compile_mode` | str (`llm`/`append`) |
 | `CAO_MEMORY_FLUSH_THRESHOLD` | `memory.flush_threshold` | float |
+| `CAO_MEMORY_COMPILE_TIMEOUT_S` | `memory.compile_timeout_s` | float |
+| `CAO_CLEANUP_COMPLETED_SESSIONS_ENABLED` | `cleanup.completed_sessions_enabled` | bool |
 | `CAO_MCP_REQUEST_TIMEOUT` | `server.mcp_request_timeout` | int |
 | `CAO_EVENT_BUS_MAX_QUEUE_SIZE` | `server.event_bus_max_queue_size` | int |
 | `CAO_PROVIDER_INIT_TIMEOUT` | `server.provider_init_timeout` | int |

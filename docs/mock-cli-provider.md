@@ -9,6 +9,10 @@ The other CAO providers (`claude_code`, `kiro_cli`, `codex`, `kimi_cli`, `copilo
 
 `mock_cli` fills that gap. It's a tiny bash binary plus a thin provider that together let CAO drive a deterministic "agent" through the full lifecycle (initialize → IDLE → receive input → PROCESSING → COMPLETED → respond, plus ERROR injection). No auth, no network, no flakes, no cost.
 
+The source-backed supervisor lifecycle and the separate exact-model live matrix
+are documented in the
+[supervisor integration harness](supervisor-integration-harness.md).
+
 ## Design
 
 Two components:

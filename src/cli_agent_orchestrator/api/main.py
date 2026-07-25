@@ -115,6 +115,10 @@ from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxServic
 from cli_agent_orchestrator.services.inbox_service import inbox_service
 from cli_agent_orchestrator.services.install_service import InstallResult, install_agent
 from cli_agent_orchestrator.services.log_writer import log_writer
+from cli_agent_orchestrator.services.runtime_cleanup_daemon import RuntimeCleanupDaemon
+from cli_agent_orchestrator.services.runtime_resource_cleanup import (
+    build_runtime_resource_cleanup,
+)
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
@@ -497,6 +501,22 @@ async def lifespan(app: FastAPI):
     registry = PluginRegistry()
     await registry.load()
     app.state.plugin_registry = registry
+    backend = get_backend()
+
+    # The completed-session policy is default-off, but its lifespan-owned
+    # scheduler starts unconditionally so config enable/disable changes take
+    # effect without a process restart. The daemon delays its first sweep.
+    runtime_cleanup = build_runtime_resource_cleanup(
+        registry=registry,
+        backend=backend,
+    )
+    runtime_cleanup_daemon = RuntimeCleanupDaemon(
+        policy_reader=lambda: ConfigService.get_config().cleanup,
+        sweep_runner=runtime_cleanup.sweep,
+        lock_path=CAO_HOME_DIR / "runtime-cleanup.lock",
+    )
+    app.state.runtime_cleanup_daemon = runtime_cleanup_daemon
+    runtime_cleanup_task = asyncio.create_task(runtime_cleanup_daemon.run_forever())
 
     # Run cleanup in background
     asyncio.create_task(asyncio.to_thread(cleanup_old_data))
@@ -553,7 +573,6 @@ async def lifespan(app: FastAPI):
     # above. Start the herdr inbox service only when the herdr backend is active
     # (additive; no-op for tmux). See #271.
     herdr_inbox_task: Optional[asyncio.Task] = None
-    backend = get_backend()
     if isinstance(backend, HerdrBackend):
 
         def deliver_inbox(terminal_id: str) -> None:
@@ -568,6 +587,15 @@ async def lifespan(app: FastAPI):
         logger.info("Herdr inbox service started")
 
     yield
+
+    # Stop automatic resource cleanup first. If cancellation arrives during a
+    # thread-backed sweep, the daemon shields and awaits that worker before
+    # allowing plugin/provider teardown to continue.
+    runtime_cleanup_task.cancel()
+    try:
+        await runtime_cleanup_task
+    except asyncio.CancelledError:
+        pass
 
     # Stop herdr inbox service on shutdown
     if herdr_inbox_task is not None:

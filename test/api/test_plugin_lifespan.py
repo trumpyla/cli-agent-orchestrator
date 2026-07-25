@@ -1,6 +1,8 @@
 """Integration tests for plugin registry FastAPI lifespan wiring."""
 
+import asyncio
 import logging
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -89,6 +91,77 @@ class TestPluginRegistryLifespan:
                 assert ordering == ["registry_load"]
 
             mock_teardown.assert_awaited_once()
+
+    @pytest.mark.asyncio
+    async def test_lifespan_awaits_cleanup_worker_before_registry_teardown(self) -> None:
+        """Shutdown must not tear down providers while cleanup is still running."""
+
+        ordering: list[str] = []
+        cleanup_started = asyncio.Event()
+        cleanup_cancelled = asyncio.Event()
+        release_cleanup = asyncio.Event()
+
+        class BlockingCleanupDaemon:
+            async def run_forever(self) -> None:
+                cleanup_started.set()
+                try:
+                    await asyncio.Future()
+                except asyncio.CancelledError:
+                    ordering.append("cleanup_cancelling")
+                    cleanup_cancelled.set()
+                    await release_cleanup.wait()
+                    ordering.append("cleanup_finished")
+                    raise
+
+        mock_load = AsyncMock()
+        mock_teardown = AsyncMock(side_effect=lambda: ordering.append("registry_teardown"))
+        status_run, log_run, inbox_run, opencode_daemon = _consumer_patches()
+
+        with (
+            patch("cli_agent_orchestrator.api.main.setup_logging"),
+            patch("cli_agent_orchestrator.api.main.init_db"),
+            patch(
+                "cli_agent_orchestrator.services.memory_reconciliation.reconcile_memory_startup",
+                return_value=None,
+            ),
+            patch("cli_agent_orchestrator.api.main.cleanup_old_data"),
+            patch(
+                "cli_agent_orchestrator.api.main.cleanup_expired_memories", new_callable=AsyncMock
+            ),
+            patch("cli_agent_orchestrator.api.main.flow_daemon", fake_flow_daemon),
+            patch("cli_agent_orchestrator.api.main.bus.set_loop"),
+            status_run,
+            log_run,
+            inbox_run,
+            opencode_daemon,
+            patch.object(PluginRegistry, "load", mock_load),
+            patch.object(PluginRegistry, "teardown", mock_teardown),
+            patch(
+                "cli_agent_orchestrator.api.main.build_runtime_resource_cleanup",
+                return_value=SimpleNamespace(sweep=lambda: None),
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.RuntimeCleanupDaemon",
+                return_value=BlockingCleanupDaemon(),
+            ),
+        ):
+            context = lifespan(app)
+            await context.__aenter__()
+            await cleanup_started.wait()
+            shutdown_task = asyncio.create_task(context.__aexit__(None, None, None))
+            try:
+                await cleanup_cancelled.wait()
+                assert "registry_teardown" not in ordering
+                assert not shutdown_task.done()
+            finally:
+                release_cleanup.set()
+                await shutdown_task
+
+        assert ordering == [
+            "cleanup_cancelling",
+            "cleanup_finished",
+            "registry_teardown",
+        ]
 
     @pytest.mark.asyncio
     async def test_lifespan_logs_no_plugins_registered_when_entry_points_are_empty(

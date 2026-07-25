@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from cli_agent_orchestrator.constants import SKILLS_DIR
 from cli_agent_orchestrator.models.skill import SkillMetadata
+from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
 
@@ -81,8 +82,15 @@ def _skill_search_dirs() -> List[Path]:
     """
     from cli_agent_orchestrator.services.settings_service import get_extra_skill_dirs
 
-    dirs: List[Path] = [SKILLS_DIR]
-    dirs.extend(Path(extra) for extra in get_extra_skill_dirs())
+    dirs: List[Path] = [Path(normalized_path(SKILLS_DIR))]
+    for index, extra in enumerate(get_extra_skill_dirs()):
+        try:
+            dirs.append(Path(normalized_path(extra)))
+        except ValueError:
+            logger.warning(
+                "Skipping extra skill directory index=%d reason=sensitive_root",
+                index,
+            )
     return dirs
 
 

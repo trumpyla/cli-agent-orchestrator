@@ -1,5 +1,10 @@
 # Kimi CLI Provider
 
+Kimi startup prompt/readiness parsing runs in a worker thread so upgrade,
+trust, or initialization output cannot block `/health`, REST, WebSocket, MCP,
+or Herdr event processing. Startup timeout still fails the Kimi terminal
+categorically; it does not stall the server event loop.
+
 ## Overview
 
 The Kimi CLI provider enables CAO to work with [Kimi Code CLI](https://kimi.com/code), Moonshot AI's coding agent CLI tool. Kimi CLI runs as an interactive TUI using prompt_toolkit.

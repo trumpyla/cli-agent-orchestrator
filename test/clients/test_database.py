@@ -47,7 +47,8 @@ def test_db():
     engine = create_engine("sqlite:///:memory:")
     Base.metadata.create_all(bind=engine)
     TestSession = sessionmaker(bind=engine)
-    return TestSession
+    yield TestSession
+    engine.dispose()
 
 
 class TestTerminalOperations:
@@ -341,6 +342,7 @@ class TestTerminalOperations:
         mock_session.__exit__ = MagicMock(return_value=False)
 
         mock_query = MagicMock()
+        mock_query.filter.return_value.all.return_value = [("term-1",), ("term-2",)]
         mock_query.filter.return_value.delete.return_value = 2
         mock_session.query.return_value = mock_query
         mock_session_class.return_value = mock_session
@@ -733,7 +735,7 @@ class TestTerminalsSchemaMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "legacy.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn, conn:
             conn.execute(
                 "CREATE TABLE terminals ("
                 "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
@@ -754,7 +756,7 @@ class TestTerminalsSchemaMigration:
 
         db_mod._migrate_terminals_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn, conn:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(terminals)")}
             rows = conn.execute(
                 "SELECT id, caller_id, provider_initialized, profile_prompt_delivered "
@@ -774,7 +776,7 @@ class TestTerminalsSchemaMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "current.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn, conn:
             conn.execute(
                 "CREATE TABLE terminals ("
                 "id TEXT PRIMARY KEY, tmux_session TEXT NOT NULL, "
@@ -790,7 +792,7 @@ class TestTerminalsSchemaMigration:
         db_mod._migrate_terminals_schema()
         db_mod._migrate_terminals_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn, conn:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("caller_id") == 1
         assert columns.count("allowed_tools") == 1
@@ -889,17 +891,20 @@ class TestCallerIdRoundTrip:
         from cli_agent_orchestrator.clients import database as db_mod
 
         engine = create_engine(f"sqlite:///{tmp_path / 'rt.db'}")
-        Base.metadata.create_all(bind=engine)
-        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+        try:
+            Base.metadata.create_all(bind=engine)
+            monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
-        created = create_terminal(
-            "abc12345", "cao-s", "w-0", "kiro_cli", "developer", caller_id="def67890"
-        )
-        assert created["caller_id"] == "def67890"
+            created = create_terminal(
+                "abc12345", "cao-s", "w-0", "kiro_cli", "developer", caller_id="def67890"
+            )
+            assert created["caller_id"] == "def67890"
 
-        fetched = get_terminal_metadata("abc12345")
-        assert fetched is not None
-        assert fetched["caller_id"] == "def67890"
+            fetched = get_terminal_metadata("abc12345")
+            assert fetched is not None
+            assert fetched["caller_id"] == "def67890"
+        finally:
+            engine.dispose()
 
     def test_caller_id_defaults_to_none(self, tmp_path, monkeypatch):
         """Operator-launched terminals (no caller) round-trip NULL."""
@@ -909,15 +914,18 @@ class TestCallerIdRoundTrip:
         from cli_agent_orchestrator.clients import database as db_mod
 
         engine = create_engine(f"sqlite:///{tmp_path / 'rt2.db'}")
-        Base.metadata.create_all(bind=engine)
-        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+        try:
+            Base.metadata.create_all(bind=engine)
+            monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
-        created = create_terminal("abc12345", "cao-s", "w-0", "kiro_cli")
-        assert created["caller_id"] is None
+            created = create_terminal("abc12345", "cao-s", "w-0", "kiro_cli")
+            assert created["caller_id"] is None
 
-        fetched = get_terminal_metadata("abc12345")
-        assert fetched is not None
-        assert fetched["caller_id"] is None
+            fetched = get_terminal_metadata("abc12345")
+            assert fetched is not None
+            assert fetched["caller_id"] is None
+        finally:
+            engine.dispose()
 
 
 class TestProjectAliasMigration:
@@ -930,7 +938,7 @@ class TestProjectAliasMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "legacy.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn, conn:
             conn.execute(
                 "CREATE TABLE project_aliases ("
                 "project_id TEXT NOT NULL, alias TEXT NOT NULL, kind TEXT NOT NULL, "
@@ -946,7 +954,7 @@ class TestProjectAliasMigration:
 
         db_mod._migrate_project_aliases_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn, conn:
             exists = conn.execute(
                 "SELECT name FROM sqlite_master " "WHERE type='table' AND name='project_aliases'"
             ).fetchone()
@@ -959,7 +967,7 @@ class TestProjectAliasMigration:
         from cli_agent_orchestrator.clients import database as db_mod
 
         db_file = tmp_path / "current.db"
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn, conn:
             conn.execute(
                 "CREATE TABLE project_aliases ("
                 "alias TEXT PRIMARY KEY, project_id TEXT NOT NULL, kind TEXT NOT NULL, "
@@ -975,6 +983,6 @@ class TestProjectAliasMigration:
 
         db_mod._migrate_project_aliases_schema()
 
-        with sqlite3.connect(str(db_file)) as conn:
+        with closing(sqlite3.connect(str(db_file))) as conn, conn:
             rows = conn.execute("SELECT alias, project_id FROM project_aliases").fetchall()
         assert rows == [("a1", "p1")], "current-schema table must be left intact"

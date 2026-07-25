@@ -90,10 +90,15 @@ class MockCliProvider(BaseProvider):
 
     def get_status(self, buffer: str) -> TerminalStatus:
         """Pattern-match the binary's output buffer to determine current state."""
-        if not buffer:
+        native = self._resolve_native_status(buffer)
+        if native is not None:
+            return native
+
+        resolved_buffer = self._resolve_buffer(buffer)
+        if not resolved_buffer:
             return TerminalStatus.UNKNOWN
 
-        clean = re.sub(ANSI_CODE_PATTERN, "", buffer)
+        clean = re.sub(ANSI_CODE_PATTERN, "", resolved_buffer)
 
         if ERROR_INDICATOR in clean:
             return TerminalStatus.ERROR

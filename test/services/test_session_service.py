@@ -4,9 +4,11 @@ from unittest.mock import ANY, MagicMock, patch
 
 import pytest
 
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend, HerdrWorkspace
 from cli_agent_orchestrator.services.session_service import (
     create_session,
     delete_session,
+    delete_session_automatically,
     get_session,
     list_sessions,
 )
@@ -347,3 +349,171 @@ class TestDeleteSession:
         mock_delete_terminal.assert_any_call("term-bbb", registry=ANY)
         mock_delete_terminal.assert_any_call("term-ccc", registry=ANY)
         mock_delete_terminal.assert_any_call("term-ddd", registry=ANY)
+
+
+class TestAutomaticDeleteSession:
+    """Stable-ID automatic teardown closes Herdr before persistence cleanup."""
+
+    @staticmethod
+    def _workspace(workspace_id: str = "ws-old") -> HerdrWorkspace:
+        return HerdrWorkspace(
+            workspace_id=workspace_id,
+            label="cao-old",
+            agent_status="done",
+            pane_count=1,
+            tab_count=1,
+            active_tab_id=f"{workspace_id}:1",
+        )
+
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_backend_close")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    def test_backend_identity_closes_before_terminal_and_environment_cleanup(
+        self,
+        mock_list,
+        mock_delete,
+        mock_prepare,
+        mock_clear_env,
+    ):
+        backend = MagicMock(spec=HerdrBackend)
+        backend.list_workspace_inventory.return_value = [self._workspace()]
+        order: list[str] = []
+        backend.close_workspace_by_id.side_effect = (
+            lambda _workspace_id: order.append("backend") or True
+        )
+        mock_list.return_value = [{"id": "terminal-old"}]
+        mock_prepare.side_effect = lambda *_args: order.append("prepare")
+        mock_delete.side_effect = lambda *_args, **_kwargs: order.append("terminal")
+        mock_clear_env.side_effect = lambda *_args: order.append("environment")
+
+        result = delete_session_automatically(
+            "cao-old",
+            expected_backend_id="ws-old",
+            backend=backend,
+        )
+
+        assert result == {"deleted": ["cao-old"], "errors": []}
+        assert order == ["prepare", "backend", "terminal", "environment"]
+        backend.close_workspace_by_id.assert_called_once_with("ws-old")
+        mock_delete.assert_called_once_with(
+            "terminal-old",
+            registry=None,
+            backend_already_closed=True,
+            prepared=True,
+        )
+
+    @pytest.mark.parametrize(
+        ("inventory", "close_result", "expected_error"),
+        [
+            pytest.param(
+                [_workspace.__func__("ws-reused")],
+                True,
+                "backend identity changed",
+                id="label-reuse",
+            ),
+            pytest.param(
+                [_workspace.__func__()],
+                False,
+                "backend close failed",
+                id="close-failure",
+            ),
+        ],
+    )
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_backend_close")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    def test_identity_or_close_failure_preserves_all_persistence(
+        self,
+        mock_list,
+        mock_delete,
+        mock_prepare,
+        mock_clear_env,
+        inventory,
+        close_result,
+        expected_error,
+    ):
+        backend = MagicMock(spec=HerdrBackend)
+        backend.list_workspace_inventory.return_value = inventory
+        backend.close_workspace_by_id.return_value = close_result
+        mock_list.return_value = [{"id": "terminal-old"}]
+
+        with pytest.raises(RuntimeError, match=expected_error):
+            delete_session_automatically(
+                "cao-old",
+                expected_backend_id="ws-old",
+                backend=backend,
+            )
+
+        mock_delete.assert_not_called()
+        if expected_error == "backend identity changed":
+            mock_prepare.assert_not_called()
+        mock_clear_env.assert_not_called()
+
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_backend_close")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    def test_authoritatively_absent_backend_resumes_persistence_cleanup(
+        self,
+        mock_list,
+        mock_delete,
+        mock_prepare,
+        mock_clear_env,
+    ):
+        backend = MagicMock(spec=HerdrBackend)
+        backend.list_workspace_inventory.return_value = []
+        mock_list.return_value = [{"id": "terminal-old"}]
+
+        result = delete_session_automatically(
+            "cao-old",
+            expected_backend_id="ws-old",
+            backend=backend,
+        )
+
+        assert result == {"deleted": ["cao-old"], "errors": []}
+        backend.close_workspace_by_id.assert_not_called()
+        mock_prepare.assert_not_called()
+        mock_delete.assert_called_once_with(
+            "terminal-old",
+            registry=None,
+            backend_already_closed=True,
+            prepared=False,
+        )
+        mock_clear_env.assert_called_once_with("cao-old")
+
+    @patch("cli_agent_orchestrator.services.session_service.clear_session_env")
+    @patch("cli_agent_orchestrator.services.terminal_service.prepare_terminal_for_backend_close")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
+    def test_crash_boundary_resumes_without_second_backend_close(
+        self,
+        mock_list,
+        mock_delete,
+        mock_prepare,
+        mock_clear_env,
+    ):
+        backend = MagicMock(spec=HerdrBackend)
+        backend.list_workspace_inventory.side_effect = [[self._workspace()], []]
+        backend.close_workspace_by_id.return_value = True
+        mock_list.return_value = [{"id": "terminal-old"}]
+        mock_delete.side_effect = [RuntimeError("simulated crash boundary"), True]
+
+        with pytest.raises(RuntimeError, match="simulated crash boundary"):
+            delete_session_automatically(
+                "cao-old",
+                expected_backend_id="ws-old",
+                backend=backend,
+            )
+
+        result = delete_session_automatically(
+            "cao-old",
+            expected_backend_id="ws-old",
+            backend=backend,
+        )
+
+        assert result == {"deleted": ["cao-old"], "errors": []}
+        backend.close_workspace_by_id.assert_called_once_with("ws-old")
+        assert mock_delete.call_count == 2
+        mock_clear_env.assert_called_once_with("cao-old")

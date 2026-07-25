@@ -38,6 +38,7 @@ jobs:
         run: |
           uv run pytest test/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
+            --ignore=test/integration/test_supervisor_harness.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \
@@ -57,6 +58,32 @@ jobs:
           fail_ci_if_error: false
         env:
           CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
+  supervisor-harness:
+    name: Source-backed Supervisor Harness
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install tmux
+        run: sudo apt-get update && sudo apt-get install -y tmux
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Set up Python
+        run: uv python install 3.12
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      - name: Run deterministic supervisor lifecycle
+        run: uv run pytest test/integration/test_supervisor_harness.py -v -o addopts=''
 
   web-build:
     name: Web UI Build
@@ -157,6 +184,7 @@ jobs:
         run: |
           uv run pytest test/ \
             --ignore=test/providers/test_kiro_cli_integration.py \
+            --ignore=test/integration/test_supervisor_harness.py \
             --ignore=test/e2e \
             -m "not e2e" \
             --cov=src/cli_agent_orchestrator \

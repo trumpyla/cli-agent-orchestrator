@@ -1,0 +1,16 @@
+{
+  "id": "cli:workspace:list",
+  "result": {
+    "type": "workspace_list",
+    "workspaces": [
+      {
+        "workspace_id": "workspace-redacted-1",
+        "label": "cao-redacted-session",
+        "agent_status": "idle",
+        "pane_count": 1,
+        "tab_count": 1,
+        "active_tab_id": "tab-redacted-1"
+      }
+    ]
+  }
+}

@@ -4,9 +4,11 @@ Covers initialization, status detection, message extraction, command building,
 pattern matching, and cleanup — targeting >90% code coverage.
 """
 
+import asyncio
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -26,6 +28,7 @@ from cli_agent_orchestrator.providers.kimi_cli import (
     WELCOME_BANNER_PATTERN,
     KimiCliProvider,
     ProviderError,
+    _is_startup_output_ready,
 )
 
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
@@ -69,6 +72,38 @@ class TestKimiCliProviderInitialization:
         mock_tmux.return_value.send_keys.assert_called_once()
         mock_wait_shell.assert_called_once()
         mock_wait_status.assert_called_once()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
+    async def test_initialize_offloads_blocking_startup_dialog(
+        self, mock_backend, mock_wait_shell, mock_wait_status
+    ):
+        """A blocking startup-dialog poll must not stall the server event loop."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        events: list[str] = []
+        release_handler = threading.Event()
+
+        def blocking_dialog(*, outer_timeout: float) -> None:
+            events.append("handler-enter")
+            if not release_handler.wait(timeout=1.0):
+                events.append("handler-timeout")
+            events.append("handler-exit")
+
+        async def prove_loop_progress() -> None:
+            await asyncio.sleep(0)
+            events.append("loop-progress")
+            release_handler.set()
+
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        with patch.object(provider, "_handle_startup_dialog", side_effect=blocking_dialog):
+            await asyncio.gather(provider.initialize(), prove_loop_progress())
+
+        assert "handler-timeout" not in events
+        assert events.index("loop-progress") < events.index("handler-exit")
+        mock_backend.return_value.send_keys.assert_called_once()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
@@ -195,6 +230,118 @@ class TestKimiCliProviderInitialization:
         assert "TERM=xterm-256color" in command
         assert "kimi --yolo" in command
         provider.cleanup()
+
+
+# =============================================================================
+# Startup readiness tests
+# =============================================================================
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        pytest.param(
+            _read_fixture("kimi_cli_idle_output.txt"),
+            True,
+            id="legacy-idle",
+        ),
+        pytest.param(
+            _read_fixture("kimi_cli_completed_output.txt"),
+            True,
+            id="legacy-completed",
+        ),
+        pytest.param(
+            _read_fixture("kimi_code_tui_idle_raw.txt"),
+            True,
+            id="redesigned-idle",
+        ),
+        pytest.param(
+            _read_fixture("kimi_code_tui_completed_raw.txt"),
+            True,
+            id="redesigned-completed",
+        ),
+        pytest.param(
+            _read_fixture("kimi_cli_processing_output.txt"),
+            False,
+            id="legacy-processing",
+        ),
+        pytest.param(
+            _read_fixture("kimi_code_tui_processing_raw.txt"),
+            False,
+            id="redesigned-processing",
+        ),
+        pytest.param(
+            "[Enter] Upgrade now  [q] Not now  [s] Skip reminders for version 1.2.3",
+            False,
+            id="supported-upgrade-dialog",
+        ),
+        pytest.param(
+            "[s] Skip reminders for version 1.2.3\n" + _read_fixture("kimi_code_tui_idle_raw.txt"),
+            True,
+            id="lingering-upgrade-text-with-ready-prompt",
+        ),
+        pytest.param(
+            "Kimi needs input from an unsupported startup dialog",
+            False,
+            id="unsupported-dialog",
+        ),
+        pytest.param(
+            "Kimi process launched but emitted no recognized TUI chrome",
+            False,
+            id="unknown-output",
+        ),
+    ],
+)
+def test_startup_ready_predicate(output: str, expected: bool) -> None:
+    """Startup readiness is a pure classification over captured output."""
+    assert _is_startup_output_ready(output) is expected
+
+
+def test_startup_dialog_dismisses_supported_upgrade_then_accepts_ready() -> None:
+    """The supported upgrade menu is answered once before ready is accepted."""
+    backend = MagicMock()
+    backend.get_history.side_effect = [
+        "[Enter] Upgrade now  [q] Not now  [s] Skip reminders for version 1.2.3",
+        _read_fixture("kimi_code_tui_idle_raw.txt"),
+    ]
+    provider = KimiCliProvider("term-1", "session-1", "window-1")
+
+    with (
+        patch("cli_agent_orchestrator.providers.kimi_cli.get_backend", return_value=backend),
+        patch("cli_agent_orchestrator.providers.kimi_cli.time.monotonic", return_value=0.0),
+        patch("cli_agent_orchestrator.providers.kimi_cli.time.sleep"),
+        patch(
+            "cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent"
+        ) as notify_input_sent,
+    ):
+        provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=10.0)
+
+    backend.send_keys.assert_called_once_with(
+        "session-1",
+        "window-1",
+        "s",
+        enter_count=0,
+    )
+    notify_input_sent.assert_called_once_with("term-1")
+
+
+def test_startup_dialog_does_not_answer_unsupported_dialog() -> None:
+    """Unknown startup dialogs fail closed without sending guessed input."""
+    backend = MagicMock()
+    backend.get_history.return_value = "Kimi needs input from an unsupported startup dialog"
+    provider = KimiCliProvider("term-1", "session-1", "window-1")
+
+    with (
+        patch("cli_agent_orchestrator.providers.kimi_cli.get_backend", return_value=backend),
+        patch(
+            "cli_agent_orchestrator.providers.kimi_cli.time.monotonic",
+            side_effect=[0.0, 0.0, 0.0, 2.0],
+        ),
+        patch("cli_agent_orchestrator.providers.kimi_cli.time.sleep"),
+    ):
+        provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=1.0)
+
+    backend.send_keys.assert_not_called()
 
 
 # =============================================================================

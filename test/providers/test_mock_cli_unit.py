@@ -52,6 +52,27 @@ class TestMockCliProviderStatus:
         provider = MockCliProvider("t1", "sess", "win")
         assert provider.get_status("") == TerminalStatus.UNKNOWN
 
+    def test_empty_pushed_buffer_uses_live_herdr_buffer(self, monkeypatch):
+        provider = MockCliProvider("t1", "sess", "win")
+        monkeypatch.setattr(provider, "_resolve_native_status", lambda _buffer: None)
+        monkeypatch.setattr(
+            provider,
+            "_resolve_buffer",
+            lambda _buffer: f"MockCli ready.\n{_PROMPT}",
+        )
+
+        assert provider.get_status("") == TerminalStatus.IDLE
+
+    def test_native_herdr_status_wins_over_empty_buffer(self, monkeypatch):
+        provider = MockCliProvider("t1", "sess", "win")
+        monkeypatch.setattr(
+            provider,
+            "_resolve_native_status",
+            lambda _buffer: TerminalStatus.IDLE,
+        )
+
+        assert provider.get_status("") == TerminalStatus.IDLE
+
     def test_ansi_codes_do_not_break_state_detection(self):
         # Real tmux capture often interleaves ANSI; the provider strips them.
         provider = MockCliProvider("t1", "sess", "win")

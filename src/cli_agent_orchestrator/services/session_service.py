@@ -22,6 +22,7 @@ Session Lifecycle:
 import logging
 from typing import Dict, List
 
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import list_terminals_by_session
 from cli_agent_orchestrator.constants import SESSION_PREFIX
@@ -168,3 +169,64 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     except Exception as e:
         logger.error(f"Failed to delete session {session_name}: {e}")
         raise
+
+
+def delete_session_automatically(
+    session_name: str,
+    *,
+    expected_backend_id: str,
+    registry: PluginRegistry | None = None,
+    backend: HerdrBackend | None = None,
+) -> Dict:
+    """Close one captured Herdr identity before releasing persisted state.
+
+    This ordering is intentionally limited to the automatic completed-session
+    policy. Manual deletion retains its existing compatibility behavior.
+    """
+    session_name = normalize_session_name(session_name)
+    selected_backend = backend or get_backend()
+    if not isinstance(selected_backend, HerdrBackend):
+        raise RuntimeError("automatic cleanup requires Herdr backend")
+
+    inventory = selected_backend.list_workspace_inventory()
+    label_matches = [workspace for workspace in inventory if workspace.label == session_name]
+    id_matches = [
+        workspace for workspace in inventory if workspace.workspace_id == expected_backend_id
+    ]
+    if len(label_matches) > 1 or len(id_matches) > 1:
+        raise RuntimeError("backend identity ambiguous")
+    from cli_agent_orchestrator.services import terminal_service
+
+    terminals = list_terminals_by_session(session_name)
+    backend_was_present = bool(label_matches)
+    if label_matches:
+        workspace = label_matches[0]
+        if workspace.workspace_id != expected_backend_id:
+            raise RuntimeError("backend identity changed")
+        if workspace.agent_status != "done":
+            raise RuntimeError("backend state changed")
+        for terminal in terminals:
+            terminal_service.prepare_terminal_for_backend_close(terminal["id"])
+        if not selected_backend.close_workspace_by_id(expected_backend_id):
+            raise RuntimeError("backend close failed")
+    elif id_matches:
+        # The captured stable identity still exists under a different label.
+        raise RuntimeError("backend identity changed")
+    # No label or ID match is an authoritative already-absent backend. Continue
+    # persistence cleanup so a close/crash boundary resumes idempotently.
+
+    for terminal in terminals:
+        terminal_service.delete_terminal(
+            terminal["id"],
+            registry=registry,
+            backend_already_closed=True,
+            prepared=backend_was_present,
+        )
+
+    clear_session_env(session_name)
+    dispatch_plugin_event(
+        registry,
+        "post_kill_session",
+        PostKillSessionEvent(session_id=session_name, session_name=session_name),
+    )
+    return {"deleted": [session_name], "errors": []}

@@ -102,11 +102,21 @@ CAO maps its concepts to herdr primitives:
 
 On server start (or reconnect after socket disconnect):
 
-1. **Startup cleanup** -- cross-checks all DB terminal records against live herdr tabs. Removes ghost records left by prior server runs that exited uncleanly.
+1. **Startup reconciliation** -- strictly parses the complete Herdr workspace,
+   tab, and pane envelopes off the asyncio request loop. It cross-checks all
+   persisted non-peer terminals, accepts a valid empty authoritative inventory,
+   and removes receiver-side inbox state with a ghost terminal in one
+   transaction. Malformed, duplicate, timed-out, or failed inventory preserves
+   database state and reports only categorical counts.
 2. **Reconnect reconcile** -- prunes stale pane subscriptions from the in-memory map and re-subscribes only to panes that are still alive.
 3. **Lifecycle events** -- subscribes to `pane.closed` and `workspace.closed` events for real-time cleanup when agents exit or sessions end.
 
 The socket connection uses exponential backoff (1s to 30s) on disconnect.
+
+Optional automatic deletion of old native-`done` workspaces is a separate,
+default-off policy. It never treats `blocked`, `idle`, or unknown status as
+complete and never runs on tmux. See
+[Runtime resource cleanup](runtime-resource-cleanup.md).
 
 ## Switching Back to tmux
 

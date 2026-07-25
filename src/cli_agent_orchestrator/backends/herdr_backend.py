@@ -18,7 +18,9 @@ import shlex
 import subprocess
 import time
 from pathlib import Path
-from typing import Dict, List, Optional, cast
+from typing import Dict, List, Literal, Optional, cast
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from cli_agent_orchestrator.backends.base import (
     TerminalBackend,
@@ -115,6 +117,26 @@ def _sanitize_herdr_args(args: List[str]) -> List[str]:
 _PANE_CACHE_TTL = 5.0
 
 
+class HerdrWorkspace(BaseModel):
+    """Strict internal Herdr workspace identity and native lifecycle state."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    workspace_id: str = Field(strict=True)
+    label: str = Field(strict=True)
+    agent_status: Literal["done", "blocked", "idle", "working", "unknown"]
+    pane_count: int = Field(strict=True, ge=0)
+    tab_count: int = Field(strict=True, ge=0)
+    active_tab_id: Optional[str] = Field(default=None, strict=True)
+
+    @field_validator("workspace_id", "label")
+    @classmethod
+    def _require_non_empty_identity(cls, value: str) -> str:
+        if not value:
+            raise ValueError("workspace identity fields must not be empty")
+        return value
+
+
 class HerdrBackend(TerminalBackend):
     """TerminalBackend implementation using herdr CLI commands.
 
@@ -202,6 +224,62 @@ class HerdrBackend(TerminalBackend):
             return cast(dict, data["result"])
         return cast(dict, data)
 
+    @staticmethod
+    def _parse_workspace_inventory(stdout: str) -> List[HerdrWorkspace]:
+        """Parse one complete Herdr workspace-list envelope or fail closed."""
+        try:
+            envelope = json.loads(stdout)
+            if not isinstance(envelope, dict):
+                raise ValueError
+            result = envelope.get("result")
+            if not isinstance(result, dict):
+                raise ValueError
+            raw_workspaces = result.get("workspaces")
+            if not isinstance(raw_workspaces, list):
+                raise ValueError
+            workspaces = [
+                HerdrWorkspace.model_validate(item)
+                for item in raw_workspaces
+                if isinstance(item, dict)
+            ]
+            if len(workspaces) != len(raw_workspaces):
+                raise ValueError
+        except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
+            raise TerminalBackendError("invalid_workspace_inventory") from exc
+
+        labels: set[str] = set()
+        for workspace in workspaces:
+            if workspace.label in labels:
+                raise TerminalBackendError("duplicate_workspace_label")
+            labels.add(workspace.label)
+        return workspaces
+
+    def list_workspace_inventory(self) -> List[HerdrWorkspace]:
+        """Return strict typed inventory including stable Herdr identities."""
+        result = self._run_herdr(["workspace", "list"], check=False)
+        if result.returncode != 0:
+            raise TerminalBackendError("workspace_inventory_command_failed")
+        return self._parse_workspace_inventory(result.stdout)
+
+    def revalidate_workspace(
+        self,
+        label: str,
+        workspace_id: str,
+    ) -> Optional[HerdrWorkspace]:
+        """Return the workspace only when both its label and stable ID still match."""
+        for workspace in self.list_workspace_inventory():
+            if workspace.label == label:
+                return workspace if workspace.workspace_id == workspace_id else None
+        return None
+
+    def close_workspace_by_id(self, workspace_id: str) -> bool:
+        """Close the exact Herdr identity captured during candidate selection."""
+        result = self._run_herdr(
+            ["workspace", "close", workspace_id],
+            check=False,
+        )
+        return result.returncode == 0
+
     def _resolve_workspace_id(self, session_name: str) -> str:
         """Resolve session_name (workspace label) to workspace ID.
 
@@ -222,18 +300,13 @@ class HerdrBackend(TerminalBackend):
             if time.time() - cached_at < _PANE_CACHE_TTL:
                 return workspace_id
 
-        result = self._run_herdr(["workspace", "list"])
-        try:
-            data = self._parse_herdr_json(result.stdout)
-            workspaces = data.get("workspaces", []) if isinstance(data, dict) else data
-        except json.JSONDecodeError as e:
-            raise TerminalBackendError(f"Failed to parse herdr workspace list output: {e}") from e
-
-        for ws in workspaces:
-            if ws.get("label") == session_name:
-                ws_id = str(ws["workspace_id"])
-                self._workspace_cache[session_name] = (ws_id, time.time())
-                return ws_id
+        for workspace in self.list_workspace_inventory():
+            if workspace.label == session_name:
+                self._workspace_cache[session_name] = (
+                    workspace.workspace_id,
+                    time.time(),
+                )
+                return workspace.workspace_id
 
         raise TerminalBackendError(f"Workspace with label '{session_name}' not found")
 
@@ -289,33 +362,25 @@ class HerdrBackend(TerminalBackend):
 
     def session_exists(self, session_name: str) -> bool:
         """Check if a workspace with the given label exists."""
-        result = self._run_herdr(["workspace", "list"], check=False)
-        if result.returncode != 0:
-            return False
         try:
-            data = self._parse_herdr_json(result.stdout)
-            workspaces = data.get("workspaces", []) if isinstance(data, dict) else data
-            return any(ws.get("label") == session_name for ws in workspaces)
-        except (json.JSONDecodeError, KeyError):
+            return any(
+                workspace.label == session_name for workspace in self.list_workspace_inventory()
+            )
+        except TerminalBackendError:
             return False
 
     def list_sessions(self) -> List[Dict[str, str]]:
         """List all herdr workspaces as sessions."""
-        result = self._run_herdr(["workspace", "list"], check=False)
-        if result.returncode != 0:
-            return []
         try:
-            data = self._parse_herdr_json(result.stdout)
-            workspaces = data.get("workspaces", []) if isinstance(data, dict) else data
             return [
                 {
-                    "id": ws.get("label", str(ws.get("workspace_id", ""))),
-                    "name": ws.get("label", str(ws.get("workspace_id", ""))),
-                    "status": "active",
+                    "id": workspace.label,
+                    "name": workspace.label,
+                    "status": workspace.agent_status,
                 }
-                for ws in workspaces
+                for workspace in self.list_workspace_inventory()
             ]
-        except (json.JSONDecodeError, KeyError):
+        except TerminalBackendError:
             return []
 
     def kill_session(self, session_name: str) -> bool:
@@ -325,8 +390,7 @@ class HerdrBackend(TerminalBackend):
         except TerminalBackendError:
             logger.warning(f"kill_session: workspace '{session_name}' not found")
             return False
-        result = self._run_herdr(["workspace", "close", workspace_id], check=False)
-        if result.returncode == 0:
+        if self.close_workspace_by_id(workspace_id):
             self._workspace_cache.pop(session_name, None)
             logger.info(f"Killed herdr workspace: {session_name}")
             return True

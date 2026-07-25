@@ -2,6 +2,7 @@
 
 import logging
 import os
+import stat
 import uuid
 from contextlib import closing
 from datetime import datetime, timedelta, timezone
@@ -17,9 +18,10 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     create_engine,
+    text,
 )
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import DeclarativeBase, declarative_base, sessionmaker
+from sqlalchemy.orm import DeclarativeBase, Session, declarative_base, sessionmaker
 
 from cli_agent_orchestrator.constants import DATABASE_URL, DB_DIR, DEFAULT_PROVIDER
 from cli_agent_orchestrator.models.flow import Flow
@@ -162,9 +164,17 @@ def _ensure_db_dir() -> None:
     bodies + inputs_json), so the dir is owner-only — the same posture as
     claude_code prompt files (0o600) and the audit log (0o700/0o600). mkdir's
     mode is ignored when the dir already exists (exist_ok) and is masked by
-    umask on creation — the chmod enforces 0o700 in both cases, best-effort.
+    umask on creation. Avoid a redundant chmod when the effective mode is
+    already 0o700 so read-only agent sandboxes do not report a false warning.
     """
     DB_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        current_mode = stat.S_IMODE(DB_DIR.stat().st_mode)
+    except OSError as e:
+        logger.warning(f"Could not inspect DB dir permissions on {DB_DIR}: {e}")
+        return
+    if current_mode == 0o700:
+        return
     try:
         os.chmod(DB_DIR, 0o700)
     except OSError as e:
@@ -173,7 +183,14 @@ def _ensure_db_dir() -> None:
 
 # Module-level singletons
 _ensure_db_dir()
-engine = create_engine(DATABASE_URL, connect_args={"check_same_thread": False})
+_SQLITE_BUSY_TIMEOUT_SECONDS = 5.0
+engine = create_engine(
+    DATABASE_URL,
+    connect_args={
+        "check_same_thread": False,
+        "timeout": _SQLITE_BUSY_TIMEOUT_SECONDS,
+    },
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -276,7 +293,7 @@ def _migrate_project_aliases_schema() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             row = conn.execute(
                 "SELECT name FROM sqlite_master " "WHERE type='table' AND name='project_aliases'"
             ).fetchone()
@@ -302,7 +319,7 @@ def _migrate_memory_indexes() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_memory_scope ON memory_metadata (scope, scope_id)"
             )
@@ -329,7 +346,7 @@ def _migrate_add_access_count() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             cursor = conn.execute("PRAGMA table_info(memory_metadata)")
             columns = {row[1] for row in cursor.fetchall()}
             if "access_count" not in columns:
@@ -356,7 +373,7 @@ def _migrate_add_last_compiled_at() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             cursor = conn.execute("PRAGMA table_info(memory_metadata)")
             columns = {row[1] for row in cursor.fetchall()}
             if "last_compiled_at" not in columns:
@@ -380,7 +397,7 @@ def _migrate_add_related_keys() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             cursor = conn.execute("PRAGMA table_info(memory_metadata)")
             columns = {row[1] for row in cursor.fetchall()}
             if "related_keys" not in columns:
@@ -417,7 +434,7 @@ def _migrate_workflow_index() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             row = conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='workflow_index'"
             ).fetchone()
@@ -473,7 +490,7 @@ def _migrate_workflow_run() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run ("
                 "run_id TEXT PRIMARY KEY, "
@@ -525,7 +542,7 @@ def _migrate_workflow_run_step() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        with sqlite3.connect(str(DATABASE_FILE)) as conn:
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
             conn.execute(
                 "CREATE TABLE IF NOT EXISTS workflow_run_step ("
                 "run_id TEXT NOT NULL, "
@@ -555,34 +572,28 @@ def _migrate_terminals_schema() -> None:
     from cli_agent_orchestrator.constants import DATABASE_FILE
 
     try:
-        conn = sqlite3.connect(str(DATABASE_FILE))
-        cursor = conn.execute("PRAGMA table_info(terminals)")
-        columns = {row[1] for row in cursor.fetchall()}
-        if "allowed_tools" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
-            conn.commit()
-            logger.info("Migration: added allowed_tools column to terminals table")
-        if "shell_command" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
-            conn.commit()
-            logger.info("Migration: added shell_command column to terminals table")
-        if "caller_id" not in columns:
-            conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
-            conn.commit()
-            logger.info("Migration: added caller_id column to terminals table")
-        if "provider_initialized" not in columns:
-            conn.execute(
-                "ALTER TABLE terminals ADD COLUMN provider_initialized BOOLEAN DEFAULT NULL"
-            )
-            conn.commit()
-            logger.info("Migration: added provider_initialized column to terminals table")
-        if "profile_prompt_delivered" not in columns:
-            conn.execute(
-                "ALTER TABLE terminals ADD COLUMN profile_prompt_delivered BOOLEAN DEFAULT NULL"
-            )
-            conn.commit()
-            logger.info("Migration: added profile_prompt_delivered column to terminals table")
-        conn.close()
+        with closing(sqlite3.connect(str(DATABASE_FILE))) as conn, conn:
+            cursor = conn.execute("PRAGMA table_info(terminals)")
+            columns = {row[1] for row in cursor.fetchall()}
+            if "allowed_tools" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
+                logger.info("Migration: added allowed_tools column to terminals table")
+            if "shell_command" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
+                logger.info("Migration: added shell_command column to terminals table")
+            if "caller_id" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
+                logger.info("Migration: added caller_id column to terminals table")
+            if "provider_initialized" not in columns:
+                conn.execute(
+                    "ALTER TABLE terminals ADD COLUMN provider_initialized BOOLEAN DEFAULT NULL"
+                )
+                logger.info("Migration: added provider_initialized column to terminals table")
+            if "profile_prompt_delivered" not in columns:
+                conn.execute(
+                    "ALTER TABLE terminals ADD COLUMN profile_prompt_delivered BOOLEAN DEFAULT NULL"
+                )
+                logger.info("Migration: added profile_prompt_delivered column to terminals table")
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
 
@@ -839,22 +850,62 @@ def list_pending_receiver_ids_older_than(min_age_seconds: int) -> List[str]:
         return [row[0] for row in rows]
 
 
-def delete_terminal(terminal_id: str) -> bool:
-    """Delete terminal metadata."""
+def _begin_immediate(db: Session) -> None:
+    """Acquire SQLite's write reservation before validating receiver state."""
+    db.execute(text("BEGIN IMMEDIATE"))
+
+
+def _delete_terminals_with_receiver_inbox(
+    *,
+    terminal_id: Optional[str] = None,
+    tmux_session: Optional[str] = None,
+) -> int:
+    """Atomically delete terminal rows and messages addressed to them."""
+    if (terminal_id is None) == (tmux_session is None):
+        raise ValueError("exactly one terminal selector is required")
+
     with SessionLocal() as db:
-        deleted = db.query(TerminalModel).filter(TerminalModel.id == terminal_id).delete()
-        db.commit()
-        return deleted > 0
+        try:
+            _begin_immediate(db)
+            if terminal_id is not None:
+                exists = db.query(TerminalModel.id).filter(TerminalModel.id == terminal_id).first()
+                terminal_ids = [terminal_id] if exists is not None else []
+                terminal_filter = TerminalModel.id == terminal_id
+            else:
+                rows = (
+                    db.query(TerminalModel.id)
+                    .filter(TerminalModel.tmux_session == tmux_session)
+                    .all()
+                )
+                terminal_ids = [str(row[0]) for row in rows]
+                terminal_filter = TerminalModel.tmux_session == tmux_session
+
+            if terminal_ids:
+                db.query(InboxModel).filter(InboxModel.receiver_id.in_(terminal_ids)).delete(
+                    synchronize_session=False
+                )
+                deleted = (
+                    db.query(TerminalModel)
+                    .filter(terminal_filter)
+                    .delete(synchronize_session=False)
+                )
+            else:
+                deleted = 0
+            db.commit()
+            return int(deleted)
+        except Exception:
+            db.rollback()
+            raise
+
+
+def delete_terminal(terminal_id: str) -> bool:
+    """Delete terminal metadata and its receiver-side inbox rows atomically."""
+    return _delete_terminals_with_receiver_inbox(terminal_id=terminal_id) > 0
 
 
 def delete_terminals_by_session(tmux_session: str) -> int:
-    """Delete all terminals in a session."""
-    with SessionLocal() as db:
-        deleted = (
-            db.query(TerminalModel).filter(TerminalModel.tmux_session == tmux_session).delete()
-        )
-        db.commit()
-        return deleted
+    """Delete all session terminals and their receiver-side inbox rows atomically."""
+    return _delete_terminals_with_receiver_inbox(tmux_session=tmux_session)
 
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:
@@ -864,25 +915,30 @@ def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> Inbo
         ValueError: If the receiver terminal does not exist.
     """
     with SessionLocal() as db:
-        if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
-            raise ValueError(f"Terminal '{receiver_id}' not found")
-        inbox_msg = InboxModel(
-            sender_id=sender_id,
-            receiver_id=receiver_id,
-            message=message,
-            status=MessageStatus.PENDING.value,
-        )
-        db.add(inbox_msg)
-        db.commit()
-        db.refresh(inbox_msg)
-        return InboxMessage(
-            id=inbox_msg.id,
-            sender_id=inbox_msg.sender_id,
-            receiver_id=inbox_msg.receiver_id,
-            message=inbox_msg.message,
-            status=MessageStatus(inbox_msg.status),
-            created_at=inbox_msg.created_at,
-        )
+        try:
+            _begin_immediate(db)
+            if not db.query(TerminalModel).filter(TerminalModel.id == receiver_id).first():
+                raise ValueError(f"Terminal '{receiver_id}' not found")
+            inbox_msg = InboxModel(
+                sender_id=sender_id,
+                receiver_id=receiver_id,
+                message=message,
+                status=MessageStatus.PENDING.value,
+            )
+            db.add(inbox_msg)
+            db.commit()
+            db.refresh(inbox_msg)
+            return InboxMessage(
+                id=inbox_msg.id,
+                sender_id=inbox_msg.sender_id,
+                receiver_id=inbox_msg.receiver_id,
+                message=inbox_msg.message,
+                status=MessageStatus(inbox_msg.status),
+                created_at=inbox_msg.created_at,
+            )
+        except Exception:
+            db.rollback()
+            raise
 
 
 def get_pending_messages(receiver_id: str, limit: int = 1) -> List[InboxMessage]:

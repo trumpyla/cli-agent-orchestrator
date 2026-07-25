@@ -19,6 +19,11 @@ import subprocess
 import time
 from typing import Callable, Dict, Optional, Set
 
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+from cli_agent_orchestrator.backends.base import TerminalBackendError
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+
 logger = logging.getLogger(__name__)
 
 # Exponential backoff parameters
@@ -28,6 +33,262 @@ _BACKOFF_MULTIPLIER = 2.0
 
 # Kiro supplement check: how long in "working" before we check pane read
 _KIRO_WORKING_THRESHOLD = 30.0  # seconds
+
+
+class HerdrTab(BaseModel):
+    """Strict identity fields required from one Herdr tab-list element."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    tab_id: str = Field(strict=True)
+    workspace_id: str = Field(strict=True)
+    label: str = Field(strict=True)
+
+    @field_validator("tab_id", "workspace_id", "label")
+    @classmethod
+    def _require_non_empty_identity(cls, value: str) -> str:
+        if not value:
+            raise ValueError("tab identity fields must not be empty")
+        return value
+
+
+class HerdrPane(BaseModel):
+    """Strict stable fields required from one Herdr pane-list element."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    pane_id: str = Field(strict=True)
+
+    @field_validator("pane_id")
+    @classmethod
+    def _require_non_empty_identity(cls, value: str) -> str:
+        if not value:
+            raise ValueError("pane identity must not be empty")
+        return value
+
+
+class ReconciliationTerminal(BaseModel):
+    """Strict persisted identity used by startup reconciliation."""
+
+    model_config = ConfigDict(extra="ignore")
+
+    id: str = Field(strict=True)
+    tmux_session: str = Field(strict=True)
+    tmux_window: str = Field(strict=True)
+    provider: str = Field(strict=True)
+
+    @field_validator("id", "tmux_session", "tmux_window", "provider")
+    @classmethod
+    def _require_non_empty_identity(cls, value: str) -> str:
+        if not value:
+            raise ValueError("persisted terminal identity fields must not be empty")
+        return value
+
+
+class StartupReconciliationSummary(BaseModel):
+    """Content-free result suitable for operational logs and health evidence."""
+
+    model_config = ConfigDict(frozen=True)
+
+    inventory_valid: bool
+    reason: str
+    examined: int = Field(default=0, ge=0)
+    peer_skipped: int = Field(default=0, ge=0)
+    missing_workspace: int = Field(default=0, ge=0)
+    missing_tab: int = Field(default=0, ge=0)
+    deleted: int = Field(default=0, ge=0)
+    delete_failed: int = Field(default=0, ge=0)
+
+
+def _parse_tab_inventory(stdout: str) -> list[HerdrTab]:
+    """Parse a complete Herdr tab-list envelope or fail closed."""
+    try:
+        envelope = json.loads(stdout)
+        if not isinstance(envelope, dict):
+            raise ValueError
+        result = envelope.get("result")
+        if not isinstance(result, dict):
+            raise ValueError
+        raw_tabs = result.get("tabs")
+        if not isinstance(raw_tabs, list):
+            raise ValueError
+        tabs = [HerdrTab.model_validate(item) for item in raw_tabs if isinstance(item, dict)]
+        if len(tabs) != len(raw_tabs):
+            raise ValueError
+    except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
+        raise TerminalBackendError("tab_inventory_invalid") from exc
+
+    identities: set[tuple[str, str]] = set()
+    for tab in tabs:
+        identity = (tab.workspace_id, tab.label)
+        if identity in identities:
+            raise TerminalBackendError("tab_inventory_invalid")
+        identities.add(identity)
+    return tabs
+
+
+def _parse_pane_inventory(stdout: str) -> list[HerdrPane]:
+    """Parse a complete Herdr pane-list envelope or fail closed."""
+    try:
+        envelope = json.loads(stdout)
+        if not isinstance(envelope, dict):
+            raise ValueError
+        result = envelope.get("result")
+        if not isinstance(result, dict):
+            raise ValueError
+        raw_panes = result.get("panes")
+        if not isinstance(raw_panes, list):
+            raise ValueError
+        panes = [HerdrPane.model_validate(item) for item in raw_panes if isinstance(item, dict)]
+        if len(panes) != len(raw_panes):
+            raise ValueError
+    except (json.JSONDecodeError, ValidationError, TypeError, ValueError) as exc:
+        raise TerminalBackendError("pane_inventory_invalid") from exc
+
+    pane_ids = [pane.pane_id for pane in panes]
+    if len(set(pane_ids)) != len(pane_ids):
+        raise TerminalBackendError("pane_inventory_invalid")
+    return panes
+
+
+def _log_startup_reconciliation(summary: StartupReconciliationSummary) -> None:
+    """Log only stable reason codes and aggregate counts."""
+    logger.info(
+        "startup_reconciliation inventory_valid=%s reason=%s examined=%d "
+        "peer_skipped=%d missing_workspace=%d missing_tab=%d deleted=%d delete_failed=%d",
+        summary.inventory_valid,
+        summary.reason,
+        summary.examined,
+        summary.peer_skipped,
+        summary.missing_workspace,
+        summary.missing_tab,
+        summary.deleted,
+        summary.delete_failed,
+    )
+
+
+def _invalid_reconciliation(reason: str) -> StartupReconciliationSummary:
+    summary = StartupReconciliationSummary(inventory_valid=False, reason=reason)
+    _log_startup_reconciliation(summary)
+    return summary
+
+
+def _run_startup_reconciliation(herdr_session: str) -> StartupReconciliationSummary:
+    """Synchronously reconcile persisted terminals against strict Herdr inventory.
+
+    The async service invokes this repository boundary in a worker thread. Both
+    inventories are parsed completely before any destructive action, ensuring a
+    partial or malformed Herdr response cannot delete local state.
+    """
+    from cli_agent_orchestrator.clients.database import (
+        PEER_TMUX_SESSION,
+        delete_terminal,
+        list_all_terminals,
+    )
+
+    try:
+        workspace_result = subprocess.run(
+            ["herdr", "--session", herdr_session, "workspace", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return _invalid_reconciliation("workspace_command_timeout")
+    except OSError:
+        return _invalid_reconciliation("workspace_command_failed")
+    if workspace_result.returncode != 0:
+        return _invalid_reconciliation("workspace_command_failed")
+
+    try:
+        workspaces = HerdrBackend._parse_workspace_inventory(workspace_result.stdout)
+    except TerminalBackendError as exc:
+        reason = str(exc)
+        if reason not in {"workspace_inventory_invalid", "duplicate_workspace_label"}:
+            reason = "workspace_inventory_invalid"
+        return _invalid_reconciliation(reason)
+
+    try:
+        tab_result = subprocess.run(
+            ["herdr", "--session", herdr_session, "tab", "list"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired:
+        return _invalid_reconciliation("tab_command_timeout")
+    except OSError:
+        return _invalid_reconciliation("tab_command_failed")
+    if tab_result.returncode != 0:
+        return _invalid_reconciliation("tab_command_failed")
+
+    try:
+        tabs = _parse_tab_inventory(tab_result.stdout)
+    except TerminalBackendError:
+        return _invalid_reconciliation("tab_inventory_invalid")
+
+    try:
+        raw_terminals = list_all_terminals()
+        terminals = [
+            ReconciliationTerminal.model_validate(item)
+            for item in raw_terminals
+            if isinstance(item, dict)
+        ]
+        if len(terminals) != len(raw_terminals):
+            raise ValueError
+        terminal_ids = [terminal.id for terminal in terminals]
+        if len(set(terminal_ids)) != len(terminal_ids):
+            raise ValueError
+    except (ValidationError, TypeError, ValueError):
+        return _invalid_reconciliation("database_inventory_invalid")
+
+    workspace_by_label = {workspace.label: workspace for workspace in workspaces}
+    live_tabs_by_workspace: dict[str, set[str]] = {}
+    for tab in tabs:
+        live_tabs_by_workspace.setdefault(tab.workspace_id, set()).add(tab.label)
+
+    examined = 0
+    peer_skipped = 0
+    missing_workspace = 0
+    missing_tab = 0
+    deleted = 0
+    delete_failed = 0
+    candidates: list[ReconciliationTerminal] = []
+
+    for terminal in terminals:
+        if terminal.provider == "peer" or terminal.tmux_session == PEER_TMUX_SESSION:
+            peer_skipped += 1
+            continue
+        examined += 1
+        workspace = workspace_by_label.get(terminal.tmux_session)
+        if workspace is None:
+            missing_workspace += 1
+            candidates.append(terminal)
+            continue
+        live_labels = live_tabs_by_workspace.get(workspace.workspace_id, set())
+        if terminal.tmux_window not in live_labels:
+            missing_tab += 1
+            candidates.append(terminal)
+
+    for terminal in candidates:
+        try:
+            if delete_terminal(terminal.id):
+                deleted += 1
+        except Exception:
+            delete_failed += 1
+
+    summary = StartupReconciliationSummary(
+        inventory_valid=True,
+        reason="ok",
+        examined=examined,
+        peer_skipped=peer_skipped,
+        missing_workspace=missing_workspace,
+        missing_tab=missing_tab,
+        deleted=deleted,
+        delete_failed=delete_failed,
+    )
+    _log_startup_reconciliation(summary)
+    return summary
 
 
 class HerdrInboxService:
@@ -152,85 +413,8 @@ class HerdrInboxService:
             kiro_task.cancel()
 
     async def _startup_db_cleanup(self) -> None:
-        """Delete ghost DB terminals whose herdr tabs no longer exist.
-
-        Runs once at server startup before any pane registrations.  Cannot
-        rely on _pane_to_terminal (empty at startup) or _workspace_to_session
-        (populated later by _reconcile).  Builds the workspace map directly
-        from herdr workspace list.
-        """
-        from cli_agent_orchestrator.clients.database import (
-            delete_terminal,
-            list_terminals_by_session,
-        )
-
-        ws_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "workspace", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if ws_result.returncode != 0:
-            logger.debug("Startup DB cleanup: herdr workspace list failed, skipping")
-            return
-
-        try:
-            ws_data = json.loads(ws_result.stdout)
-            workspaces = ws_data.get("result", {}).get("workspaces", [])
-            workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Startup DB cleanup: failed to parse workspace list: {e}")
-            return
-
-        tab_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "tab", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if tab_result.returncode != 0:
-            logger.debug("Startup DB cleanup: herdr tab list failed, skipping")
-            return
-
-        try:
-            tab_data = json.loads(tab_result.stdout)
-            tabs = tab_data.get("result", {}).get("tabs", [])
-            live_tabs_by_workspace: Dict[str, set] = {}
-            for tab in tabs:
-                ws_id = tab.get("workspace_id", "")
-                label = tab.get("label", "")
-                if ws_id and label:
-                    live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Startup DB cleanup: failed to parse tab list: {e}")
-            return
-
-        deleted = 0
-        for ws_id, session_name in workspace_to_session.items():
-            live_labels = live_tabs_by_workspace.get(ws_id, set())
-            db_terminals = list_terminals_by_session(session_name)
-            for term in db_terminals:
-                if term.get("provider") == "peer":
-                    continue  # peers are pane-less (bi-directional bridge); never a ghost
-                window = term.get("tmux_window", "")
-                if window and window not in live_labels:
-                    logger.info(
-                        f"Startup DB cleanup: deleting ghost terminal {term['id']} "
-                        f"({session_name}:{window}) — tab not in herdr"
-                    )
-                    try:
-                        delete_terminal(term["id"])
-                        deleted += 1
-                    except Exception as e:
-                        logger.warning(
-                            f"Startup DB cleanup: failed to delete ghost terminal "
-                            f"{term['id']}: {e}"
-                        )
-
-        if deleted:
-            logger.info(f"Startup DB cleanup: removed {deleted} ghost terminal(s)")
-        else:
-            logger.debug("Startup DB cleanup: no ghost terminals found")
+        """Reconcile persisted state without blocking the owning event loop."""
+        await asyncio.to_thread(_run_startup_reconciliation, self._herdr_session)
 
     async def _kiro_supplement_loop(self) -> None:
         """Periodically check kiro terminals stuck in working state."""
@@ -292,85 +476,54 @@ class HerdrInboxService:
             get_terminal_metadata,
         )
 
-        # Get live panes from herdr
-        result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "pane", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
+        # Inventory subprocesses are blocking and must never own the event loop.
+        try:
+            result = await asyncio.to_thread(
+                subprocess.run,
+                ["herdr", "--session", self._herdr_session, "pane", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            logger.warning("reconcile_failed reason=pane_command_failed")
+            return
         if result.returncode != 0:
-            logger.warning(f"Reconcile: herdr pane list failed: {result.stderr}")
+            logger.warning("reconcile_failed reason=pane_command_failed")
             return
 
         try:
-            data = json.loads(result.stdout)
-            panes = data.get("result", {}).get("panes", [])
-            live_pane_ids = {p["pane_id"] for p in panes}
-        except (json.JSONDecodeError, KeyError) as e:
-            logger.warning(f"Reconcile: failed to parse pane list: {e}")
+            live_pane_ids = {pane.pane_id for pane in _parse_pane_inventory(result.stdout)}
+        except TerminalBackendError:
+            logger.warning("reconcile_failed reason=pane_inventory_invalid")
             return
 
         # Build workspace_id -> session_name mapping
-        ws_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "workspace", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if ws_result.returncode == 0:
-            try:
-                ws_data = json.loads(ws_result.stdout)
-                workspaces = ws_data.get("result", {}).get("workspaces", [])
-                self._workspace_to_session = {ws["workspace_id"]: ws["label"] for ws in workspaces}
-            except (json.JSONDecodeError, KeyError):
-                pass
+        try:
+            ws_result = await asyncio.to_thread(
+                subprocess.run,
+                ["herdr", "--session", self._herdr_session, "workspace", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            logger.warning("reconcile_failed reason=workspace_command_failed")
+            return
+        if ws_result.returncode != 0:
+            logger.warning("reconcile_failed reason=workspace_command_failed")
+            return
+        try:
+            workspaces = HerdrBackend._parse_workspace_inventory(ws_result.stdout)
+        except TerminalBackendError:
+            logger.warning("reconcile_failed reason=workspace_inventory_invalid")
+            return
+        self._workspace_to_session = {
+            workspace.workspace_id: workspace.label for workspace in workspaces
+        }
 
-        # DB cross-check: find terminals in DB whose tab no longer exists in herdr.
-        # This catches ghost records from previous server runs where _pane_to_terminal
-        # starts empty (so the stale-pane diff below produces nothing).
-        tab_result = subprocess.run(
-            ["herdr", "--session", self._herdr_session, "tab", "list"],
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        if tab_result.returncode == 0:
-            try:
-                tab_data = json.loads(tab_result.stdout)
-                tabs = tab_data.get("result", {}).get("tabs", [])
-                # Build: workspace_id -> set of live tab labels
-                live_tabs_by_workspace: Dict[str, set] = {}
-                for tab in tabs:
-                    ws_id = tab.get("workspace_id", "")
-                    label = tab.get("label", "")
-                    if ws_id and label:
-                        live_tabs_by_workspace.setdefault(ws_id, set()).add(label)
-
-                from cli_agent_orchestrator.clients.database import (
-                    delete_terminal,
-                    list_terminals_by_session,
-                )
-
-                for ws_id, session_name in self._workspace_to_session.items():
-                    live_labels = live_tabs_by_workspace.get(ws_id, set())
-                    db_terminals = list_terminals_by_session(session_name)
-                    for term in db_terminals:
-                        window = term.get("tmux_window", "")
-                        if window and window not in live_labels:
-                            logger.info(
-                                f"Reconcile: deleting ghost terminal {term['id']} "
-                                f"({session_name}:{window}) — tab not in herdr"
-                            )
-                            try:
-                                delete_terminal(term["id"])
-                            except Exception as e:
-                                logger.warning(
-                                    f"Reconcile: failed to delete ghost terminal "
-                                    f"{term['id']}: {e}"
-                                )
-            except (json.JSONDecodeError, KeyError) as e:
-                logger.warning(f"Reconcile: failed to parse tab list: {e}")
+        # Reuse the same strict persisted-state reconciliation on every reconnect.
+        await asyncio.to_thread(_run_startup_reconciliation, self._herdr_session)
 
         # Find stale panes: stored pane_id no longer in herdr's live pane list.
         #

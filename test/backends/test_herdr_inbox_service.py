@@ -5,7 +5,7 @@ import inspect
 import json
 import threading
 import time
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import MagicMock, patch
 
 from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxService
 
@@ -13,6 +13,11 @@ from cli_agent_orchestrator.services.herdr_inbox_service import HerdrInboxServic
 def _run_async(coro):
     """Run an async coroutine synchronously."""
     return asyncio.run(coro)
+
+
+def _stream_writer_mock() -> MagicMock:
+    """Model StreamWriter's mixed sync/async API without leaked coroutines."""
+    return MagicMock(spec=asyncio.StreamWriter)
 
 
 class TestHerdrInboxServiceRegistration:
@@ -156,7 +161,7 @@ class TestHerdrInboxServiceSubscription:
         """_subscribe_all_events should send exactly one events.subscribe containing
         every managed pane's agent-status subscription plus the lifecycle events."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer_mock()
         service._pane_to_terminal = {"pane-1": "tid1", "pane-2": "tid2"}
         service._terminal_to_pane = {"tid1": "pane-1", "tid2": "pane-2"}
 
@@ -182,7 +187,7 @@ class TestHerdrInboxServiceSubscription:
     def test_subscribe_all_events_with_no_panes_still_includes_lifecycle(self):
         """With no managed panes, the single subscribe still covers lifecycle events."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer_mock()
 
         _run_async(service._subscribe_all_events())
 
@@ -309,7 +314,7 @@ class TestHerdrInboxServiceReconnect:
         N panes must be one combined call, not N separate calls.
         """
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer_mock()
         # Register two terminals with their current pane_ids
         service._terminal_to_pane["tid1"] = "pane-1"
         service._pane_to_terminal["pane-1"] = "tid1"
@@ -478,7 +483,7 @@ class TestHerdrInboxServiceReconcile:
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
-    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals")
     def test_reconcile_deletes_ghost_db_terminals(self, mock_list_terminals, mock_delete, mock_run):
         """Ghost DB terminals (tab not in herdr) are deleted; live terminals are kept."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
@@ -486,7 +491,16 @@ class TestHerdrInboxServiceReconcile:
 
         pane_list_response = json.dumps({"result": {"panes": []}})
         ws_list_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
+            {
+                "result": {
+                    "workspaces": [
+                        TestHerdrInboxServiceStartupDbCleanup._workspace(
+                            "ws-abc",
+                            "my-session",
+                        )
+                    ]
+                }
+            }
         )
         tab_list_response = json.dumps(
             {
@@ -512,9 +526,20 @@ class TestHerdrInboxServiceReconcile:
         mock_run.side_effect = subprocess_side_effect
 
         mock_list_terminals.return_value = [
-            {"id": "tid-live", "tmux_window": "live-window"},
-            {"id": "tid-ghost", "tmux_window": "ghost-window"},
+            {
+                "id": "tid-live",
+                "tmux_session": "my-session",
+                "tmux_window": "live-window",
+                "provider": "claude_code",
+            },
+            {
+                "id": "tid-ghost",
+                "tmux_session": "my-session",
+                "tmux_window": "ghost-window",
+                "provider": "claude_code",
+            },
         ]
+        mock_delete.return_value = True
 
         _run_async(service._reconcile())
 
@@ -603,6 +628,17 @@ class TestHerdrInboxServiceReconcile:
 class TestHerdrInboxServiceStartupDbCleanup:
     """Test _startup_db_cleanup removes ghost terminals on server start."""
 
+    @staticmethod
+    def _workspace(workspace_id, label):
+        return {
+            "workspace_id": workspace_id,
+            "label": label,
+            "agent_status": "idle",
+            "pane_count": 1,
+            "tab_count": 1,
+            "active_tab_id": f"{workspace_id}:1",
+        }
+
     def _make_subprocess_side_effect(self, ws_response, tab_response):
         def side_effect(cmd, **_):
             m = MagicMock()
@@ -617,13 +653,13 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
-    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals")
     def test_startup_cleanup_deletes_ghost_terminals(self, mock_list, mock_delete, mock_run):
         """Ghost terminals (window not in live herdr tabs) are deleted at startup."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
         ws_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
+            {"result": {"workspaces": [self._workspace("ws-abc", "my-session")]}}
         )
         tab_response = json.dumps(
             {
@@ -636,16 +672,27 @@ class TestHerdrInboxServiceStartupDbCleanup:
         )
         mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
         mock_list.return_value = [
-            {"id": "tid-live", "tmux_window": "live-window"},
-            {"id": "tid-ghost", "tmux_window": "dead-window"},
+            {
+                "id": "tid-live",
+                "tmux_session": "my-session",
+                "tmux_window": "live-window",
+                "provider": "claude_code",
+            },
+            {
+                "id": "tid-ghost",
+                "tmux_session": "my-session",
+                "tmux_window": "dead-window",
+                "provider": "claude_code",
+            },
         ]
+        mock_delete.return_value = True
 
         _run_async(service._startup_db_cleanup())
 
         mock_delete.assert_called_once_with("tid-ghost")
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
-    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals")
     def test_startup_cleanup_skips_when_workspace_list_fails(self, mock_list, mock_run):
         """When herdr workspace list fails, no DB queries run."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
@@ -657,13 +704,13 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
-    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals")
     def test_startup_cleanup_no_deletes_when_all_live(self, mock_list, mock_delete, mock_run):
         """No deletions when all DB terminals have matching live tabs."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
         ws_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-abc", "label": "my-session"}]}}
+            {"result": {"workspaces": [self._workspace("ws-abc", "my-session")]}}
         )
         tab_response = json.dumps(
             {
@@ -675,7 +722,14 @@ class TestHerdrInboxServiceStartupDbCleanup:
             }
         )
         mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
-        mock_list.return_value = [{"id": "tid-1", "tmux_window": "conductor-10e0"}]
+        mock_list.return_value = [
+            {
+                "id": "tid-1",
+                "tmux_session": "my-session",
+                "tmux_window": "conductor-10e0",
+                "provider": "claude_code",
+            }
+        ]
 
         _run_async(service._startup_db_cleanup())
 
@@ -683,37 +737,31 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
-    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals")
     def test_startup_cleanup_preserves_peer_terminal(self, mock_list, mock_delete, mock_run):
         """Pane-less peer records are not ghosts and must survive startup cleanup."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
         ws_response = json.dumps(
-            {
-                "result": {
-                    "workspaces": [
-                        {
-                            "workspace_id": "ws-abc",
-                            "label": "cao-test",
-                        }
-                    ]
-                }
-            }
+            {"result": {"workspaces": [self._workspace("ws-abc", "cao-test")]}}
         )
         tab_response = json.dumps({"result": {"tabs": []}})
         mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
         mock_list.return_value = [
             {
                 "id": "peer-keep",
+                "tmux_session": "cao-test",
                 "tmux_window": "driver",
                 "provider": "peer",
             },
             {
                 "id": "ghost-delete",
+                "tmux_session": "cao-test",
                 "tmux_window": "dead-window",
                 "provider": "claude_code",
             },
         ]
+        mock_delete.return_value = True
 
         _run_async(service._startup_db_cleanup())
 
@@ -742,7 +790,7 @@ class TestHerdrInboxServiceSingleSubscribePerConnection:
     def test_socket_setup_issues_exactly_one_subscribe(self):
         """A full connect cycle (reconcile already done) writes exactly one subscribe."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
-        service._writer = AsyncMock()
+        service._writer = _stream_writer_mock()
         service._pane_to_terminal = {"pane-1": "tid1"}
         service._terminal_to_pane = {"tid1": "pane-1"}
 
@@ -1180,7 +1228,7 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
     @patch("cli_agent_orchestrator.backends.registry.get_backend")
     @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
-    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch("cli_agent_orchestrator.clients.database.list_all_terminals")
     @patch("cli_agent_orchestrator.clients.database.get_terminal_metadata")
     def test_reconcile_does_not_kill_live_workspace_on_pane_diff(
         self, mock_meta, mock_list, mock_delete, mock_run, mock_get_backend
@@ -1195,11 +1243,30 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
         pane_list_response = json.dumps({"result": {"panes": [{"pane_id": "pane-new"}]}})
         # Workspace "sess" is LIVE.
         ws_list_response = json.dumps(
-            {"result": {"workspaces": [{"workspace_id": "ws-1", "label": "sess"}]}}
+            {
+                "result": {
+                    "workspaces": [
+                        TestHerdrInboxServiceStartupDbCleanup._workspace(
+                            "ws-1",
+                            "sess",
+                        )
+                    ]
+                }
+            }
         )
         # Tab label win-1 is LIVE.
         tab_list_response = json.dumps(
-            {"result": {"tabs": [{"label": "win-1", "workspace_id": "ws-1"}]}}
+            {
+                "result": {
+                    "tabs": [
+                        {
+                            "tab_id": "ws-1:1",
+                            "label": "win-1",
+                            "workspace_id": "ws-1",
+                        }
+                    ]
+                }
+            }
         )
 
         def subprocess_side_effect(cmd, **_):
@@ -1215,7 +1282,14 @@ class TestHerdrInboxServiceReconcileLiveTerminal:
 
         mock_run.side_effect = subprocess_side_effect
         # DB cross-check: terminal's window matches a live tab -> not a ghost.
-        mock_list.return_value = [{"id": "tid1", "tmux_window": "win-1"}]
+        mock_list.return_value = [
+            {
+                "id": "tid1",
+                "tmux_session": "sess",
+                "tmux_window": "win-1",
+                "provider": "claude_code",
+            }
+        ]
 
         mock_backend = MagicMock()
         mock_backend.get_pane_id.return_value = "pane-new"

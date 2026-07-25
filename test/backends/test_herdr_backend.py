@@ -31,8 +31,24 @@ def _make_pane_list_response(panes):
 
 def _make_workspace_list_response(workspaces):
     """Build a herdr workspace list JSON envelope."""
+    complete_workspaces = [
+        {
+            "agent_status": "unknown",
+            "pane_count": 0,
+            "tab_count": 0,
+            "active_tab_id": None,
+            **workspace,
+        }
+        for workspace in workspaces
+    ]
     return json.dumps(
-        {"id": "cli:workspace:list", "result": {"workspaces": workspaces, "type": "workspace_list"}}
+        {
+            "id": "cli:workspace:list",
+            "result": {
+                "workspaces": complete_workspaces,
+                "type": "workspace_list",
+            },
+        }
     )
 
 

@@ -1266,8 +1266,53 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
         raise
 
 
-def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
-    """Delete terminal and kill its tmux window."""
+def _snapshot_terminal_metadata(terminal_id: str, metadata: dict) -> None:
+    """Best-effort scrollback and metadata snapshot before backend closure."""
+    try:
+        scrollback = get_backend().get_history(
+            metadata["tmux_session"],
+            metadata["tmux_window"],
+            strip_escapes=True,
+            full_history=True,
+        )
+        scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
+        scrollback_path.write_text(scrollback, encoding="utf-8")
+
+        import json as _json
+
+        snapshot = {
+            "terminal_id": terminal_id,
+            "session_name": metadata["tmux_session"],
+            "window_name": metadata["tmux_window"],
+            "agent_profile": metadata.get("agent_profile"),
+            "provider": metadata["provider"],
+            "working_directory": get_backend().get_pane_working_directory(
+                metadata["tmux_session"], metadata["tmux_window"]
+            ),
+            "allowed_tools": metadata.get("allowed_tools"),
+            "caller_id": metadata.get("caller_id"),
+        }
+        snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
+        snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
+    except Exception as e:
+        logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
+
+
+def prepare_terminal_for_backend_close(terminal_id: str) -> None:
+    """Snapshot a terminal while its captured backend workspace still exists."""
+    metadata = get_terminal_metadata(terminal_id)
+    if metadata:
+        _snapshot_terminal_metadata(terminal_id, metadata)
+
+
+def delete_terminal(
+    terminal_id: str,
+    registry: PluginRegistry | None = None,
+    *,
+    backend_already_closed: bool = False,
+    prepared: bool = False,
+) -> bool:
+    """Delete terminal state, optionally after an automatic backend-first close."""
     try:
         # Unregister from herdr inbox service
         svc = get_herdr_inbox_service()
@@ -1281,42 +1326,15 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         metadata = get_terminal_metadata(terminal_id)
 
         if metadata:
-            # Snapshot scrollback + metadata before killing (for debugging/restore)
-            try:
-                # Capture plain text full scrollback (no -e, no line cap)
-                scrollback = get_backend().get_history(
-                    metadata["tmux_session"],
-                    metadata["tmux_window"],
-                    strip_escapes=True,
-                    full_history=True,
-                )
-                scrollback_path = TERMINAL_LOG_DIR / f"{terminal_id}.scrollback"
-                scrollback_path.write_text(scrollback, encoding="utf-8")
-
-                import json as _json
-
-                snapshot = {
-                    "terminal_id": terminal_id,
-                    "session_name": metadata["tmux_session"],
-                    "window_name": metadata["tmux_window"],
-                    "agent_profile": metadata.get("agent_profile"),
-                    "provider": metadata["provider"],
-                    "working_directory": get_backend().get_pane_working_directory(
-                        metadata["tmux_session"], metadata["tmux_window"]
-                    ),
-                    "allowed_tools": metadata.get("allowed_tools"),
-                    "caller_id": metadata.get("caller_id"),
-                }
-                snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
-                snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
-            except Exception as e:
-                logger.warning(f"Failed to snapshot terminal {terminal_id}: {e}")
+            if not prepared:
+                _snapshot_terminal_metadata(terminal_id, metadata)
 
             # Stop pipe-pane logging
-            try:
-                get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
+            if not backend_already_closed:
+                try:
+                    get_backend().stop_pipe_pane(metadata["tmux_session"], metadata["tmux_window"])
+                except Exception as e:
+                    logger.warning(f"Failed to stop pipe-pane for {terminal_id}: {e}")
 
             # Stop FIFO reader and cleanup FIFO file. Must run BEFORE kill_window
             # so the reader thread (which reopens the FIFO on EOF) unblocks and
@@ -1333,10 +1351,11 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                 logger.warning(f"Failed to clear state detector for {terminal_id}: {e}")
 
             # Kill the tmux window (this terminates the agent process)
-            try:
-                get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
-            except Exception as e:
-                logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+            if not backend_already_closed:
+                try:
+                    get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
+                except Exception as e:
+                    logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
 
         # Cleanup provider state and database record
         provider_manager.cleanup_provider(terminal_id)

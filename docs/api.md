@@ -1,5 +1,10 @@
 # CLI Agent Orchestrator API Documentation
 
+Completed-session cleanup adds no REST, WebSocket, MCP, authentication, or
+scope surface. It is configured through `cao config`/`settings.json` and runs
+inside the server lifespan. See
+[Runtime resource cleanup](runtime-resource-cleanup.md).
+
 Base URL: `http://localhost:9889` (default)
 
 Interactive API docs (Swagger UI) are served live at **`/docs`**, and the raw OpenAPI

@@ -106,6 +106,7 @@ async def cleanup_expired_memories() -> None:
     try:
         now = datetime.now(timezone.utc)
         expired_count = 0
+        failed_count = 0
 
         if not MEMORY_BASE_DIR.exists():
             return
@@ -149,20 +150,20 @@ async def cleanup_expired_memories() -> None:
                         effective_scope_id,
                     )
                     expired_count += 1
-                    logger.info(
-                        f"Expired memory: key={entry['key']} scope={entry['scope']} "
-                        f"type={entry['memory_type']}"
-                    )
-                except Exception as e:
-                    logger.warning(f"Failed to expire memory key={entry['key']}: {e}")
+                except Exception:
+                    failed_count += 1
 
-        if expired_count > 0:
-            logger.info(f"Memory cleanup: expired {expired_count} memories")
+        if expired_count > 0 or failed_count > 0:
+            logger.info(
+                "memory_cleanup expired=%d failed=%d",
+                expired_count,
+                failed_count,
+            )
         else:
-            logger.debug("Memory cleanup: no expired memories found")
+            logger.debug("memory_cleanup expired=0 failed=0")
 
-    except Exception as e:
-        logger.error(f"Error during memory cleanup: {e}")
+    except Exception:
+        logger.error("memory_cleanup failed reason=internal_error")
 
 
 def _forget_sync(memory_service, key: str, scope: str, scope_id: str | None) -> None:

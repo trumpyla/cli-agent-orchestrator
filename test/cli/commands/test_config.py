@@ -143,6 +143,53 @@ class TestConfigSet:
         terminal_result = runner.invoke(config, ["set", "terminal.backend", "herdr"])
         assert terminal_result.stderr == ""
 
+    def test_set_cleanup_policy_round_trips_typed_value(self, runner, _isolated_settings):
+        result = runner.invoke(
+            config,
+            ["set", "cleanup.completed_sessions_enabled", "true"],
+        )
+
+        assert result.exit_code == 0
+        assert json.loads(result.output) is True
+        get_result = runner.invoke(
+            config,
+            ["get", "cleanup.completed_sessions_enabled"],
+        )
+        assert json.loads(get_result.output) is True
+
+    @pytest.mark.parametrize(
+        ("key", "value"),
+        [
+            pytest.param(
+                "cleanup.completed_sessions_enabled",
+                "yes",
+                id="non-strict-bool",
+            ),
+            pytest.param(
+                "cleanup.max_sessions_per_sweep",
+                "51",
+                id="batch-too-large",
+            ),
+            pytest.param(
+                "cleanup.preserve_patterns",
+                '["contains\\ncontrol"]',
+                id="control-character",
+            ),
+        ],
+    )
+    def test_set_invalid_cleanup_policy_returns_clean_cli_error(
+        self,
+        runner,
+        _isolated_settings,
+        key,
+        value,
+    ):
+        result = runner.invoke(config, ["set", key, value])
+
+        assert result.exit_code != 0
+        assert result.exception is None or isinstance(result.exception, SystemExit)
+        assert "validation error" in result.output.lower()
+
 
 class TestConfigList:
     def test_list_includes_known_keys(self, runner, _isolated_settings):
@@ -150,6 +197,7 @@ class TestConfigList:
         assert result.exit_code == 0
         assert "terminal.backend = " in result.output
         assert "memory.compile_mode = " in result.output
+        assert "cleanup.completed_sessions_enabled = false" in result.output
 
     def test_list_surfaces_network_and_auth_values_despite_being_inert(
         self, runner, _isolated_settings

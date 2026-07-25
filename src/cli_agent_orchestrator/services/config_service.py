@@ -25,12 +25,15 @@ under the *nested* schema described in issue #357.
 
 import json
 import logging
+import os
+import unicodedata
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils.atomic_write import atomic_write_text
 
 logger = logging.getLogger(__name__)
 
@@ -61,10 +64,54 @@ class ServerConfig(BaseModel):
 
 
 class MemoryConfig(BaseModel):
-    enabled: bool = True
-    compile_mode: str = "llm"
-    flush_threshold: float = 0.85
-    compile_timeout_s: float = 120.0
+    """Validated memory policy while preserving extension-owned metadata."""
+
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool = Field(default=True, strict=True)
+    compile_mode: Literal["llm", "append"] = "llm"
+    flush_threshold: float = Field(
+        default=0.85,
+        strict=True,
+        gt=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
+    compile_timeout_s: float = Field(
+        default=120.0,
+        strict=True,
+        gt=0.0,
+        le=3600.0,
+        allow_inf_nan=False,
+    )
+
+
+class CleanupConfig(BaseModel):
+    """Conservative policy for irreversible completed-session deletion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    completed_sessions_enabled: bool = Field(default=False, strict=True)
+    completed_session_grace_s: int = Field(default=900, strict=True, ge=60)
+    sweep_interval_s: int = Field(default=300, strict=True, ge=30)
+    max_sessions_per_sweep: int = Field(default=5, strict=True, ge=1, le=50)
+    preserve_patterns: List[str] = Field(default_factory=list)
+
+    @field_validator("preserve_patterns", mode="before")
+    @classmethod
+    def _validate_preserve_patterns(cls, value: Any) -> List[str]:
+        if not isinstance(value, list):
+            raise ValueError("preserve_patterns must be a list")
+        if len(value) > 100:
+            raise ValueError("preserve_patterns must contain at most 100 entries")
+        for pattern in value:
+            if not isinstance(pattern, str):
+                raise ValueError("preserve_patterns entries must be strings")
+            if len(pattern) > 128:
+                raise ValueError("preserve_patterns entries must be at most 128 characters")
+            if any(unicodedata.category(character) == "Cc" for character in pattern):
+                raise ValueError("preserve_patterns entries must not contain control characters")
+        return value
 
 
 class TerminalConfig(BaseModel):
@@ -121,6 +168,7 @@ class CAOConfig(BaseModel):
     skills: SkillsConfig = Field(default_factory=SkillsConfig)
     server: ServerConfig = Field(default_factory=ServerConfig)
     memory: MemoryConfig = Field(default_factory=MemoryConfig)
+    cleanup: CleanupConfig = Field(default_factory=CleanupConfig)
     terminal: TerminalConfig = Field(default_factory=TerminalConfig)
     apps: AppsConfig = Field(default_factory=AppsConfig)
     network: NetworkConfig = Field(default_factory=NetworkConfig)
@@ -158,6 +206,11 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "network.allowed_hosts": [],
     "network.cors_origins": [],
     "network.ws_allowed_clients": [],
+    "cleanup.completed_sessions_enabled": False,
+    "cleanup.completed_session_grace_s": 900,
+    "cleanup.sweep_interval_s": 300,
+    "cleanup.max_sessions_per_sweep": 5,
+    "cleanup.preserve_patterns": [],
 }
 
 # Env-var registry: every CAO_* var this schema recognizes, mapped to its
@@ -179,6 +232,24 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
+    "CAO_MEMORY_COMPILE_TIMEOUT_S": ("memory.compile_timeout_s", "float", 120.0),
+    "CAO_CLEANUP_COMPLETED_SESSIONS_ENABLED": (
+        "cleanup.completed_sessions_enabled",
+        "bool",
+        False,
+    ),
+    "CAO_CLEANUP_COMPLETED_SESSION_GRACE_S": (
+        "cleanup.completed_session_grace_s",
+        "int",
+        900,
+    ),
+    "CAO_CLEANUP_SWEEP_INTERVAL_S": ("cleanup.sweep_interval_s", "int", 300),
+    "CAO_CLEANUP_MAX_SESSIONS_PER_SWEEP": (
+        "cleanup.max_sessions_per_sweep",
+        "int",
+        5,
+    ),
+    "CAO_CLEANUP_PRESERVE_PATTERNS": ("cleanup.preserve_patterns", "list", []),
     "CAO_MCP_REQUEST_TIMEOUT": ("server.mcp_request_timeout", "int", 30),
     "CAO_EVENT_BUS_MAX_QUEUE_SIZE": ("server.event_bus_max_queue_size", "int", 1024),
     "CAO_PROVIDER_INIT_TIMEOUT": ("server.provider_init_timeout", "int", 60),
@@ -197,7 +268,12 @@ _migration_logged = False
 
 def _coerce_env_value(raw: str, kind: str) -> Any:
     if kind == "bool":
-        return raw.strip().lower() in ("1", "true", "yes")
+        normalized = raw.strip().lower()
+        if normalized in ("1", "true", "yes"):
+            return True
+        if normalized in ("0", "false", "no"):
+            return False
+        raise ValueError("expected a boolean")
     if kind == "int":
         return int(raw)
     if kind == "float":
@@ -205,6 +281,32 @@ def _coerce_env_value(raw: str, kind: str) -> Any:
     if kind == "list":
         return [item.strip() for item in raw.split(",") if item.strip()]
     return raw
+
+
+def _resolved_cleanup_config() -> CleanupConfig:
+    """Resolve and validate the entire cleanup section as one policy."""
+    raw_section = _load_raw().get("cleanup", {})
+    if not isinstance(raw_section, dict):
+        logger.warning("Invalid settings.cleanup (expected object); cleanup remains disabled")
+        return CleanupConfig()
+
+    merged = dict(raw_section)
+    for env_name, (path, kind, _) in ENV_REGISTRY.items():
+        if not path.startswith("cleanup."):
+            continue
+        raw = os.environ.get(env_name)
+        if raw is None or raw == "":
+            continue
+        try:
+            merged[path.split(".", 1)[1]] = _coerce_env_value(raw, kind)
+        except ValueError:
+            logger.warning("Ignoring invalid %s for %s; using file/default", env_name, path)
+
+    try:
+        return CleanupConfig.model_validate(merged)
+    except ValidationError:
+        logger.warning("Invalid settings.cleanup policy; cleanup remains disabled")
+        return CleanupConfig()
 
 
 def _get_nested(data: Dict[str, Any], keys: Tuple[str, ...]) -> Any:
@@ -291,7 +393,7 @@ def _load_raw() -> Dict[str, Any]:
 def _save_raw(data: Dict[str, Any]) -> None:
     settings_file = _settings_file()
     settings_file.parent.mkdir(parents=True, exist_ok=True)
-    settings_file.write_text(json.dumps(data, indent=2))
+    atomic_write_text(settings_file, json.dumps(data, indent=2))
 
 
 def _get_from_file(path: str) -> Any:
@@ -348,6 +450,15 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
     from the caller (e.g. ``cao-server --terminal herdr``) and, when not
     ``None``, always wins.
     """
+    if path.startswith("cleanup."):
+        key = path.split(".", 1)[1]
+        cleanup = _resolved_cleanup_config()
+        if override is None:
+            return getattr(cleanup, key, default)
+        merged = cleanup.model_dump()
+        merged[key] = override
+        return getattr(CleanupConfig.model_validate(merged), key)
+
     if override is not None:
         return override
 
@@ -421,6 +532,20 @@ def _set_value(path: str, value: Any) -> Any:
     if path.startswith("memory."):
         key = path.split(".", 1)[1]
         return settings_service.set_memory_setting(key, value)
+    if path.startswith("cleanup."):
+        key = path.split(".", 1)[1]
+        if key not in CleanupConfig.model_fields:
+            raise KeyError(path)
+        data = _load_raw()
+        raw_section = data.get("cleanup", {})
+        if not isinstance(raw_section, dict):
+            raise ValueError("cleanup must be an object")
+        merged = dict(raw_section)
+        merged[key] = value
+        cleanup = CleanupConfig.model_validate(merged)
+        data["cleanup"] = cleanup.model_dump()
+        _save_raw(data)
+        return getattr(cleanup, key)
 
     keys = _LEGACY_KEY_MAP.get(path, tuple(path.split(".")))
     data = _load_raw()
@@ -445,6 +570,11 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "cleanup.completed_sessions_enabled",
+        "cleanup.completed_session_grace_s",
+        "cleanup.sweep_interval_s",
+        "cleanup.max_sessions_per_sweep",
+        "cleanup.preserve_patterns",
     }
 )
 
@@ -508,6 +638,7 @@ class ConfigService:
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
                 compile_timeout_s=_get_value("memory.compile_timeout_s", default=120.0),
             ),
+            cleanup=_resolved_cleanup_config(),
             terminal=TerminalConfig(
                 backend=_get_value("terminal.backend", default="tmux"),
                 herdr_session=_get_value("terminal.herdr_session", default="cao"),

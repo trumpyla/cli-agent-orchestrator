@@ -1,5 +1,10 @@
 # Terminal Lifecycle
 
+Automatic completed-session deletion is not part of ordinary terminal exit.
+It is a separate default-off Herdr policy with stable workspace-ID
+revalidation, a grace period, pending-inbox protection, and bounded batches.
+See [Runtime resource cleanup](runtime-resource-cleanup.md).
+
 ## Overview
 
 Each terminal created by CAO (via `assign` or `handoff`) occupies a tmux window

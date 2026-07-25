@@ -25,6 +25,7 @@ Status Detection Strategy:
     - ERROR: Error message patterns or empty output
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -171,6 +172,33 @@ ANY_BULLET_PATTERN = r"(?m)^\s*•"
 ERROR_PATTERN = (
     r"^(?:Error:|ERROR:|Traceback \(most recent call last\):|ConnectionError:|APIError:)"
 )
+
+
+def _is_startup_output_ready(output: str) -> bool:
+    """Classify captured Kimi startup output without mutating provider state."""
+    if not output:
+        return False
+
+    clean_output = strip_terminal_escapes(output)
+    if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
+        return False
+
+    if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
+        lines = clean_output.splitlines()
+        last_spinner = max(
+            (index for index, line in enumerate(lines) if _is_live_turn_spinner_line(line)),
+            default=-1,
+        )
+        last_bullet = max(
+            (index for index, line in enumerate(lines) if re.match(r"\s*•", line)),
+            default=-1,
+        )
+        spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
+        return not (spinner_in_tail or last_spinner > last_bullet)
+
+    bottom_lines = clean_output.strip().splitlines()[-IDLE_PROMPT_TAIL_LINES:]
+    idle_prompt_eol = IDLE_PROMPT_PATTERN + r"\s*$"
+    return any(re.search(idle_prompt_eol, line) for line in bottom_lines)
 
 
 class KimiCliProvider(BaseProvider):
@@ -528,10 +556,7 @@ class KimiCliProvider(BaseProvider):
                     time.sleep(1.0)
                     continue
                 # Already at a ready prompt → no dialog to handle, stop early.
-                if self.get_status(output) in (
-                    TerminalStatus.IDLE,
-                    TerminalStatus.COMPLETED,
-                ):
+                if _is_startup_output_ready(output):
                     return
             time.sleep(1.0)
 
@@ -577,7 +602,10 @@ class KimiCliProvider(BaseProvider):
 
         # Dismiss the startup upgrade-reminder dialog before waiting for ready:
         # unanswered it blocks kimi from reaching its prompt (init would time out).
-        self._handle_startup_dialog(outer_timeout=ready_timeout)
+        await asyncio.to_thread(
+            self._handle_startup_dialog,
+            outer_timeout=ready_timeout,
+        )
 
         # Wait for Kimi CLI to reach IDLE or COMPLETED state (prompt visible).
         # Accept both IDLE and COMPLETED — some CLI versions show a startup

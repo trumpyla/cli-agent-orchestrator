@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
 
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.utils.atomic_write import atomic_write_text
 from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
@@ -37,7 +38,7 @@ def _load() -> Dict[str, Any]:
 def _save(data: Dict[str, Any]) -> None:
     """Save settings to disk."""
     CAO_HOME_DIR.mkdir(parents=True, exist_ok=True)
-    SETTINGS_FILE.write_text(json.dumps(data, indent=2))
+    atomic_write_text(SETTINGS_FILE, json.dumps(data, indent=2))
 
 
 def get_agent_dirs() -> Dict[str, str]:
@@ -132,20 +133,27 @@ def set_disabled_agent_dirs(dirs: List[str]) -> List[str]:
     key (``disabled_agent_dirs``) for backward compatibility — mirroring
     ``set_agent_dirs`` / ``set_extra_agent_dirs``.
     """
-    norm_to_configured = {
-        normalized_path(v): v
-        for v in list(get_agent_dirs().values()) + list(get_extra_agent_dirs())
-        if isinstance(v, str)
-    }
+    norm_to_configured: Dict[str, str] = {}
+    for configured in list(get_agent_dirs().values()) + list(get_extra_agent_dirs()):
+        if not isinstance(configured, str):
+            continue
+        try:
+            norm_to_configured[normalized_path(configured)] = configured
+        except ValueError:
+            continue
     seen: Set[str] = set()
     cleaned: List[str] = []
     for d in dirs:
         if not isinstance(d, str) or not d.strip():
             continue
-        configured = norm_to_configured.get(normalized_path(d.strip()))
-        if configured is not None and configured not in seen:
-            seen.add(configured)
-            cleaned.append(configured)
+        try:
+            normalized = normalized_path(d.strip())
+        except ValueError:
+            continue
+        matched_configured = norm_to_configured.get(normalized)
+        if matched_configured is not None and matched_configured not in seen:
+            seen.add(matched_configured)
+            cleaned.append(matched_configured)
     settings = _load()
     # Write nested format
     agents_section = settings.get("agents", {})
@@ -260,11 +268,27 @@ def get_memory_settings() -> Dict[str, Any]:
     behavior. Setting it to ``False`` disables all memory subsystem
     operations — see ``is_memory_enabled()``.
     """
+    from cli_agent_orchestrator.services.config_service import MemoryConfig
+
     settings = _load()
-    defaults: Dict[str, Any] = {"enabled": True, "flush_threshold": 0.85}
+    defaults: Dict[str, Any] = MemoryConfig().model_dump()
     saved = settings.get("memory", {})
-    result = dict(defaults)
-    result.update(saved)
+    if not isinstance(saved, dict):
+        logger.warning("Ignoring non-object memory settings; using defaults")
+        saved = {}
+
+    # Validate known fields independently so one malformed optional setting
+    # cannot disable otherwise-valid memory policy. Preserve unknown metadata
+    # owned by memory integrations when settings are read or rewritten.
+    result = {key: value for key, value in saved.items() if key not in defaults}
+    for key, default in defaults.items():
+        candidate = dict(defaults)
+        candidate[key] = saved.get(key, default)
+        try:
+            result[key] = MemoryConfig.model_validate(candidate).model_dump()[key]
+        except ValueError:
+            logger.warning("Ignoring invalid memory.%s; using default", key)
+            result[key] = default
 
     # Env-var overlay: CAO_MEMORY_ENABLED beats settings.json
     env_enabled = os.environ.get("CAO_MEMORY_ENABLED")
@@ -288,6 +312,16 @@ def get_memory_settings() -> Dict[str, Any]:
                 f"Ignoring invalid CAO_MEMORY_FLUSH_THRESHOLD={env_threshold!r} "
                 f"(expected float); using file/default"
             )
+
+    env_timeout = os.environ.get("CAO_MEMORY_COMPILE_TIMEOUT_S")
+    if env_timeout is not None and env_timeout.strip() != "":
+        try:
+            timeout = float(env_timeout)
+            candidate = dict(defaults)
+            candidate["compile_timeout_s"] = timeout
+            result["compile_timeout_s"] = MemoryConfig.model_validate(candidate).compile_timeout_s
+        except (ValueError, TypeError):
+            logger.warning("Ignoring invalid CAO_MEMORY_COMPILE_TIMEOUT_S; using file/default")
 
     return result
 
@@ -357,28 +391,37 @@ def get_compile_timeout_s() -> float:
 def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
     """Update a single memory setting.
 
-    Supported keys:
-        ``enabled`` (bool) — master switch for the memory subsystem.
-        ``flush_threshold`` (float, 0.0 < x ≤ 1.0) — context-usage trigger.
+    All documented keys are validated through the shared Pydantic contract.
+    Extension-owned keys already present in the memory object are preserved.
     """
+    from cli_agent_orchestrator.services.config_service import MemoryConfig
+
+    if key not in MemoryConfig.model_fields:
+        raise ValueError(f"Unknown memory setting: {key}")
+    if key == "enabled" and not isinstance(value, bool):
+        raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
+    if key == "flush_threshold":
+        try:
+            threshold = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("flush_threshold must be between 0.0 and 1.0") from exc
+        if isinstance(value, bool) or not 0.0 < threshold <= 1.0:
+            raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {threshold}")
+        value = threshold
+
     settings = _load()
     memory = settings.get("memory", {})
+    if not isinstance(memory, dict):
+        raise ValueError("memory must be an object")
 
-    if key == "enabled":
-        if not isinstance(value, bool):
-            raise ValueError(f"enabled must be a bool, got {type(value).__name__}")
-        memory[key] = value
-    elif key == "flush_threshold":
-        fval = float(value)
-        if not (0.0 < fval <= 1.0):
-            raise ValueError(f"flush_threshold must be between 0.0 and 1.0, got {fval}")
-        memory[key] = fval
-    else:
-        raise ValueError(f"Unknown memory setting: {key}")
+    candidate = dict(memory)
+    candidate[key] = value
+    validated = MemoryConfig.model_validate(candidate)
+    memory = validated.model_dump()
 
     settings["memory"] = memory
     _save(settings)
-    logger.info(f"Updated memory setting: {key}={memory[key]}")
+    logger.info("Updated memory setting: %s", key)
     return get_memory_settings()
 
 
@@ -409,8 +452,11 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     Writes to nested schema (``agents.extra_dirs``) and legacy flat key
     (``extra_agent_dirs``) for backward compatibility.
     """
+    extra_agent_dirs = [d for d in dirs if isinstance(d, str) and d.strip()]
+    for configured in extra_agent_dirs:
+        normalized_path(configured)
+
     settings = _load()
-    extra_agent_dirs = [d for d in dirs if d.strip()]
     # Write nested format
     agents_section = settings.get("agents", {})
     if not isinstance(agents_section, dict):
@@ -462,8 +508,11 @@ def set_extra_skill_dirs(dirs: List[str]) -> List[str]:
     Writes to nested schema (``skills.extra_dirs``) and legacy flat key
     (``extra_skill_dirs``) for backward compatibility.
     """
-    settings = _load()
     extra_skill_dirs = [d.strip() for d in dirs if isinstance(d, str) and d.strip()]
+    for configured in extra_skill_dirs:
+        normalized_path(configured)
+
+    settings = _load()
     # Write nested format
     skills_section = settings.get("skills", {})
     if not isinstance(skills_section, dict):
