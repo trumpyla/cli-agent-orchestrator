@@ -11,19 +11,18 @@ class FastMcp32SessionTasks:
 
     def __init__(self, session: Any) -> None:
         """Bind directly to the fastmcp session transport."""
-        self._ops_subscription_closing = False
-        
-        if hasattr(session, "_incoming_message_stream_writer"):
-            orig_aclose = session._incoming_message_stream_writer.aclose
-            async def hooked_aclose(*args, **kwargs):
-                await self.cancel_all()
-                return await orig_aclose(*args, **kwargs)
-            session._incoming_message_stream_writer.aclose = hooked_aclose
-
         self.session = session
         if not hasattr(session, "_ops_subscription_registry"):
             # Use setattr to dynamically attach the registry to the session object
             setattr(session, "_ops_subscription_registry", {})
+            setattr(session, "_ops_subscription_closing", False)
+
+            if hasattr(session, "_incoming_message_stream_writer"):
+                orig_aclose = session._incoming_message_stream_writer.aclose
+                async def hooked_aclose(*args, **kwargs):
+                    await self.cancel_all()
+                    return await orig_aclose(*args, **kwargs)
+                session._incoming_message_stream_writer.aclose = hooked_aclose
 
     @property
     def _registry(self) -> Dict[str, Tuple[anyio.CancelScope, anyio.Event]]:
@@ -38,7 +37,7 @@ class FastMcp32SessionTasks:
         """
         Idempotently subscribes a worker to a resource.
         """
-        if self._ops_subscription_closing:
+        if getattr(self.session, "_ops_subscription_closing", False):
             raise RuntimeError("Session is closing")
 
         if resource_uri in self._registry:
@@ -93,8 +92,8 @@ class FastMcp32SessionTasks:
         """
         Explicit finalization seam: cancels all active subscription workers and awaits their termination.
         """
-        self._ops_subscription_closing = True
-        
+        setattr(self.session, "_ops_subscription_closing", True)
+
         events_to_wait = []
         for scope, done_event in list(self._registry.values()):
             scope.cancel()

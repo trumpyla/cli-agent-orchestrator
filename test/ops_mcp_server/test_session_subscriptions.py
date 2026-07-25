@@ -217,7 +217,7 @@ async def test_real_fastmcp_delete_finalization():
     from mcp.client.session import ClientSession
     from mcp.shared.memory import create_client_server_memory_streams
     from pydantic import AnyUrl
-    
+
     server = FastMCP("test-delete")
     low = server._mcp_server
     worker_started = anyio.Event()
@@ -253,11 +253,11 @@ async def test_real_fastmcp_delete_finalization():
                 await client.subscribe_resource(AnyUrl("cao://peers/deadbeef/inbox"))
                 await worker_started.wait()
                 assert len(captured["tasks"]._registry) == 1
-            
+
             # Client disconnected
             with anyio.move_on_after(0.25) as wait_scope:
                 await server_done.wait()
-            
+
             assert not wait_scope.cancel_called, "Server exit timed out"
             assert len(captured["tasks"]._registry) == 0
             outer.cancel_scope.cancel()
@@ -290,7 +290,47 @@ async def test_cancel_all_racing_late():
             tg2.start_soon(do_cancel_all)
             await anyio.sleep(0.01)  # Ensure cancel_all is in progress
             tg2.start_soon(late_subscriber)
-            
+
         assert len(tasks._registry) == 0
 
 
+
+@pytest.mark.anyio
+async def test_multiple_adapters_shared_closing_state():
+    class MockWriter:
+        def __init__(self):
+            self.aclose_calls = 0
+        async def aclose(self):
+            self.aclose_calls += 1
+
+    async with anyio.create_task_group() as tg:
+        session = FakeSession(tg)
+        session._incoming_message_stream_writer = MockWriter()
+
+        adapter1 = FastMcp32SessionTasks(session)
+        adapter2 = FastMcp32SessionTasks(session)
+
+        await session._incoming_message_stream_writer.aclose()
+
+        # We expect aclose to only be called once on the original MockWriter
+        assert session._incoming_message_stream_writer.aclose_calls == 1
+
+        # Both adapters should prevent new subscriptions
+        with pytest.raises(RuntimeError, match="Session is closing"):
+            await adapter1.subscribe("r://new", lambda: None)
+
+        with pytest.raises(RuntimeError, match="Session is closing"):
+            await adapter2.subscribe("r://new", lambda: None)
+
+@pytest.mark.anyio
+async def test_multiple_adapters_cancel_all():
+    async with anyio.create_task_group() as tg:
+        session = FakeSession(tg)
+
+        adapter1 = FastMcp32SessionTasks(session)
+        adapter2 = FastMcp32SessionTasks(session)
+
+        await adapter1.cancel_all()
+
+        with pytest.raises(RuntimeError, match="Session is closing"):
+            await adapter2.subscribe("r://new", lambda: None)
