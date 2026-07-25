@@ -228,6 +228,13 @@ write tools; Kimi uses native plan mode and Antigravity uses
 `permissionMode: plan`. Implementation profiles receive write/execute
 capabilities only in their assigned worktrees.
 
+Supervisor profiles additionally include the embedded `cao-ops` native HTTP
+endpoint. This keeps them in Codex plan/read-only mode while providing
+`get_terminal_status`, output, input, session inspection, and shutdown tools
+through the trusted MCP control plane; direct localhost REST and Herdr socket
+access can be denied by the provider sandbox and is not a lifecycle-management
+dependency.
+
 `.serena/project.yml` enables Python, excludes generated/cache/worktree
 directories, and sets `read_only: true`. The shared warm Serena daemon is
 navigation-only; edits remain native filesystem operations. Prompts require

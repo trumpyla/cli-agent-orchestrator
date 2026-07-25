@@ -30,6 +30,9 @@ machine-specific user setting.
 Every applicable swarm profile MUST include the identity-bearing stdio
 `cao-mcp-server`, managed Context7 HTTP, and
 `${CAO_SERENA_MCP_URL}` HTTP entry.
+Supervisor profiles MUST additionally include the embedded native HTTP
+`cao-ops` endpoint so plan/read-only supervisors can inspect and control worker
+lifecycle without direct Herdr-socket or localhost-shell access.
 
 #### Scenario: Command and HTTP coexistence
 - **WHEN** a profile containing all three MCP entries is translated for a supported provider
@@ -38,6 +41,10 @@ Every applicable swarm profile MUST include the identity-bearing stdio
 #### Scenario: Missing Serena environment
 - **WHEN** `CAO_SERENA_MCP_URL` is unset at terminal launch
 - **THEN** launch fails closed before starting the provider
+
+#### Scenario: Supervisor lifecycle control
+- **WHEN** a plan/read-only supervisor monitors or unblocks a worker
+- **THEN** it uses native HTTP `cao-ops` tools for terminal status, output, input, session inspection, and cleanup without requiring yolo or tmux
 
 #### Scenario: Navigation prompt
 - **WHEN** an agent receives its repository prompt

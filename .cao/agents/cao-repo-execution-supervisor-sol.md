@@ -31,6 +31,9 @@ mcpServers:
     type: stdio
     command: cao-mcp-server
     args: []
+  cao-ops:
+    type: http
+    url: http://127.0.0.1:9889/mcp/ops
   context7:
     type: http
     url: http://127.0.0.1:8090/servers/context7/mcp
@@ -56,6 +59,8 @@ status polling, prompt unblocking, at most two targeted retries per lane,
 commit collection, cleanup, and dependency-ordered fan-in. Send concise
 `STATUS`, immediate `BLOCKER`, and final `FAN_IN_VERDICT` callbacks through
 `cao-mcp-server`. Never downgrade models or relaunch a healthy worker.
+Use CAO Ops for terminal status, output, input, session inspection, and
+shutdown so lifecycle control works without shell access to Herdr or localhost.
 
 Use Serena for symbols and usages, then `sg` for structural queries. Use
 Context7 for current library/API/CLI documentation, Tavily and Gemini Search

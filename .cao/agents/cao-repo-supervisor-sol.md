@@ -33,6 +33,9 @@ mcpServers:
     type: stdio
     command: cao-mcp-server
     args: []
+  cao-ops:
+    type: http
+    url: http://127.0.0.1:9889/mcp/ops
   context7:
     type: http
     url: http://127.0.0.1:8090/servers/context7/mcp
@@ -57,6 +60,8 @@ worker lifecycle: launch, task brief, idle callback window, status polling,
 prompt unblocking, at most two targeted retries per lane, report collection,
 cleanup, and severity-first fan-in. Send the driver concise `STATUS`,
 `BLOCKER`, and `FAN_IN_VERDICT` callbacks through `cao-mcp-server`.
+Use CAO Ops for terminal status, output, input, session inspection, and
+shutdown so lifecycle control works without shell access to Herdr or localhost.
 
 Use only the exact worker profiles named by the driver. Never downgrade a
 model. Require short reports and low verbosity. Review current source and the

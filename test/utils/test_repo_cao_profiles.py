@@ -84,7 +84,8 @@ def test_exact_generic_profile_topology_and_models() -> None:
 def test_every_profile_has_portable_mcp_and_navigation_guidance(name: str) -> None:
     profile, prompt = _read(name)
 
-    assert set(profile.mcpServers or {}) == COMMON_MCPS
+    expected_mcps = COMMON_MCPS | ({"cao-ops"} if name in SUPERVISORS else set())
+    assert set(profile.mcpServers or {}) == expected_mcps
     assert profile.mcpServers["cao-mcp-server"]["command"] == "cao-mcp-server"
     assert profile.mcpServers["serena"]["url"] == "${CAO_SERENA_MCP_URL}"
     assert "/Users/" not in (PROFILE_DIR / f"{name}.md").read_text()
@@ -106,7 +107,12 @@ def test_supervisors_own_worker_lifecycle_without_write_tools(name: str) -> None
     assert "cao-worker-protocols" not in (profile.skills or [])
     assert "fs_write" not in (profile.allowedTools or [])
     assert profile.permissionMode == "plan"
+    assert profile.mcpServers["cao-ops"] == {
+        "type": "http",
+        "url": "http://127.0.0.1:9889/mcp/ops",
+    }
     assert "worker lifecycle" in prompt
+    assert "CAO Ops" in prompt
     assert "implementation verifier" in prompt.lower()
 
 
