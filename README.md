@@ -158,6 +158,7 @@ cao install https://example.com/agents/custom-agent.md
 ```
 
 For creating custom agent profiles, see [docs/agent-profile.md](docs/agent-profile.md).
+For this repository's own development-swarm profiles, shared Serena navigation, and ast-grep structural gates, see [docs/swarm-tooling.md](docs/swarm-tooling.md).
 
 #### Profile management (`cao profile`)
 

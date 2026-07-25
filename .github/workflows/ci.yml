@@ -228,6 +228,30 @@ jobs:
       - name: Run type checker with mypy
         run: uv run mypy src/
 
+  ast-grep:
+    name: Structural Gates (ast-grep)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # Pinned ast-grep: rules and fixtures in sgconfig.yml / rules/python /
+      # rule-tests are tuned against this exact version.
+      - name: Install ast-grep 0.44.1
+        run: npm install -g @ast-grep/cli@0.44.1
+
+      - name: Validate ast-grep rules against fixtures
+        run: sg test
+
+      - name: Scan for prohibited structural patterns
+        run: sg scan --error src/ test/
+
   ag-ui-demo:
     name: AG-UI demo (shift-left recording)
     runs-on: ubuntu-latest

@@ -1,0 +1,13 @@
+{
+  "agents": {
+    "extra_dirs": [
+      "/Users/gtrump001c@cable.comcast.com/Projects/Artagon/cli-agent-orchestrator/.worktrees/embed-ops-tooling/.cao/agents"
+    ]
+  },
+  "skills": {
+    "extra_dirs": [
+      "/Users/gtrump001c@cable.comcast.com/Projects/Artagon/cli-agent-orchestrator/.worktrees/embed-ops-tooling/skills",
+      "/Users/gtrump001c@cable.comcast.com/Projects/Artagon/artagon-ai-skills/plugins/artagon-python/skills"
+    ]
+  }
+}

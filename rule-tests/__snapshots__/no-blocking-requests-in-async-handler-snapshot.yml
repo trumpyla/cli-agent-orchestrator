@@ -1,0 +1,58 @@
+id: no-blocking-requests-in-async-handler
+snapshots:
+  ? |
+    import requests
+
+    async def list_profiles() -> dict:
+        response = requests.get("http://127.0.0.1:9889/api/profiles", timeout=30)
+        return response.json()
+  : labels:
+    - source: requests.get("http://127.0.0.1:9889/api/profiles", timeout=30)
+      style: primary
+      start: 67
+      end: 129
+    - source: |-
+        async def list_profiles() -> dict:
+            response = requests.get("http://127.0.0.1:9889/api/profiles", timeout=30)
+            return response.json()
+      style: secondary
+      start: 17
+      end: 156
+  ? |
+    import requests
+
+    async def peer_inbox_resource(peer_id: str) -> str:
+        response = requests.request("GET", f"http://127.0.0.1:9889/api/peers/{peer_id}")
+        return response.text
+  : labels:
+    - source: requests.request("GET", f"http://127.0.0.1:9889/api/peers/{peer_id}")
+      style: primary
+      start: 84
+      end: 153
+    - source: |-
+        async def peer_inbox_resource(peer_id: str) -> str:
+            response = requests.request("GET", f"http://127.0.0.1:9889/api/peers/{peer_id}")
+            return response.text
+      style: secondary
+      start: 17
+      end: 178
+  ? |
+    import requests
+
+    async def send_session_message(session_id: str, text: str) -> dict:
+        payload = {"message": text}
+        response = requests.post(f"http://127.0.0.1:9889/api/sessions/{session_id}", json=payload)
+        return response.json()
+  : labels:
+    - source: requests.post(f"http://127.0.0.1:9889/api/sessions/{session_id}", json=payload)
+      style: primary
+      start: 132
+      end: 211
+    - source: |-
+        async def send_session_message(session_id: str, text: str) -> dict:
+            payload = {"message": text}
+            response = requests.post(f"http://127.0.0.1:9889/api/sessions/{session_id}", json=payload)
+            return response.json()
+      style: secondary
+      start: 17
+      end: 238

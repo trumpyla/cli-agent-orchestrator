@@ -1,0 +1,22 @@
+id: no-detached-asyncio-task
+language: Python
+severity: error
+message: >-
+  Detached `asyncio.create_task` expression statement. Subscription workers
+  and other long-lived tasks must be created through the session-owned
+  abstraction (the FastMCP session task group adapter) or, at minimum, be
+  assigned, registered, cancelled, and awaited — never fired and forgotten.
+# A bare create_task statement keeps only the event loop's weak reference to
+# the task and escapes ownership/cancellation tracking, leaking workers past
+# session shutdown.
+files:
+  # Scoped to the Ops MCP server / peer-inbox subscription layer: the shared
+  # event loop being converted for embedded Streamable HTTP. The identity-
+  # bearing stdio cao-mcp-server (mcp_server/) is a documented non-goal of the
+  # change, and FastAPI lifespan housekeeping (api/main.py) is out of scope.
+  - "src/cli_agent_orchestrator/ops_mcp_server/**/*.py"
+rule:
+  kind: expression_statement
+  has:
+    stopBy: neighbor
+    pattern: asyncio.create_task($$$ARGS)

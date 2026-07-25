@@ -1,0 +1,23 @@
+id: no-blocking-requests-in-async-handler
+language: Python
+severity: error
+message: >-
+  Blocking `requests` call inside an async CAO MCP handler. Async handlers
+  must use the injected asynchronous backend (httpx.AsyncClient); a blocking
+  requests call stalls the event loop for every connected MCP client.
+# Rationale (embed-cao-ops-streamable-http): the Ops MCP server shares one
+# event loop across stdio and embedded Streamable HTTP sessions, so no async
+# handler may perform synchronous network I/O.
+files:
+  # Scoped to the Ops MCP server / peer-inbox subscription layer: the shared
+  # event loop being converted for embedded Streamable HTTP. The identity-
+  # bearing stdio cao-mcp-server (mcp_server/) is a documented non-goal of the
+  # change, and FastAPI lifespan housekeeping (api/main.py) is out of scope.
+  - "src/cli_agent_orchestrator/ops_mcp_server/**/*.py"
+rule:
+  pattern: requests.$METHOD($$$ARGS)
+  inside:
+    all:
+      - kind: function_definition
+      - regex: "^async"
+    stopBy: end

@@ -1,0 +1,30 @@
+id: no-detached-asyncio-task
+snapshots:
+  ? |
+    import asyncio
+
+    async def _subscribe(session, resource: str) -> None:
+        asyncio.create_task(_watch_resource(session, resource))
+  : labels:
+    - source: asyncio.create_task(_watch_resource(session, resource))
+      style: primary
+      start: 74
+      end: 129
+    - source: asyncio.create_task(_watch_resource(session, resource))
+      style: secondary
+      start: 74
+      end: 129
+  ? |
+    import asyncio
+
+    def _on_subscribe(peer_id: str) -> None:
+        asyncio.create_task(_consume_inbox(peer_id))
+  : labels:
+    - source: asyncio.create_task(_consume_inbox(peer_id))
+      style: primary
+      start: 61
+      end: 105
+    - source: asyncio.create_task(_consume_inbox(peer_id))
+      style: secondary
+      start: 61
+      end: 105

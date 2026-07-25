@@ -1,0 +1,36 @@
+id: no-detached-asyncio-task
+valid:
+  # task assigned, registered, and later cancelled/awaited
+  - |
+    import asyncio
+
+    def _on_subscribe(peer_id: str) -> None:
+        task = asyncio.create_task(_consume_inbox(peer_id))
+        _peer_consumers[peer_id] = task
+        task.add_done_callback(lambda t: _peer_consumers.pop(peer_id, None))
+  # task created through the session-owned adapter (task group)
+  - |
+    class FastMcp32SessionTasks:
+        async def start_worker(self, session, resource: str) -> None:
+            scope = await session._subscription_task_group.start(self._run, resource)
+            self._cancel_scopes[resource] = scope
+  # awaiting a coroutine directly is not a detached task
+  - |
+    import asyncio
+
+    async def main() -> None:
+        result = await _consume_inbox("peer-1")
+        asyncio.get_event_loop()
+invalid:
+  # bare create_task expression statement: nothing owns, cancels, or awaits it
+  - |
+    import asyncio
+
+    def _on_subscribe(peer_id: str) -> None:
+        asyncio.create_task(_consume_inbox(peer_id))
+  # detached task inside an async subscription handler
+  - |
+    import asyncio
+
+    async def _subscribe(session, resource: str) -> None:
+        asyncio.create_task(_watch_resource(session, resource))

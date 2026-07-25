@@ -1,0 +1,42 @@
+id: no-http-mcp-empty-command
+language: Python
+severity: error
+message: >-
+  Empty `command` or `args` field on an HTTP MCP entry. HTTP MCP translations
+  (`type: http` / `url`) must not carry subprocess fields — providers emit
+  every present key, and an empty command/args corrupts the native HTTP
+  mapping.
+# Stdio entries legitimately use `command`/`args`; this rule only fires when
+# the same dictionary also defines a `url` (i.e. an HTTP entry).
+rule:
+  any:
+    - all:
+        - kind: pair
+        - has:
+            field: key
+            pattern: '"command"'
+        - has:
+            field: value
+            pattern: '""'
+        - inside:
+            kind: dictionary
+            has:
+              kind: pair
+              has:
+                field: key
+                pattern: '"url"'
+    - all:
+        - kind: pair
+        - has:
+            field: key
+            pattern: '"args"'
+        - has:
+            field: value
+            pattern: "[]"
+        - inside:
+            kind: dictionary
+            has:
+              kind: pair
+              has:
+                field: key
+                pattern: '"url"'

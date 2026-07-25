@@ -1,0 +1,9 @@
+# ast-grep structural gates for the CAO repository (OpenSpec change
+# embed-cao-ops-streamable-http, task 6.4). Rules supplement — never replace —
+# pytest, Black, isort, mypy, link, secret, and diff gates.
+#
+# Pinned to ast-grep 0.44.1 (installed in CI via @ast-grep/cli@0.44.1).
+ruleDirs:
+  - rules/python
+testConfigs:
+  - testDir: rule-tests

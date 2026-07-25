@@ -1,0 +1,44 @@
+id: no-blocking-requests-in-async-handler
+valid:
+  # async handler using the async backend
+  - |
+    import httpx
+
+    async def receive_messages(peer_id: str) -> dict:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"/peers/{peer_id}/inbox")
+        return response.json()
+  # sync helper performing blocking I/O outside any async handler
+  - |
+    import requests
+
+    def _request_json(method: str, path: str) -> dict:
+        response = requests.request(method, path, timeout=30)
+        return response.json()
+  # async handler with no network I/O
+  - |
+    async def list_sessions() -> list:
+        return [session async for session in _aiter_sessions()]
+invalid:
+  # blocking requests.get directly inside an async MCP tool handler
+  - |
+    import requests
+
+    async def list_profiles() -> dict:
+        response = requests.get("http://127.0.0.1:9889/api/profiles", timeout=30)
+        return response.json()
+  # blocking requests.request inside an async resource handler
+  - |
+    import requests
+
+    async def peer_inbox_resource(peer_id: str) -> str:
+        response = requests.request("GET", f"http://127.0.0.1:9889/api/peers/{peer_id}")
+        return response.text
+  # blocking requests.post nested inside a helper call within the async body
+  - |
+    import requests
+
+    async def send_session_message(session_id: str, text: str) -> dict:
+        payload = {"message": text}
+        response = requests.post(f"http://127.0.0.1:9889/api/sessions/{session_id}", json=payload)
+        return response.json()

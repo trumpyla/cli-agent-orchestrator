@@ -1,0 +1,25 @@
+id: no-http-mcp-empty-command
+valid:
+  # pure HTTP entry: no subprocess fields at all
+  - |
+    entry = {"type": "http", "url": "https://example.com/mcp"}
+  # stdio entry legitimately carries command and args (no url key)
+  - |
+    entry = {"type": "stdio", "command": "cao-mcp-server", "args": []}
+  # stdio entry with empty args is fine without a url key
+  - |
+    config = {"command": resolve_command(name), "args": [], "env": {}}
+  # url key in an unrelated shape with a non-empty command is a different
+  # (mixed-entry) validation problem, not an empty-subprocess-field one
+  - |
+    config = {"command": resolved, "args": resolved_args}
+invalid:
+  # HTTP entry polluted with an empty command
+  - |
+    entry = {"type": "http", "url": url, "command": ""}
+  # HTTP entry polluted with empty args
+  - |
+    entry = {"type": "http", "url": url, "args": []}
+  # both empty subprocess fields on an HTTP translation
+  - |
+    mcp_servers[name] = {"url": resolved_url, "command": "", "args": []}
