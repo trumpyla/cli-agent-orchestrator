@@ -34,6 +34,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse
+from fastmcp.server.dependencies import get_http_headers
+from fastmcp.utilities.lifespan import combine_lifespans
 from pydantic import BaseModel, Field, field_validator, model_validator
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
@@ -82,6 +84,8 @@ from cli_agent_orchestrator.models.memory import (
     MemoryType,
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.ops_mcp_server.backend import AsgiRequestBackend
+from cli_agent_orchestrator.ops_mcp_server.server import CaoTokenVerifier, create_ops_mcp
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -661,12 +665,43 @@ def _build_pty_env() -> Dict[str, str]:
     return env
 
 
+def _current_mcp_authorization() -> str | None:
+    """Return only the Authorization value from the current MCP HTTP request."""
+    return get_http_headers(include={"authorization"}).get("authorization")
+
+
+ops_backend = AsgiRequestBackend(authorization=_current_mcp_authorization)
+ops_mcp = create_ops_mcp(ops_backend, auth=CaoTokenVerifier())
+ops_http_app = ops_mcp.http_app(
+    path="/ops",
+    transport="http",
+    stateless_http=False,
+)
+_first_application_lifespan = combine_lifespans(lifespan, ops_http_app.lifespan)
+_ops_lifespan_completed = False
+
+
+@asynccontextmanager
+async def _application_lifespan(application: FastAPI):
+    """Run the single-use MCP manager once and keep host test restarts compatible."""
+    global _ops_lifespan_completed
+    if _ops_lifespan_completed:
+        async with lifespan(application):
+            yield
+        return
+
+    async with _first_application_lifespan(application):
+        _ops_lifespan_completed = True
+        yield
+
+
 app = FastAPI(
     title="CLI Agent Orchestrator",
     description="Simplified CLI Agent Orchestrator API",
     version=SERVER_VERSION,
-    lifespan=lifespan,
+    lifespan=_application_lifespan,
 )
+ops_backend.bind(app)
 
 # Security: DNS Rebinding Protection
 # Validate Host header to prevent DNS rebinding attacks (CVE mitigation)
@@ -683,6 +718,8 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+app.mount("/mcp", ops_http_app, name="cao-ops-mcp")
 
 
 @app.exception_handler(RequestValidationError)

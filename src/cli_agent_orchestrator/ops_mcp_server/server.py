@@ -4,16 +4,39 @@ import asyncio
 import json
 import logging
 import re
-from typing import Annotated, Any, Dict, List, Optional, Tuple
+from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from functools import wraps
+from typing import Annotated, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 import httpx
+import jwt
 import requests  # type: ignore[import-untyped]
 from fastmcp import FastMCP
+from fastmcp.server.auth import AccessToken, AuthProvider, TokenVerifier
+from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from pydantic import AnyUrl, Field
+from starlette.authentication import (
+    AuthCredentials,
+    AuthenticationBackend,
+)
+from starlette.middleware import Middleware
+from starlette.middleware.authentication import AuthenticationMiddleware
+from starlette.requests import HTTPConnection
+from starlette.responses import JSONResponse
+from starlette.types import Receive, Scope, Send
 
 logger = logging.getLogger(__name__)
 
 from cli_agent_orchestrator.constants import API_BASE_URL
+from cli_agent_orchestrator.ops_mcp_server.backend import (
+    CLIENT_DEFAULT_TIMEOUT,
+    AsyncRequestBackend,
+    HttpxRequestBackend,
+    RequestResult,
+    RequestTimeout,
+)
 from cli_agent_orchestrator.ops_mcp_server.models import (
     InstallResult,
     LaunchResult,
@@ -22,14 +45,20 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     SessionListResult,
     TerminalControlResult,
 )
-from cli_agent_orchestrator.security.auth import get_local_bearer
+from cli_agent_orchestrator.security.auth import (
+    FULL_SCOPE_SET,
+    SCOPE_ADMIN,
+    SCOPE_READ,
+    SCOPE_WRITE,
+    extract_scopes_from_token,
+    get_local_bearer,
+    is_auth_enabled,
+)
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 JsonDict = Dict[str, Any]
 
-mcp = FastMCP(
-    "cao-ops-mcp",
-    instructions="""
+_OPS_MCP_INSTRUCTIONS = """
     # CAO Operations MCP Server
 
     Manage CLI Agent Orchestrator profiles and sessions from outside a CAO session.
@@ -64,8 +93,128 @@ mcp = FastMCP(
     resources/updated wakeup), but long-poll remains authoritative because not every
     client handles notifications. Re-read the resource after a wake; resubscribe if its
     consumer terminates. CAO_AUTH_LOCAL_TOKEN is forwarded on every API request.
-    """,
+    """
+
+_active_backend: ContextVar[AsyncRequestBackend | None] = ContextVar(
+    "cao_ops_request_backend",
+    default=None,
 )
+
+
+_CAO_SCOPES = frozenset({SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN})
+
+
+class _CaoAuthenticationBackend(AuthenticationBackend):
+    """Authenticate dynamically so CAO's default-off mode remains import-safe."""
+
+    def __init__(self, verifier: "CaoTokenVerifier") -> None:
+        self._verifier = verifier
+
+    async def authenticate(
+        self,
+        conn: HTTPConnection,
+    ) -> tuple[AuthCredentials, AuthenticatedUser] | None:
+        if not is_auth_enabled():
+            access = AccessToken(
+                token="",
+                client_id="cao-local-anonymous",
+                scopes=list(FULL_SCOPE_SET),
+                subject="cao-local-anonymous",
+                claims={"iss": "cao:local"},
+            )
+            return AuthCredentials(access.scopes), AuthenticatedUser(access)
+
+        authorization = conn.headers.get("authorization")
+        if not authorization:
+            return None
+        scheme, separator, token = authorization.partition(" ")
+        if scheme.lower() != "bearer" or not separator or not token.strip():
+            return None
+        verified_access = await self._verifier.verify_token(token.strip())
+        if verified_access is None:
+            return None
+        return AuthCredentials(verified_access.scopes), AuthenticatedUser(verified_access)
+
+
+class _RequireAnyCaoScopeMiddleware:
+    """Map valid-but-unscoped callers to a sanitized 403."""
+
+    def __init__(self, app: Any) -> None:
+        self._app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http" and is_auth_enabled():
+            user = scope.get("user")
+            if isinstance(user, AuthenticatedUser) and not _CAO_SCOPES.intersection(user.scopes):
+                response = JSONResponse(
+                    {"error": "insufficient_scope", "error_description": "CAO scope required"},
+                    status_code=403,
+                    headers={
+                        "WWW-Authenticate": (
+                            'Bearer error="insufficient_scope", '
+                            'error_description="CAO scope required"'
+                        )
+                    },
+                )
+                await response(scope, receive, send)
+                return
+        await self._app(scope, receive, send)
+
+
+class CaoTokenVerifier(TokenVerifier):
+    """Validate CAO bearer tokens and expose stable session-principal identity."""
+
+    def __init__(self) -> None:
+        super().__init__(required_scopes=[])
+
+    async def verify_token(self, token: str) -> AccessToken | None:
+        try:
+            scopes = extract_scopes_from_token(token)
+            claims = jwt.decode(
+                token,
+                options={
+                    "verify_signature": False,
+                    "verify_aud": False,
+                    "verify_exp": False,
+                },
+            )
+            issuer = claims.get("iss")
+            subject = claims.get("sub")
+            client_id = claims.get("client_id") or claims.get("azp")
+            if not isinstance(issuer, str) or not issuer:
+                return None
+            if not isinstance(subject, str) or not subject:
+                return None
+            if not isinstance(client_id, str) or not client_id:
+                return None
+            expires_at = claims.get("exp")
+            if not isinstance(expires_at, int):
+                expires_at = None
+        except Exception:
+            return None
+
+        return AccessToken(
+            token=token,
+            client_id=client_id,
+            scopes=scopes,
+            expires_at=expires_at,
+            subject=subject,
+            claims={"iss": issuer},
+        )
+
+    def get_middleware(self) -> list[Middleware]:
+        return [
+            Middleware(
+                AuthenticationMiddleware,
+                backend=_CaoAuthenticationBackend(self),
+                on_error=lambda _connection, _exc: JSONResponse(
+                    {"error": "invalid_token", "error_description": "Authentication required"},
+                    status_code=401,
+                ),
+            ),
+            Middleware(AuthContextMiddleware),
+            Middleware(_RequireAnyCaoScopeMiddleware),
+        ]
 
 
 def _response_detail(response: Any) -> str:
@@ -158,6 +307,48 @@ async def _async_request_json(
         return None, f"{operation} failed: invalid JSON response ({exc})"
 
 
+async def _request_from_active_backend(
+    method: str,
+    path: str,
+    *,
+    params: Optional[Dict[str, Any]] = None,
+    json: Optional[Any] = None,
+    operation: str,
+    timeout: RequestTimeout = CLIENT_DEFAULT_TIMEOUT,
+) -> RequestResult:
+    """Dispatch through the factory backend, preserving direct-call compatibility."""
+    backend = _active_backend.get()
+    if backend is not None:
+        return await backend.request_json(
+            method,
+            path,
+            params=params,
+            json=json,
+            operation=operation,
+            timeout=timeout,
+        )
+
+    # Direct imports of the historical helper functions remain compatible for
+    # callers and focused unit tests. Factory-registered MCP handlers always
+    # bind a backend before entering this function.
+    if timeout is CLIENT_DEFAULT_TIMEOUT:
+        return _request_json(
+            method,
+            path,
+            params=params,
+            json=json,
+            operation=operation,
+        )
+    return await _async_request_json(
+        method,
+        path,
+        params=params,
+        json=json,
+        operation=operation,
+        timeout=timeout,
+    )
+
+
 def _serialize_allowed_tools(allowed_tools: Optional[List[str]]) -> Optional[str]:
     """Serialize allowed tools for the session creation API."""
     if not allowed_tools:
@@ -187,7 +378,7 @@ async def _launch_session_impl(
     if serialized_allowed_tools:
         params["allowed_tools"] = serialized_allowed_tools
 
-    session_data, error = _request_json(
+    session_data, error = await _request_from_active_backend(
         "post", "/sessions", params=params, operation="Launch session"
     )
     if error:
@@ -220,7 +411,6 @@ async def _launch_session_impl(
     )
 
 
-@mcp.tool()
 async def list_profiles() -> ProfileListResult:
     """List available agent profiles.
 
@@ -230,7 +420,9 @@ async def list_profiles() -> ProfileListResult:
     Returns:
         ProfileListResult with success status and profiles list
     """
-    data, error = _request_json("get", "/agents/profiles", operation="List profiles")
+    data, error = await _request_from_active_backend(
+        "get", "/agents/profiles", operation="List profiles"
+    )
     if error:
         return ProfileListResult(success=False, message=error)
     if isinstance(data, list):
@@ -241,7 +433,6 @@ async def list_profiles() -> ProfileListResult:
     )
 
 
-@mcp.tool()
 async def get_profile_details(
     name: Annotated[str, Field(description="The agent profile name to inspect")],
 ) -> JsonDict:
@@ -256,7 +447,7 @@ async def get_profile_details(
     Returns:
         Dict with profile fields, or {"success": False, "message": ...} on error
     """
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "get",
         f"/agents/profiles/{name}",
         operation=f"Get profile details for '{name}'",
@@ -268,7 +459,6 @@ async def get_profile_details(
     return {"success": False, "message": "Get profile details failed: invalid response payload"}
 
 
-@mcp.tool()
 async def install_profile(
     source: Annotated[str, Field(description="Agent name or https:// URL to install")],
     provider: Annotated[
@@ -320,7 +510,7 @@ async def install_profile(
     if env_vars:
         body["env_vars"] = env_vars
 
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "post",
         "/agents/profiles/install",
         json=body,
@@ -333,7 +523,6 @@ async def install_profile(
     return InstallResult(success=False, message="Install profile failed: invalid response payload")
 
 
-@mcp.tool()
 async def launch_session(
     agent_profile: Annotated[str, Field(description="The agent profile to launch")],
     provider: Annotated[
@@ -378,7 +567,6 @@ async def launch_session(
     )
 
 
-@mcp.tool()
 async def send_session_message(
     terminal_id: Annotated[str, Field(description="The terminal ID to deliver the message to")],
     message: Annotated[str, Field(description="The message text to deliver")],
@@ -396,7 +584,7 @@ async def send_session_message(
     Returns:
         SendMessageResult with success status and target terminal_id
     """
-    _, error = _request_json(
+    _, error = await _request_from_active_backend(
         "post",
         f"/terminals/{terminal_id}/inbox/messages",
         params={"sender_id": "cao-ops-mcp", "message": message},
@@ -411,7 +599,6 @@ async def send_session_message(
     )
 
 
-@mcp.tool()
 async def send_terminal_input(
     terminal_id: Annotated[str, Field(description="The terminal ID to control")],
     message: Annotated[
@@ -429,7 +616,7 @@ async def send_terminal_input(
     This is intended for an active approval or selection prompt. It is not
     durable: callers should use ``send_session_message`` for agent work.
     """
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "post",
         f"/terminals/{terminal_id}/input",
         params={"message": message},
@@ -454,7 +641,6 @@ async def send_terminal_input(
     )
 
 
-@mcp.tool()
 async def send_terminal_key(
     terminal_id: Annotated[str, Field(description="The terminal ID to control")],
     key: Annotated[
@@ -468,7 +654,7 @@ async def send_terminal_key(
     ],
 ) -> TerminalControlResult:
     """Send one allowlisted key to an interactive terminal prompt."""
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "post",
         f"/terminals/{terminal_id}/key",
         params={"key": key},
@@ -576,7 +762,89 @@ def _read_session_output_impl(
     }
 
 
-@mcp.tool()
+async def _read_session_output_async_impl(
+    terminal_id: Optional[str],
+    session_name: Optional[str],
+    mode: Optional[str],
+    max_chars: Optional[int],
+) -> JsonDict:
+    """Resolve a terminal and read output through the injected async backend."""
+    normalized = (mode or "full").lower()
+    if normalized not in ("full", "last"):
+        return {"success": False, "message": f"Invalid mode '{mode}'; expected 'full' or 'last'"}
+
+    resolved_terminal_id = terminal_id
+    if not resolved_terminal_id:
+        if not session_name:
+            return {"success": False, "message": "Provide either terminal_id or session_name"}
+        info, error = await _request_from_active_backend(
+            "get",
+            f"/sessions/{session_name}",
+            operation=f"Resolve terminals for session '{session_name}'",
+        )
+        if error:
+            return {"success": False, "message": error}
+        if not isinstance(info, dict):
+            return {
+                "success": False,
+                "message": f"Session '{session_name}' returned an invalid response payload",
+            }
+        terminals = info.get("terminals", [])
+        if not isinstance(terminals, list) or any(
+            not isinstance(terminal, dict) for terminal in terminals
+        ):
+            return {
+                "success": False,
+                "message": f"Session '{session_name}' returned an invalid terminals payload",
+            }
+        if len(terminals) == 1:
+            terminal = terminals[0]
+            if not terminal.get("id"):
+                return {
+                    "success": False,
+                    "message": f"Session '{session_name}' returned a terminal without an id",
+                }
+            resolved_terminal_id = str(terminal["id"])
+        elif not terminals:
+            return {"success": False, "message": f"Session '{session_name}' has no terminals"}
+        else:
+            return {
+                "success": False,
+                "message": (
+                    f"Session '{session_name}' has {len(terminals)} terminals; "
+                    "specify terminal_id"
+                ),
+                "terminals": terminals,
+            }
+
+    data, error = await _request_from_active_backend(
+        "get",
+        f"/terminals/{resolved_terminal_id}/output",
+        params={"mode": normalized},
+        operation=f"Read output for terminal '{resolved_terminal_id}'",
+    )
+    if error:
+        return {"success": False, "message": error}
+    if not isinstance(data, dict) or not isinstance(data.get("output"), str):
+        return {"success": False, "message": "Read output failed: invalid response payload"}
+
+    output = data["output"]
+    total_chars = len(output)
+    truncated = False
+    if max_chars is not None and max_chars > 0 and total_chars > max_chars:
+        output = output[-max_chars:]
+        truncated = True
+
+    return {
+        "success": True,
+        "terminal_id": resolved_terminal_id,
+        "mode": normalized,
+        "output": output,
+        "truncated": truncated,
+        "total_chars": total_chars,
+    }
+
+
 async def read_session_output(
     terminal_id: Annotated[
         Optional[str],
@@ -630,10 +898,11 @@ async def read_session_output(
         Dict {success, terminal_id, mode, output, truncated, total_chars}, or
         {success: False, message[, terminals]} on error / ambiguous session
     """
-    return _read_session_output_impl(terminal_id, session_name, mode, max_chars)
+    if _active_backend.get() is None:
+        return _read_session_output_impl(terminal_id, session_name, mode, max_chars)
+    return await _read_session_output_async_impl(terminal_id, session_name, mode, max_chars)
 
 
-@mcp.tool()
 async def get_terminal_status(
     terminal_id: Annotated[str, Field(description="The terminal ID to inspect")],
 ) -> JsonDict:
@@ -651,7 +920,7 @@ async def get_terminal_status(
         Dict with id, name, provider, session_name, agent_profile, status,
         last_active — or {"success": False, "message": ...} on error
     """
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "get",
         f"/terminals/{terminal_id}",
         operation=f"Get terminal status for '{terminal_id}'",
@@ -663,7 +932,6 @@ async def get_terminal_status(
     return {"success": False, "message": "Get terminal status failed: invalid response payload"}
 
 
-@mcp.tool()
 async def get_terminal_output(
     terminal_id: Annotated[str, Field(description="The terminal ID to read output from")],
     mode: Annotated[
@@ -701,7 +969,7 @@ async def get_terminal_output(
             "success": False,
             "message": f"Get terminal output failed: mode must be 'last' or 'full', got '{mode}'",
         }
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "get",
         f"/terminals/{terminal_id}/output",
         params={"mode": normalized},
@@ -714,14 +982,13 @@ async def get_terminal_output(
     return {"success": False, "message": "Get terminal output failed: invalid response payload"}
 
 
-@mcp.tool()
 async def list_sessions() -> SessionListResult:
     """List active CAO sessions with terminal counts and statuses.
 
     Returns:
         SessionListResult with success status and sessions list
     """
-    data, error = _request_json("get", "/sessions", operation="List sessions")
+    data, error = await _request_from_active_backend("get", "/sessions", operation="List sessions")
     if error:
         return SessionListResult(success=False, message=error)
     if isinstance(data, list):
@@ -732,7 +999,6 @@ async def list_sessions() -> SessionListResult:
     )
 
 
-@mcp.tool()
 async def get_session_info(
     session_name: Annotated[str, Field(description="The CAO session name to inspect")],
 ) -> JsonDict:
@@ -747,7 +1013,7 @@ async def get_session_info(
     Returns:
         Dict with session fields, or {"success": False, "message": ...} on error
     """
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "get",
         f"/sessions/{session_name}",
         operation=f"Get session info for '{session_name}'",
@@ -759,7 +1025,6 @@ async def get_session_info(
     return {"success": False, "message": "Get session info failed: invalid response payload"}
 
 
-@mcp.tool()
 async def shutdown_session(
     session_name: Annotated[str, Field(description="The CAO session name to shut down")],
 ) -> JsonDict:
@@ -773,7 +1038,7 @@ async def shutdown_session(
     Returns:
         Dict with success status and cleanup details, or failure dict on error
     """
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "delete",
         f"/sessions/{session_name}",
         operation=f"Shutdown session '{session_name}'",
@@ -785,7 +1050,6 @@ async def shutdown_session(
     return {"success": False, "message": "Shutdown session failed: invalid response payload"}
 
 
-@mcp.tool()
 async def register_peer(
     name: Annotated[Optional[str], Field(description="Optional human label for the peer")] = None,
 ) -> JsonDict:
@@ -799,7 +1063,9 @@ async def register_peer(
     Returns:
         Dict with ``peer_id`` (8-hex), ``name``, ``mode`` — or a failure dict.
     """
-    data, error = _request_json("post", "/peers", json={"name": name}, operation="Register peer")
+    data, error = await _request_from_active_backend(
+        "post", "/peers", json={"name": name}, operation="Register peer"
+    )
     if error:
         return {"success": False, "message": error}
     if isinstance(data, dict):
@@ -807,7 +1073,6 @@ async def register_peer(
     return {"success": False, "message": "Register peer failed: invalid response payload"}
 
 
-@mcp.tool()
 async def receive_messages(
     peer_id: Annotated[str, Field(description="The 8-hex peer id from register_peer")],
     limit: Annotated[int, Field(description="Max messages to pull", ge=1, le=100)] = 10,
@@ -846,17 +1111,26 @@ async def receive_messages(
     if wait_seconds > 0:
         params["wait"] = wait_seconds
         request_timeout = wait_seconds + 5.0  # give the held request headroom over the server wait
-    request_options: Dict[str, Any] = {
-        "params": params,
-        "operation": f"Receive messages for peer '{peer_id}'",
-    }
-    if request_timeout is not None:
-        request_options["timeout"] = request_timeout
-    data, error = await _async_request_json(
-        "get",
-        f"/terminals/{peer_id}/inbox/messages",
-        **request_options,
-    )
+    if _active_backend.get() is None:
+        direct_options: Dict[str, Any] = {
+            "params": params,
+            "operation": f"Receive messages for peer '{peer_id}'",
+        }
+        if request_timeout is not None:
+            direct_options["timeout"] = request_timeout
+        data, error = await _async_request_json(
+            "get",
+            f"/terminals/{peer_id}/inbox/messages",
+            **direct_options,
+        )
+    else:
+        data, error = await _request_from_active_backend(
+            "get",
+            f"/terminals/{peer_id}/inbox/messages",
+            params=params,
+            operation=f"Receive messages for peer '{peer_id}'",
+            timeout=request_timeout,
+        )
     if error:
         return {"success": False, "message": error}
     if isinstance(data, list):
@@ -864,7 +1138,6 @@ async def receive_messages(
     return {"success": False, "message": "Receive messages failed: invalid response payload"}
 
 
-@mcp.tool()
 async def ack_messages(
     peer_id: Annotated[str, Field(description="The 8-hex peer id")],
     message_ids: Annotated[List[int], Field(description="Message ids to mark delivered")],
@@ -878,7 +1151,7 @@ async def ack_messages(
     Returns:
         Dict with ``acked`` (count) — or a failure dict.
     """
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "post",
         f"/terminals/{peer_id}/inbox/ack",
         json={"message_ids": message_ids},
@@ -891,7 +1164,6 @@ async def ack_messages(
     return {"success": False, "message": "Ack messages failed: invalid response payload"}
 
 
-@mcp.resource("cao://peers/{peer_id}/inbox")
 async def peer_inbox_resource(peer_id: str) -> str:
     """The peer's inbox as a readable MCP resource (subscribe for update notifications).
 
@@ -900,11 +1172,12 @@ async def peer_inbox_resource(peer_id: str) -> str:
     then re-read this resource; clients that do not can read it on demand or poll
     ``receive_messages``. This is the MCP-subscribe surface for the bi-directional bridge.
     """
-    data, error = _request_json(
+    data, error = await _request_from_active_backend(
         "get",
         f"/terminals/{peer_id}/inbox/messages",
         params={"status": "pending", "limit": 100},
         operation=f"Read peer inbox '{peer_id}'",
+        timeout=None,
     )
     if error:
         return json.dumps({"success": False, "message": error})
@@ -929,7 +1202,7 @@ def _peer_inbox_uri(peer_id: str) -> str:
 
 async def _long_poll_inbox(peer_id: str, wait: float, after_id: int = 0) -> List[Any]:
     """Cancellation-aware long-poll of a peer inbox; return pending rows."""
-    data, error = await _async_request_json(
+    data, error = await _request_from_active_backend(
         "get",
         f"/terminals/{peer_id}/inbox/messages",
         params={
@@ -996,7 +1269,10 @@ async def _consume_inbox(peer_id: str, session: Any) -> None:
         last_notified_id = max(newer_ids)
 
 
-def _setup_peer_subscribe(server: FastMCP) -> None:
+def _setup_peer_subscribe(
+    server: FastMCP,
+    backend: AsyncRequestBackend | None = None,
+) -> None:
     """Advertise resources/subscribe and wire subscribe/unsubscribe to stream consumers.
 
     Mirrors ext_apps/sep2133.advertise_capability's low-level seam. No-op + logged if the
@@ -1047,7 +1323,14 @@ def _setup_peer_subscribe(server: FastMCP) -> None:
             existing = _peer_consumers.get(key)
             if existing is not None and not existing.done():
                 return
-            task = asyncio.create_task(_consume_inbox(peer_id, session))
+            if backend is None:
+                task = asyncio.create_task(_consume_inbox(peer_id, session))
+            else:
+                token = _active_backend.set(backend)
+                try:
+                    task = asyncio.create_task(_consume_inbox(peer_id, session))
+                finally:
+                    _active_backend.reset(token)
             _peer_consumers[key] = task
 
             def _remove_completed(completed: "asyncio.Task[None]") -> None:
@@ -1096,9 +1379,133 @@ def _setup_peer_subscribe(server: FastMCP) -> None:
         logger.warning("peer-inbox: could not register MCP subscribe handlers", exc_info=True)
 
 
+def _bind_backend(
+    handler: Callable[..., Awaitable[Any]],
+    backend: AsyncRequestBackend,
+) -> Callable[..., Awaitable[Any]]:
+    """Bind one registered handler to its factory-owned backend."""
+
+    @wraps(handler)
+    async def _bound(*args: Any, **kwargs: Any) -> Any:
+        token = _active_backend.set(backend)
+        try:
+            return await handler(*args, **kwargs)
+        finally:
+            _active_backend.reset(token)
+
+    return _bound
+
+
+_TOOL_HANDLERS: Tuple[Callable[..., Awaitable[Any]], ...] = (
+    list_profiles,
+    get_profile_details,
+    install_profile,
+    launch_session,
+    send_session_message,
+    send_terminal_input,
+    send_terminal_key,
+    read_session_output,
+    get_terminal_status,
+    get_terminal_output,
+    list_sessions,
+    get_session_info,
+    shutdown_session,
+    register_peer,
+    receive_messages,
+    ack_messages,
+)
+
+
+def create_ops_mcp(
+    backend: AsyncRequestBackend,
+    *,
+    auth: AuthProvider | None = None,
+) -> FastMCP:
+    """Create a CAO Ops MCP server backed by asynchronous REST requests."""
+
+    @asynccontextmanager
+    async def _lifespan(_server: FastMCP):
+        start = getattr(backend, "start", None)
+        if start is not None:
+            await start()
+        try:
+            yield
+        finally:
+            await backend.aclose()
+
+    server = FastMCP(
+        "cao-ops-mcp",
+        instructions=_OPS_MCP_INSTRUCTIONS,
+        auth=auth,
+        lifespan=_lifespan,
+    )
+    for handler in _TOOL_HANDLERS:
+        server.tool()(_bind_backend(handler, backend))
+    server.resource("cao://peers/{peer_id}/inbox")(_bind_backend(peer_inbox_resource, backend))
+    _setup_peer_subscribe(server, backend)
+    return server
+
+
+def _local_authorization() -> str | None:
+    token = get_local_bearer()
+    return f"Bearer {token}" if token else None
+
+
+class _StdioRequestBackend(HttpxRequestBackend):
+    """Preserve direct-call compatibility outside the real stdio lifespan."""
+
+    def __init__(self) -> None:
+        super().__init__(
+            base_url=API_BASE_URL,
+            authorization=_local_authorization,
+        )
+        self._running = False
+
+    async def start(self) -> None:
+        self._running = True
+
+    async def request_json(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json: Optional[Any] = None,
+        operation: str,
+        timeout: RequestTimeout = CLIENT_DEFAULT_TIMEOUT,
+    ) -> RequestResult:
+        if self._running:
+            return await super().request_json(
+                method,
+                path,
+                params=params,
+                json=json,
+                operation=operation,
+                timeout=timeout,
+            )
+        if timeout is CLIENT_DEFAULT_TIMEOUT or timeout is None:
+            return _request_json(
+                method,
+                path,
+                params=params,
+                json=json,
+                operation=operation,
+            )
+        return _request_json(
+            method,
+            path,
+            params=params,
+            json=json,
+            operation=operation,
+            timeout=timeout,
+        )
+
+
+mcp = create_ops_mcp(_StdioRequestBackend())
+
+
 def main() -> None:
     """Run the operations MCP server."""
-    _setup_peer_subscribe(mcp)
     mcp.run()
 
 
