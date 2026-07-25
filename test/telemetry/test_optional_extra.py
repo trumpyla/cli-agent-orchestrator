@@ -75,6 +75,33 @@ t.init_telemetry("cao")
 print("OK")
 """
 
+_BLOCK_OTEL_SDK_AND_IMPORT_API = """
+import sys
+from importlib.abc import MetaPathFinder
+
+class _BlockOtelSdk(MetaPathFinder):
+    def find_spec(self, name, path=None, target=None):
+        optional_prefixes = (
+            "opentelemetry.sdk",
+            "opentelemetry.exporter",
+            "opentelemetry.instrumentation",
+        )
+        if name.startswith(optional_prefixes):
+            raise ImportError(f"blocked for test: {name}", name=name)
+        return None
+
+sys.meta_path.insert(0, _BlockOtelSdk())
+
+import cli_agent_orchestrator.api.main  # noqa: F401
+import cli_agent_orchestrator.telemetry as t
+
+# FastMCP requires the base OpenTelemetry API. CAO's optional extra adds the
+# SDK/exporters only, so the API-backed no-op helpers remain available.
+assert t.OTEL_AVAILABLE is True
+t.init_telemetry("cao")
+print("OK")
+"""
+
 
 def test_telemetry_package_noops_without_otel_sdk() -> None:
     proc = subprocess.run(
@@ -89,13 +116,8 @@ def test_telemetry_package_noops_without_otel_sdk() -> None:
 
 def test_api_main_imports_without_otel_sdk() -> None:
     """cao-server's module import path survives a base (no-extra) install."""
-    probe = _BLOCK_OTEL_AND_PROBE.replace(
-        "import cli_agent_orchestrator.telemetry as t",
-        "import cli_agent_orchestrator.api.main  # noqa: F401\n"
-        "import cli_agent_orchestrator.telemetry as t",
-    )
     proc = subprocess.run(
-        [sys.executable, "-c", probe],
+        [sys.executable, "-c", _BLOCK_OTEL_SDK_AND_IMPORT_API],
         capture_output=True,
         text=True,
         timeout=120,

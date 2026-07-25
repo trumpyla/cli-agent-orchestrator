@@ -94,15 +94,18 @@ class TestInstalledModeProbe:
         assert "accept-edits" in modes
 
     @pytest.mark.skipif(shutil.which("agy") is None, reason="agy not installed")
-    def test_installed_agy_documents_direct_url_mcp_entries(self) -> None:
+    def test_installed_agy_documents_native_permission_modes(self) -> None:
         """Characterize the exact installed CLI surface used by this rollout."""
         executable = shutil.which("agy")
         assert executable is not None
         completed = subprocess.run(
-            [executable, "changelog"],
+            [executable, "--help"],
             check=True,
             capture_output=True,
             text=True,
             timeout=15,
         )
-        assert "Added support for `url` in `mcp_config.json`" in completed.stdout
+        help_text = completed.stdout + completed.stderr
+        assert "--mode" in help_text
+        assert "accept-edits" in help_text
+        assert "plan" in help_text
