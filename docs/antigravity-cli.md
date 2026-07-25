@@ -72,7 +72,19 @@ Response extraction returns the text between the last echoed `> <query>` line an
 
 ## MCP Servers
 
-`agy` reads MCP servers from `~/.gemini/config/mcp_config.json` (top-level `mcpServers` key). The provider merges the agent profile's `mcpServers` into that file at launch — preserving any existing, non-CAO entries — and forwards `CAO_TERMINAL_ID` into each server's env so `cao-mcp-server` can resolve the current terminal for handoff / assign. Entries are removed on `cleanup()`. There is no per-invocation MCP config flag, but CAO serializes launches (initialize waits for the agent to become ready), so each `agy` process reads the config and spawns its MCP subprocess with the correct terminal id before the next terminal writes.
+`agy` reads MCP servers from `~/.gemini/config/mcp_config.json` (top-level
+`mcpServers` key). The provider merges the agent profile's entries at launch,
+preserving unrelated user entries. Command entries receive
+`CAO_TERMINAL_ID`; HTTP entries use the documented canonical `serverUrl`
+field and never receive subprocess fields. When CAO auth is enabled, exact
+loopback `/mcp/ops` receives a literal bearer header because Agy 1.1.7 does
+not document header environment expansion. CAO forces the generated file to
+mode 0600 after every write and never includes the token in the launch
+command. Entries are removed on `cleanup()`.
+
+There is no per-invocation MCP config flag. CAO serializes launches so each
+`agy` process reads the correct callback identity before the next terminal
+writes the shared config.
 
 ## Tool Restrictions
 

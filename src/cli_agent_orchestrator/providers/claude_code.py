@@ -19,7 +19,7 @@ from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.mcp_server import HttpMcpServer, parse_mcp_server_entry
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.providers.mcp_translation import claude_http_entry
+from cli_agent_orchestrator.providers.mcp_translation import render_http_entry
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_launch import (
@@ -393,7 +393,9 @@ class ClaudeCodeProvider(BaseProvider):
                     entry = parse_mcp_server_entry(server_config, server_name=server_name)
                     if isinstance(entry, HttpMcpServer):
                         url = resolve_http_url(entry.url, env_snapshot, server_name=server_name)
-                        mcp_config[server_name] = claude_http_entry(url)
+                        mcp_config[server_name] = render_http_entry(
+                            "claude_code", url, env=env_snapshot
+                        )
                         continue
 
                     # The narrowed model is the single serialization source: it

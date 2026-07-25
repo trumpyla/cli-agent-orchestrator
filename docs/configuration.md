@@ -83,8 +83,14 @@ CAO discovers agent profiles by scanning multiple directories, in this order (fi
 
 1. **Local store** — `~/.aws/cli-agent-orchestrator/agent-store/`
 2. **Provider-specific directories** — `agents.dirs`, keyed by provider
-3. **Extra custom directories** — `agents.extra_dirs`
-4. **Built-in store** — bundled with the CAO package
+3. **Repository profiles** — nearest `.cao/agents/` up to the current Git worktree root
+4. **Extra custom directories** — `agents.extra_dirs`
+5. **Built-in store** — bundled with the CAO package
+
+The repository convention is automatic: a fresh clone can commit portable
+profiles under `.cao/agents/` without adding a machine-specific absolute path
+to user settings. User-configured directories remain available for profiles
+shared across repositories.
 
 | Key | Provider | Default Path |
 |-----|----------|-------------|

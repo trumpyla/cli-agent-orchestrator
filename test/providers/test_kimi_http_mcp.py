@@ -32,6 +32,14 @@ _HOME = "cli_agent_orchestrator.providers.kimi_cli.Path.home"
 _LOAD = "cli_agent_orchestrator.providers.kimi_cli.load_agent_profile"
 
 
+@pytest.fixture(autouse=True)
+def _auth_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep shape tests deterministic when the operator enables CAO auth."""
+    monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
+    monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+    monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+
+
 def _kimi_mcp_file(provider: KimiCliProvider) -> dict:
     path = Path(provider._temp_dir) / ".kimi-code" / "mcp.json"
     return json.loads(path.read_text())
@@ -128,6 +136,28 @@ class TestKimiHttpMapping:
             pytest.raises(McpConfigError),
         ):
             provider._build_kimi_command()
+        provider.cleanup()
+
+    def test_authenticated_ops_uses_bearer_token_env_var(self, tmp_path, monkeypatch) -> None:
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example.test/jwks")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "fake-machine-token")
+        provider = KimiCliProvider("t1", "s", "w", agent_profile="dev")
+        with (
+            patch(_HOME, return_value=tmp_path),
+            patch(
+                _LOAD,
+                return_value=_profile({"cao-ops": {"type": "http", "url": _OPS_URL}}),
+            ),
+        ):
+            command = provider._build_kimi_command()
+            entry = _kimi_mcp_file(provider)["mcpServers"]["cao-ops"]
+
+        assert entry == {
+            "url": _OPS_URL,
+            "bearerTokenEnvVar": "CAO_AUTH_LOCAL_TOKEN",
+        }
+        assert "fake-machine-token" not in command
+        assert "fake-machine-token" not in json.dumps(entry)
         provider.cleanup()
 
 

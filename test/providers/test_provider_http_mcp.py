@@ -33,6 +33,15 @@ from cli_agent_orchestrator.providers.mcp_translation import (
 )
 
 _OPS_URL = "http://127.0.0.1:9889/mcp/ops"
+_EXTERNAL_URL = "https://mcp.example.test/ops"
+
+
+@pytest.fixture(autouse=True)
+def _auth_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep native-shape tests independent of the operator's auth environment."""
+    monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
+    monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
+    monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
 
 
 def _read_claude_mcp(command: str) -> dict:
@@ -60,7 +69,7 @@ class TestTranslationRegistry:
         "provider,expected",
         [
             pytest.param("claude_code", {"type": "http", "url": _OPS_URL}, id="claude"),
-            pytest.param("antigravity_cli", {"url": _OPS_URL}, id="antigravity"),
+            pytest.param("antigravity_cli", {"serverUrl": _OPS_URL}, id="antigravity"),
             pytest.param("kimi_cli", {"url": _OPS_URL}, id="kimi"),
         ],
     )
@@ -87,7 +96,11 @@ class TestTranslationRegistry:
         "helper,expected",
         [
             pytest.param(claude_http_entry, {"type": "http", "url": _OPS_URL}, id="claude"),
-            pytest.param(antigravity_http_entry, {"url": _OPS_URL}, id="antigravity"),
+            pytest.param(
+                antigravity_http_entry,
+                {"serverUrl": _OPS_URL},
+                id="antigravity",
+            ),
             pytest.param(kimi_http_entry, {"url": _OPS_URL}, id="kimi"),
         ],
     )
@@ -106,6 +119,69 @@ class TestTranslationRegistry:
         # mapping must fail clearly, never be coerced to a command entry.
         with pytest.raises(McpConfigError):
             render_http_entry(provider, _OPS_URL)
+
+    @pytest.mark.parametrize(
+        "provider,expected_auth",
+        [
+            pytest.param(
+                "codex",
+                {"bearer_token_env_var": "CAO_AUTH_LOCAL_TOKEN"},
+                id="codex",
+            ),
+            pytest.param(
+                "claude_code",
+                {"headers": {"Authorization": "Bearer ${CAO_AUTH_LOCAL_TOKEN}"}},
+                id="claude",
+            ),
+            pytest.param(
+                "antigravity_cli",
+                {"headers": {"Authorization": "Bearer fake-machine-token"}},
+                id="antigravity",
+            ),
+            pytest.param(
+                "kimi_cli",
+                {"bearerTokenEnvVar": "CAO_AUTH_LOCAL_TOKEN"},
+                id="kimi",
+            ),
+        ],
+    )
+    def test_authenticated_local_ops_uses_provider_native_auth(
+        self, provider: str, expected_auth: dict
+    ) -> None:
+        env = {
+            "CAO_AUTH_JWKS_URI": "https://idp.example.test/jwks",
+            "CAO_AUTH_LOCAL_TOKEN": "fake-machine-token",
+        }
+
+        rendered = render_http_entry(provider, _OPS_URL, env=env)
+
+        for key, value in expected_auth.items():
+            assert rendered[key] == value
+
+    @pytest.mark.parametrize("provider", sorted(HTTP_SUPPORTED_PROVIDERS))
+    def test_machine_token_is_never_attached_to_external_http_server(self, provider: str) -> None:
+        env = {
+            "AUTH0_DOMAIN": "tenant.example.test",
+            "CAO_AUTH_LOCAL_TOKEN": "fake-machine-token",
+        }
+
+        rendered = render_http_entry(provider, _EXTERNAL_URL, env=env)
+
+        assert "bearer_token_env_var" not in rendered
+        assert "bearerTokenEnvVar" not in rendered
+        assert "headers" not in rendered
+        assert "fake-machine-token" not in json.dumps(rendered)
+
+    @pytest.mark.parametrize("provider", sorted(HTTP_SUPPORTED_PROVIDERS))
+    def test_authenticated_local_ops_without_machine_token_fails_closed(
+        self, provider: str
+    ) -> None:
+        with pytest.raises(McpConfigError, match="CAO_AUTH_LOCAL_TOKEN"):
+            render_http_entry(
+                provider,
+                _OPS_URL,
+                env={"CAO_AUTH_JWKS_URI": "https://idp.example.test/jwks"},
+            )
 
 
 # --------------------------------------------------------------------------- #
@@ -155,6 +231,19 @@ class TestCodexHttpMapping:
         with pytest.raises(McpConfigError):
             provider._build_codex_command()
 
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_codex_authenticated_ops_references_token_env_without_value(
+        self, mock_load, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example.test/jwks")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "fake-machine-token")
+        mock_load.return_value = _codex_http_profile(_OPS_URL)
+
+        command = CodexProvider("t1", "s", "w", "agent")._build_codex_command()
+
+        assert 'mcp_servers.cao-ops.bearer_token_env_var="CAO_AUTH_LOCAL_TOKEN"' in command
+        assert "fake-machine-token" not in command
+
 
 # --------------------------------------------------------------------------- #
 # Claude
@@ -200,6 +289,20 @@ class TestClaudeHttpMapping:
         assert servers["cao-ops"] == {"type": "http", "url": _OPS_URL}
         assert "env" not in servers["cao-ops"]
 
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_claude_authenticated_ops_uses_environment_header_reference(
+        self, mock_load, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example.test/jwks")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "fake-machine-token")
+        mock_load.return_value = _claude_profile({"cao-ops": {"type": "http", "url": _OPS_URL}})
+
+        command = ClaudeCodeProvider("term-1", "s", "w", "agent")._build_claude_command()
+        entry = _read_claude_mcp(command)["mcpServers"]["cao-ops"]
+
+        assert entry["headers"] == {"Authorization": "Bearer ${CAO_AUTH_LOCAL_TOKEN}"}
+        assert "fake-machine-token" not in json.dumps(entry)
+
 
 # --------------------------------------------------------------------------- #
 # Antigravity
@@ -207,7 +310,7 @@ class TestClaudeHttpMapping:
 
 
 class TestAntigravityHttpMapping:
-    def test_antigravity_emits_url_no_subprocess(self, tmp_path) -> None:
+    def test_antigravity_emits_server_url_no_subprocess(self, tmp_path) -> None:
         cfg = tmp_path / "mcp_config.json"
         profile = AgentProfile(
             name="reviewer",
@@ -230,11 +333,10 @@ class TestAntigravityHttpMapping:
             provider._build_agy_command()
 
         entry = json.loads(cfg.read_text())["mcpServers"]["cao-ops"]
-        assert entry == {"url": _OPS_URL}
-        # Break guarded: Agy CLI's mcp_config.json accepts ``url`` for a direct
-        # MCP server. ``httpUrl`` belongs to Gemini CLI and must not leak into
-        # this provider's config.
-        for forbidden in ("httpUrl", "command", "args", "env"):
+        assert entry == {"serverUrl": _OPS_URL}
+        # ``serverUrl`` is Antigravity's documented canonical field. ``url`` is
+        # accepted only as a compatibility alias and ``httpUrl`` is Gemini CLI.
+        for forbidden in ("url", "httpUrl", "command", "args", "env"):
             assert forbidden not in entry
 
     def test_antigravity_terminal_id_command_only(self, tmp_path) -> None:
@@ -264,8 +366,72 @@ class TestAntigravityHttpMapping:
 
         servers = json.loads(cfg.read_text())["mcpServers"]
         assert servers["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
-        assert servers["cao-ops"] == {"url": _OPS_URL}
+        assert servers["cao-ops"] == {"serverUrl": _OPS_URL}
         assert "env" not in servers["cao-ops"]
+
+    def test_antigravity_authenticated_ops_uses_private_literal_header(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example.test/jwks")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "fake-machine-token")
+        cfg = tmp_path / "mcp_config.json"
+        profile = AgentProfile(
+            name="reviewer",
+            description="Reviewer",
+            system_prompt="Review.",
+            mcpServers={"cao-ops": {"type": "http", "url": _OPS_URL}},
+        )
+        provider = AntigravityCliProvider("test-tid", "s", "w", agent_profile="reviewer")
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+                return_value="/usr/local/bin/agy",
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+                return_value=profile,
+            ),
+            patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+        ):
+            command = provider._build_agy_command()
+
+        entry = json.loads(cfg.read_text())["mcpServers"]["cao-ops"]
+        assert entry == {
+            "serverUrl": _OPS_URL,
+            "headers": {"Authorization": "Bearer fake-machine-token"},
+        }
+        assert "fake-machine-token" not in command
+        assert cfg.stat().st_mode & 0o777 == 0o600
+
+    def test_antigravity_refuses_token_write_when_private_mode_fails(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        monkeypatch.setenv("CAO_AUTH_JWKS_URI", "https://idp.example.test/jwks")
+        monkeypatch.setenv("CAO_AUTH_LOCAL_TOKEN", "fake-machine-token")
+        cfg = tmp_path / "mcp_config.json"
+        profile = AgentProfile(
+            name="reviewer",
+            description="Reviewer",
+            system_prompt="Review.",
+            mcpServers={"cao-ops": {"type": "http", "url": _OPS_URL}},
+        )
+        provider = AntigravityCliProvider("test-tid", "s", "w", agent_profile="reviewer")
+        with (
+            patch(
+                "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+                return_value="/usr/local/bin/agy",
+            ),
+            patch(
+                "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+                return_value=profile,
+            ),
+            patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+            patch.object(Path, "chmod", side_effect=OSError("denied")),
+            pytest.raises(McpConfigError, match="private Antigravity MCP config"),
+        ):
+            provider._build_agy_command()
+
+        assert not cfg.exists() or "fake-machine-token" not in cfg.read_text()
 
     def test_antigravity_unset_reference_fails_closed(self, tmp_path, monkeypatch) -> None:
         monkeypatch.delenv("CAO_SERENA_MCP_URL", raising=False)

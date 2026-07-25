@@ -52,10 +52,14 @@ from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
-from cli_agent_orchestrator.models.mcp_server import HttpMcpServer, parse_mcp_server_entry
+from cli_agent_orchestrator.models.mcp_server import (
+    HttpMcpServer,
+    McpConfigError,
+    parse_mcp_server_entry,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.providers.mcp_translation import antigravity_http_entry
+from cli_agent_orchestrator.providers.mcp_translation import render_http_entry
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_launch import (
@@ -411,15 +415,20 @@ class AntigravityCliProvider(BaseProvider):
             config["mcpServers"] = servers
         # One process-environment snapshot per launch for HTTP URL resolution.
         env_snapshot = snapshot_process_env()
+        requires_private_config = False
         for server_name, server_config in mcp_servers.items():
-            # HTTP entries emit agy's native {url} with no command, args, or
-            # env — and never CAO_TERMINAL_ID. Any previously persisted entry
-            # for this name is replaced wholesale, so a stale identity or a
-            # stale httpUrl left by an earlier session cannot survive.
+            # HTTP entries emit agy's native {serverUrl} with no command, args,
+            # or env — and never CAO_TERMINAL_ID. Any previously persisted
+            # entry for this name is replaced wholesale, so a stale identity
+            # or stale Gemini ``httpUrl`` field cannot survive.
             parsed = parse_mcp_server_entry(server_config, server_name=server_name)
             if isinstance(parsed, HttpMcpServer):
                 url = resolve_http_url(parsed.url, env_snapshot, server_name=server_name)
-                servers[server_name] = antigravity_http_entry(url)
+                rendered = render_http_entry("antigravity_cli", url, env=env_snapshot)
+                headers = rendered.get("headers")
+                if isinstance(headers, dict) and "Authorization" in headers:
+                    requires_private_config = True
+                servers[server_name] = rendered
                 self._mcp_server_names.append(server_name)
                 continue
             # The narrowed model is the single serialization source: it
@@ -447,8 +456,38 @@ class AntigravityCliProvider(BaseProvider):
             )
             self._mcp_server_names.append(server_name)
 
+        # Agy has no documented header environment expansion, so authenticated
+        # local CAO Ops requires a literal bearer in this generated file.
+        # Establish and verify private permissions *before* writing that token.
+        if requires_private_config:
+            created_probe = not path.exists()
+            try:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if created_probe:
+                    path.touch(mode=0o600)
+                path.chmod(0o600)
+                if path.stat().st_mode & 0o077:
+                    raise OSError("private mode not enforced")
+            except OSError as exc:
+                if created_probe:
+                    try:
+                        if path.exists() and path.stat().st_size == 0:
+                            path.unlink()
+                    except OSError:
+                        pass
+                raise McpConfigError(
+                    "could not establish private Antigravity MCP config; "
+                    "refusing to write local bearer"
+                ) from exc
+
         with open(path, "w") as f:
             json.dump(config, f, indent=2)
+        if not requires_private_config:
+            try:
+                path.chmod(0o600)
+            except OSError:
+                # No CAO-injected credential is present on this path.
+                pass
 
     def _unregister_mcp_servers(self) -> None:
         """Remove the MCP servers this provider registered."""
@@ -467,6 +506,10 @@ class AntigravityCliProvider(BaseProvider):
                     servers.pop(name, None)
                 with open(path, "w") as f:
                     json.dump(config, f, indent=2)
+                try:
+                    path.chmod(0o600)
+                except OSError:
+                    pass
         except (json.JSONDecodeError, OSError) as exc:
             logger.warning("Failed to unregister MCP servers from %s: %s", path, exc)
         finally:

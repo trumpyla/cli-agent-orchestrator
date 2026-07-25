@@ -90,11 +90,25 @@ still removed by `cleanup()`.
 
 ## MCP Server Configuration
 
-MCP servers from agent profiles are passed via `--mcp-config` as a JSON string:
+Kimi 0.29 has no `--mcp-config` flag. CAO writes the terminal's resolved MCP
+map to `<temporary-cwd>/.kimi-code/mcp.json`, the highest-precedence
+project-local discovery scope, and launches Kimi from that unique directory.
+The user-global and repository-shared MCP files are not changed.
 
-```bash
-kimi --yolo --mcp-config '{"server-name": {"command": "npx", "args": ["-y", "cao-mcp-server"]}}'
+```json
+{
+  "mcpServers": {
+    "cao-ops": {
+      "url": "http://127.0.0.1:9889/mcp/ops",
+      "bearerTokenEnvVar": "CAO_AUTH_LOCAL_TOKEN"
+    }
+  }
+}
 ```
+
+`bearerTokenEnvVar` is emitted only for authenticated exact-loopback CAO Ops.
+Other HTTP entries contain only `url`; command entries retain
+`command`/`args`/`env`.
 
 ### MCP Tool Call Timeout
 
@@ -108,7 +122,10 @@ Without this override, the supervisor Kimi CLI agent receives a `ToolError("Time
 
 ### CAO_TERMINAL_ID Forwarding
 
-Kimi CLI does not automatically forward parent shell environment variables to MCP subprocesses. The provider explicitly injects `CAO_TERMINAL_ID` into the `env` field of each MCP server config so that tools like `handoff` and `assign` can create new agent windows in the same tmux session (instead of creating separate sessions). Existing `env` entries are preserved, and an existing `CAO_TERMINAL_ID` value is never overwritten.
+Kimi CLI does not automatically forward parent shell environment variables to
+MCP subprocesses. The provider explicitly injects `CAO_TERMINAL_ID` only into
+the identity-bearing command-launched `cao-mcp-server` entry. Other command
+servers and every HTTP entry receive no terminal identity.
 
 ## Command Flags
 
@@ -116,7 +133,6 @@ Kimi CLI does not automatically forward parent shell environment variables to MC
 |------|---------|
 | `--yolo` | Auto-approve all tool action confirmations |
 | `--plan` | Native read-only planning guardrail for restricted reviewer profiles |
-| `--mcp-config TEXT` | MCP server configuration (JSON, repeatable) |
 | `--work-dir DIR` | Set working directory |
 | `--no-thinking` | Disable thinking mode (changes prompt to ✨) |
 
@@ -124,7 +140,7 @@ Kimi CLI does not automatically forward parent shell environment variables to MC
 
 ### Provider Lifecycle
 
-1. **Initialize**: Create unique temp dir → set MCP timeout in `~/.kimi/config.toml` (if MCP servers) → wait for shell → send `cd <tempdir> && TERM=xterm-256color kimi --yolo [--plan]` → wait for IDLE or COMPLETED (up to 120s)
+1. **Initialize**: Create unique temp dir → write `.kimi-code/mcp.json` and set MCP timeout in `~/.kimi/config.toml` (if MCP servers) → wait for shell → send `cd <tempdir> && TERM=xterm-256color kimi --yolo [--plan]` → wait for IDLE or COMPLETED (up to 120s)
 2. **Status Detection**: Check bottom 50 lines for idle prompt pattern (end-of-line anchored)
 3. **Message Extraction**: Line-based approach mapping raw and clean output for thinking filtering
 4. **Exit**: Send `/exit` command

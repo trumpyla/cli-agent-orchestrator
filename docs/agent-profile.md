@@ -30,7 +30,12 @@ Define the agent's role, responsibilities, and behavior here.
 - `provider` (string): Provider to run this agent on (e.g., `"claude_code"`, `"kiro_cli"`). See [Cross-Provider Orchestration](#cross-provider-orchestration).
 - `allowedTools` (array): CAO tool vocabulary allowlist. Overrides role-based defaults. Can be used with or without `role`. See [Tool Restrictions](tool-restrictions.md).
 - `skills` (array): Restrict this agent's injected skill catalog to skills whose name matches these patterns (exact names or case-sensitive [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) globs, e.g. `"ads-*"`). Omit for the full catalog; `[]` advertises none. Applies only to runtime-prompt providers (Claude Code, Codex, Antigravity, Kimi). See [Skills](skills.md#scoping-the-catalog-per-agent-skills).
-- `mcpServers` (object): MCP server configurations for additional tools
+- `mcpServers` (object): MCP server configurations for additional tools. Each
+  entry is exactly one command-launched stdio server (`command`, optional
+  `args`, `env`, and timeout) or one native HTTP server (`type: http`, `url`).
+  HTTP entries cannot contain subprocess fields. A URL may be one exact
+  `${ENV_NAME}` reference resolved at terminal launch; missing variables,
+  malformed URLs, fragments, and URL userinfo fail closed.
 - `tools` (array): List of allowed tools, use `["*"]` for all
 - `toolAliases` (object): Map tool names to aliases
 - `toolsSettings` (object): Tool-specific configuration
@@ -43,6 +48,11 @@ Define the agent's role, responsibilities, and behavior here.
 - `prompt` (string): Additional prompt text
 - `container` (object): Host-to-guest path mappings for an agent whose CLI runs wrapped inside a container (`podman exec`, `docker exec`, `nerdctl exec`, a devcontainer, etc.). See [Container-Wrapped Agents](#container-wrapped-agents).
 - `provider_init_timeout` (int, seconds): Per-profile override for the provider initialization timeout, replacing the server-wide `provider_init_timeout` default (60s — see [Configuration](configuration.md#server-server)) for this agent only. Also the outer cap on the startup-prompt handler (Claude Code, Kimi, Antigravity). Use this for containerized profiles whose wrapped CLI takes far longer to reach IDLE than a native launch.
+
+For the exact loopback `/mcp/ops` endpoint, CAO adds each provider's native
+bearer configuration only when CAO auth is enabled. The launch fails before
+starting the provider if `CAO_AUTH_LOCAL_TOKEN` is missing. The local token is
+never attached to external MCP URLs or other loopback paths.
 
 ## Tool Restrictions
 

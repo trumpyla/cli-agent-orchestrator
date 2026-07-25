@@ -30,14 +30,14 @@
 
 - [ ] 5.1 Add failing parametrized Pydantic contract matrices using `pytest.param` IDs, `TypeAdapter`, `tmp_path`, `monkeypatch`, and `caplog` to prove exclusive stdio/HTTP entries, legacy typed-command round trips, HTTP URL references surviving profile load/install, one process-environment launch snapshot, mixed/empty rejection, missing or malformed values, and secret-free errors.
 - [ ] 5.2 Implement a functional Pydantic boundary with pure no-I/O normalization/validation, strict narrowed stdio/HTTP models, immutable resolved copies, legacy command round trips and non-URL interpolation, aligned schema/examples, and launch-only HTTP URL resolution.
-- [x] 5.3 Add provider tests for Codex `url` plus HTTP `tool_timeout_sec` without env_vars, Claude `type: http`, Antigravity CLI `{url}` without Gemini CLI's `httpUrl`, Kimi 0.29 `{url}`, command-only terminal identity, unsupported-provider failure, and no empty subprocess fields.
+- [x] 5.3 Add provider tests for Codex `url` plus HTTP `tool_timeout_sec` without env_vars, Claude `type: http`, Antigravity CLI canonical `{serverUrl}` without compatibility `url` or Gemini CLI `httpUrl`, Kimi 0.29 `{url}`, authenticated exact-loopback bearer mappings, external-URL token isolation, missing-token fail-closed behavior, command-only terminal identity, unsupported-provider failure, and no empty subprocess fields.
 - [x] 5.4 Implement Kimi per-terminal `.kimi-code/mcp.json` without `--mcp-config`; implement Antigravity `plan`/`accept-edits` modes and the exact Codex/Claude/Antigravity HTTP mappings.
 - [ ] 5.5 Add an installed-Kimi 0.29 config/parser smoke test and installed-Antigravity 1.1.7 mode probe; run all profile, schema, install, launch, provider, backend, and example-profile tests, plus `scripts/sync_skills.py --check` if canonical skills or their generated mirror changed.
 
 ## 6. Repository swarm, Serena, and ast-grep tooling
 
 - [ ] 6.1 Add behavioral tests for project profile discovery, skill scoping, command-plus-HTTP translation, read-only design/test/review modes, and fail-closed missing `CAO_SERENA_MCP_URL`.
-- [ ] 6.2 Commit flat `.cao/agents/` supervision, design, implementation, testing, and adversarial-review profiles plus project settings that register `agents.extra_dirs` and `skills.extra_dirs`; validate every requested model identifier before use.
+- [ ] 6.2 Commit flat `.cao/agents/` supervision, design, implementation, testing, and adversarial-review profiles; add conventional fresh-clone discovery without committed absolute paths plus portable `skills.extra_dirs` setup; validate every requested model identifier before use.
 - [ ] 6.3 Add `.serena/project.yml` with Python, generated/cache/worktree exclusions, and `read_only: true`; start the managed project Serena daemon through `artagon-scripts/scripts/mcp.sh`, export its direct URL, and prove symbol navigation from more than one read-only lane.
 - [x] 6.4 Add failing ast-grep fixtures for blocking requests in async handlers, detached subscription tasks, and empty HTTP commands; add `sgconfig.yml`, `rules/python/`, and `rule-tests/` until `sg test` passes and `sg scan --error` rejects each prohibited mutation.
 - [x] 6.5 Add `sg-test` and `sg-scan` Make targets and a CI step pinned to ast-grep 0.44.1; run both targets locally with zero findings.

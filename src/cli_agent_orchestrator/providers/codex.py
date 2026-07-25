@@ -11,7 +11,7 @@ from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.models.mcp_server import HttpMcpServer, parse_mcp_server_entry
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.providers.mcp_translation import codex_http_fields
+from cli_agent_orchestrator.providers.mcp_translation import render_http_entry
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_launch import (
@@ -379,11 +379,19 @@ class CodexProvider(BaseProvider):
                     entry = parse_mcp_server_entry(server_config, server_name=server_name)
                     if isinstance(entry, HttpMcpServer):
                         url = resolve_http_url(entry.url, env_snapshot, server_name=server_name)
-                        fields = codex_http_fields(url)
+                        fields = render_http_entry("codex", url, env=env_snapshot)
                         command_parts.extend(["-c", f"{prefix}.url={_toml_scalar(fields['url'])}"])
                         command_parts.extend(
                             ["-c", f"{prefix}.tool_timeout_sec={fields['tool_timeout_sec']}"]
                         )
+                        bearer_env = fields.get("bearer_token_env_var")
+                        if bearer_env:
+                            command_parts.extend(
+                                [
+                                    "-c",
+                                    f"{prefix}.bearer_token_env_var=" f"{_toml_scalar(bearer_env)}",
+                                ]
+                            )
                         continue
                     # The narrowed model is the single serialization source: it
                     # round-trips a legacy command entry byte-for-byte (declared

@@ -68,8 +68,8 @@ compatible.
 
 #### Scenario: Antigravity HTTP mapping
 - **WHEN** Antigravity launches with an HTTP entry
-- **THEN** its native CLI configuration contains `url` and no command, args, or env
-- **AND** it does not emit Gemini CLI's `httpUrl` field
+- **THEN** its native CLI configuration contains canonical `serverUrl` and no command, args, or env
+- **AND** it does not emit the compatibility `url` alias or Gemini CLI's `httpUrl` field
 
 #### Scenario: Kimi HTTP mapping
 - **WHEN** Kimi 0.29 launches with an HTTP entry
@@ -82,6 +82,27 @@ compatible.
 #### Scenario: Unsupported provider
 - **WHEN** a provider without a native HTTP mapping receives an HTTP entry
 - **THEN** launch fails clearly rather than coercing it to a command entry
+
+### Requirement: Authenticated native local CAO Ops mapping
+When CAO authentication is enabled, every supported provider MUST authenticate
+its native HTTP client to the exact loopback `/mcp/ops` endpoint without
+placing the token in a command line or attaching it to any external MCP URL.
+
+#### Scenario: Provider-native bearer mapping
+- **WHEN** auth is enabled and `CAO_AUTH_LOCAL_TOKEN` is set for exact loopback `/mcp/ops`
+- **THEN** Codex emits `bearer_token_env_var`, Kimi emits `bearerTokenEnvVar`, Claude emits its environment-expanded Authorization header, and Antigravity emits its supported literal Authorization header in a mode-0600 generated config
+
+#### Scenario: Missing local bearer
+- **WHEN** auth is enabled and exact loopback `/mcp/ops` is configured but `CAO_AUTH_LOCAL_TOKEN` is missing
+- **THEN** provider launch fails closed before starting the CLI
+
+#### Scenario: External HTTP MCP
+- **WHEN** auth is enabled and an HTTP MCP URL is not the exact loopback `/mcp/ops` mount
+- **THEN** CAO does not attach, reference, or substitute `CAO_AUTH_LOCAL_TOKEN`
+
+#### Scenario: Secret-free launch surface
+- **WHEN** a provider launches against authenticated local CAO Ops
+- **THEN** its command line and diagnostics contain neither the token value nor URL userinfo
 
 ### Requirement: Native Antigravity permission modes
 Antigravity MUST map `permissionMode: plan` and `permissionMode: acceptEdits`

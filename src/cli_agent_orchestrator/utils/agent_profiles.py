@@ -16,6 +16,24 @@ from cli_agent_orchestrator.utils.paths import normalized_path
 logger = logging.getLogger(__name__)
 
 
+def _project_agent_dir(start: Path | None = None) -> Path | None:
+    """Find the nearest repository-owned ``.cao/agents`` directory.
+
+    Search upward from the process working directory and stop at the first Git
+    worktree root. This makes a fresh clone's profiles discoverable without a
+    machine-specific ``agents.extra_dirs`` setting while avoiding traversal
+    into unrelated parent repositories.
+    """
+    current = (start or Path.cwd()).resolve()
+    for directory in (current, *current.parents):
+        candidate = directory / ".cao" / "agents"
+        if candidate.is_dir():
+            return candidate
+        if (directory / ".git").exists():
+            return None
+    return None
+
+
 def _validate_agent_name(agent_name: str) -> None:
     """Reject agent names that could cause path traversal."""
     if "/" in agent_name or "\\" in agent_name or ".." in agent_name:
@@ -251,7 +269,21 @@ def list_agent_profiles() -> List[Dict]:
         _scan_directory(Path(norm), label, profiles, name_sources)
         scanned_paths.add(norm)
 
-    # 3. Extra user-added directories
+    # 3. Nearest repository-owned .cao/agents directory. This conventional
+    # location is intentionally automatic so committed profiles work in a
+    # fresh clone with no user-level absolute-path configuration.
+    project_dir = _project_agent_dir()
+    if project_dir is not None:
+        try:
+            project_norm = normalized_path(project_dir)
+        except ValueError:
+            logger.warning("Skipping project agent directory reason=sensitive_root")
+        else:
+            if project_norm not in disabled and project_norm not in scanned_paths:
+                _scan_directory(Path(project_norm), "project", profiles, name_sources)
+                scanned_paths.add(project_norm)
+
+    # 4. Extra user-added directories
     for index, extra_dir in enumerate(get_extra_agent_dirs()):
         try:
             norm = normalized_path(extra_dir)
@@ -266,7 +298,7 @@ def list_agent_profiles() -> List[Dict]:
         _scan_directory(Path(norm), "custom", profiles, name_sources)
         scanned_paths.add(norm)
 
-    # 4. Built-in agent store — scanned LAST so on-disk copies win (matches
+    # 5. Built-in agent store — scanned LAST so on-disk copies win (matches
     # _read_agent_profile_source's lookup order).
     try:
         agent_store = resources.files("cli_agent_orchestrator.agent_store")
@@ -316,8 +348,9 @@ def _read_agent_profile_source(agent_name: str) -> str:
     Search order:
     1. Local store: ~/.aws/cli-agent-orchestrator/agent-store/{name}.md
     2. Provider-specific directories (flat {name}.md or {name}/agent.md)
-    3. Extra user-added directories (flat {name}.md or {name}/agent.md)
-    4. Built-in store (packaged with CAO)
+    3. Nearest repository-owned .cao/agents directory
+    4. Extra user-added directories (flat {name}.md or {name}/agent.md)
+    5. Built-in store (packaged with CAO)
 
     Shared by ``load_agent_profile`` (which parses the text into an
     ``AgentProfile``) and the install service (which writes the raw text to
@@ -379,6 +412,18 @@ def _read_agent_profile_source(agent_name: str) -> str:
         found = _lookup_in_directory(Path(normalized))
         if found is not None:
             return found
+
+    project_dir = _project_agent_dir()
+    if project_dir is not None:
+        try:
+            normalized = normalized_path(project_dir)
+        except ValueError:
+            logger.warning("Skipping project agent directory reason=sensitive_root")
+        else:
+            if normalized not in disabled:
+                found = _lookup_in_directory(Path(normalized))
+                if found is not None:
+                    return found
 
     for index, extra_dir in enumerate(get_extra_agent_dirs()):
         try:

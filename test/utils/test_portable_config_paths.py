@@ -58,6 +58,23 @@ def test_legacy_tilde_agent_entry_becomes_active(portable_home: Path) -> None:
     assert "portable body" in agent_profiles._read_agent_profile_source("zz-legacy-agent")
 
 
+def test_repo_local_cao_agents_are_discovered_without_user_config(
+    portable_home: Path,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    repo = tmp_path / "fresh-clone"
+    nested = repo / "src" / "package"
+    nested.mkdir(parents=True)
+    (repo / ".git").write_text("gitdir: ../objects\n")
+    _write_profile(repo / ".cao" / "agents", "zz-repo-agent")
+    monkeypatch.chdir(nested)
+
+    assert settings_service.get_extra_agent_dirs() == []
+    assert "portable body" in agent_profiles._read_agent_profile_source("zz-repo-agent")
+    assert "zz-repo-agent" in {profile["name"] for profile in agent_profiles.list_agent_profiles()}
+
+
 def test_tilde_skill_directory_round_trips_lists_and_loads(portable_home: Path) -> None:
     configured = "~/skills"
     _write_skill(portable_home / "skills", "zz-portable-skill")

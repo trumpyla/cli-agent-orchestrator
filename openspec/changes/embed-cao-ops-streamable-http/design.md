@@ -182,11 +182,10 @@ zero-task cleanup assertions.
   `tool_timeout_sec=600.0` remains valid for HTTP, but HTTP entries receive no
   command, args, env, or env_vars.
 - Claude emits `{"type": "http", "url": "..."}` with no subprocess fields.
-- Antigravity CLI emits its direct-HTTP `{"url": "..."}` form with no
-  command, args, or env. Installed Agy 1.1.7's changelog records direct `url`
-  support from 1.0.5, and Google's current Antigravity changelog confirms that
-  `mcp_config.json` accepts `url` in addition to the older `serverUrl` alias.
-  The Gemini CLI-only `httpUrl` field is not emitted.
+- Antigravity CLI emits the documented canonical
+  `{"serverUrl": "..."}` form with no command, args, or env. Installed Agy
+  1.1.7 also accepts `url` as a compatibility alias, but CAO does not depend
+  on that alias. The Gemini CLI-only `httpUrl` field is not emitted.
 - Kimi 0.29 writes a per-terminal `.kimi-code/mcp.json` beneath its unique
   temporary working directory. HTTP entries are `{"url": "..."}` with no
   `type`, `transport`, or subprocess fields; stdio entries retain command,
@@ -196,6 +195,18 @@ zero-task cleanup assertions.
   `permissionMode: acceptEdits` to `--mode accept-edits`; either explicit mode
   suppresses `--dangerously-skip-permissions`.
 
+When auth is enabled, the exact loopback `/mcp/ops` mapping fails closed
+without `CAO_AUTH_LOCAL_TOKEN`. Codex uses `bearer_token_env_var`, Kimi uses
+`bearerTokenEnvVar`, and Claude uses its documented `${VAR}` header expansion,
+so no token value enters their command line or generated JSON. Antigravity
+documents literal custom headers but not header environment expansion; CAO
+therefore places the token only in its generated shared MCP config and forces
+that file to mode 0600 after every write. No mapping attaches the local token
+to an external URL or to another loopback path. This provider-side local
+client credential is distinct from the embedded backend rule: an external
+HTTP caller's Authorization header is forwarded unchanged through
+ASGITransport and is never replaced by the machine token.
+
 Each provider receives focused positive and negative tests. Providers outside
 this rollout continue to accept command entries; HTTP entries fail clearly if
 they lack a supported native mapping rather than being coerced to stdio.
@@ -203,8 +214,10 @@ they lack a supported native mapping rather than being coerced to stdio.
 ### 7. Repository-owned swarm and navigation profiles
 
 Flat profiles under `.cao/agents/` cover supervision, design, implementation,
-testing, and adversarial review. Project settings register that path through
-`agents.extra_dirs` and the Artagon Python skill path through
+testing, and adversarial review. CAO discovers the nearest repository-owned
+`.cao/agents/` directory automatically up to the current Git worktree root, so
+a fresh clone needs no user-global profile copy or committed absolute path.
+The Artagon Python skill path remains operator-configurable through portable
 `skills.extra_dirs`.
 
 Supervisors receive `cao-supervisor-protocols`; workers receive

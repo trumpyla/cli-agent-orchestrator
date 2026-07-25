@@ -2,11 +2,12 @@
 
 ### Requirement: Repository-owned CAO profiles
 The repository MUST ship flat, discoverable CAO profiles for supervision,
-design, implementation, testing, and adversarial review and MUST register them
-through project `agents.extra_dirs`.
+design, implementation, testing, and adversarial review. CAO MUST discover the
+nearest repository-owned `.cao/agents` convention without requiring a
+machine-specific user setting.
 
 #### Scenario: Profile discovery
-- **WHEN** CAO loads project settings in this repository
+- **WHEN** CAO starts from this repository or a nested directory in a fresh clone
 - **THEN** every committed `.cao/agents` profile is discoverable without a user-global copy
 
 #### Scenario: Protocol skill separation

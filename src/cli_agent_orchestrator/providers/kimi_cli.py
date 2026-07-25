@@ -45,7 +45,7 @@ from cli_agent_orchestrator.models.mcp_server import (
 )
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
-from cli_agent_orchestrator.providers.mcp_translation import kimi_http_entry
+from cli_agent_orchestrator.providers.mcp_translation import render_http_entry
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.mcp_launch import (
@@ -495,7 +495,9 @@ class KimiCliProvider(BaseProvider):
                             # Native HTTP entry: {"url": ...} only — no command,
                             # args, env, or CAO_TERMINAL_ID.
                             url = resolve_http_url(entry.url, env_snapshot, server_name=server_name)
-                            mcp_config[server_name] = kimi_http_entry(url)
+                            mcp_config[server_name] = render_http_entry(
+                                "kimi_cli", url, env=env_snapshot
+                            )
                             continue
 
                         # The narrowed model is the single serialization source:
