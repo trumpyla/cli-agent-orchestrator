@@ -40,7 +40,14 @@ Define the agent's role, responsibilities, and behavior here.
 - `toolAliases` (object): Map tool names to aliases
 - `toolsSettings` (object): Tool-specific configuration
 - `model` (string): AI model to use
-- `permissionMode` (string, `claude_code` only): One of `"default"`, `"acceptEdits"`, `"plan"`, `"auto"`, `"bypassPermissions"`. When set, the `claude_code` provider passes `--permission-mode <value>` instead of `--dangerously-skip-permissions`. `permissionMode` takes priority over `--yolo`; the provider always uses `--permission-mode <value>` when the field is set. See [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes).
+- `permissionMode` (string): Provider-native permission policy. Claude Code
+  passes the value through `--permission-mode`. Codex maps `plan` to its
+  read-only sandbox and `acceptEdits` to its workspace-write sandbox; both use
+  `--ask-for-approval never` so a headless terminal cannot park, and neither
+  uses `--yolo`. Antigravity maps `plan` and `acceptEdits` to its native
+  `--mode` values and omits the bypass flag. Kimi write access is derived from
+  the profile tool boundary instead of this field. See
+  [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes).
 - `native_agent` (string, `claude_code` only): Name of a native Claude Code agent (`~/.claude/agents/`). When set, the provider passes `--agent <name>` directly and skips system prompt / MCP config decomposition (thin-wrapper mode). See [Claude Code native agent routing](claude-code.md#native-agent-routing).
 - `codexProfile` (string, `codex` only): Names a `[profiles.<name>]` block in `~/.codex/config.toml`. When set, the provider drops `--yolo` and passes `--profile <name>` instead. See [Custom Codex Profile](codex-cli.md#custom-codex-profile).
 - `codexConfig` (object, `codex` only): Inline Codex config overrides passed as `-c key=value` at launch (e.g. `model_reasoning_effort`, `service_tier`, `features.fast_mode`). Keys may be dotted config paths; values become TOML scalars. See [Inline Codex Config Overrides](codex-cli.md#inline-codex-config-overrides).
@@ -61,6 +68,9 @@ CAO controls what tools an agent can use through `role` and `allowedTools` in th
 - **`role`**: A named preset (`supervisor`, `developer`, `reviewer`) that maps to a default set of `allowedTools`.
 - **`allowedTools`**: An explicit tool list that always overrides `role` defaults when set.
 - **`--yolo`**: Bypasses all restrictions and skips confirmation prompts.
+  Repository profiles should declare `permissionMode: plan` or
+  `permissionMode: acceptEdits` where the provider supports those native
+  boundaries; Codex maps both modes without `--yolo`.
 
 For the full reference — built-in roles, tool vocabulary, custom roles, resolution order, provider enforcement details, and known limitations — see **[Tool Restrictions](tool-restrictions.md)**.
 

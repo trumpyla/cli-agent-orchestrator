@@ -325,6 +325,18 @@ class CodexProvider(BaseProvider):
                 "--ask-for-approval",
                 "never",
             ]
+        elif permission_mode == "acceptEdits":
+            # An implementation profile needs repository-scoped writes, not
+            # CAO's unrestricted unattended default.  Keep approval prompts
+            # disabled so a headless terminal cannot park, while Codex's
+            # workspace-write sandbox remains the enforcement boundary.
+            command_parts = [
+                "codex",
+                "--sandbox",
+                "workspace-write",
+                "--ask-for-approval",
+                "never",
+            ]
         elif profile and profile.codexProfile and not yolo:
             command_parts = ["codex", "--profile", profile.codexProfile]
         else:

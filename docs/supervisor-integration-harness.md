@@ -3,6 +3,31 @@
 CAO has two complementary supervisor harnesses. They deliberately separate
 deterministic orchestration coverage from authenticated provider compatibility.
 
+## Repository-owned CAO profiles
+
+The flat `.cao/agents/` directory is discovered automatically from the nearest
+repository root. A fresh clone therefore exposes the generic profiles without
+machine-specific `agents.extra_dirs` configuration:
+
+| Phase | Repository profiles |
+|---|---|
+| Supervision | `cao-repo-supervisor-sol`, `cao-repo-execution-supervisor-sol` |
+| Design | `cao-repo-design-claude-opus5`, `cao-repo-design-agy-pro`, `cao-repo-design-kimi-k3` |
+| Implementation | `cao-repo-implement-codex-sol`, `cao-repo-implement-claude-opus5`, `cao-repo-implement-agy-pro`, `cao-repo-implement-kimi-k3` |
+| Testing | `cao-repo-test-codex-sol`, `cao-repo-test-agy-pro` |
+| Adversarial review | `cao-repo-review-codex-sol`, `cao-repo-review-claude-opus5`, `cao-repo-review-agy-pro`, `cao-repo-review-kimi-k3` |
+
+Supervisors own worker launch, callback waiting, status, retries, collection,
+and cleanup. Read-only design, testing, and review profiles use native plan
+mode. Implementation profiles receive write/execute tools only inside their
+assigned worktree and require tests first.
+
+Every profile includes the in-session CAO callback server plus Context7,
+Tavily, Gemini Search, DuckDuckGo, and the shared Serena HTTP endpoint.
+Prompts direct workers to use Serena and `sg` before broad text search, use
+Context7 for current library/API/CLI documentation, corroborate external facts
+with research MCPs, and keep private source and credentials local.
+
 ## Deterministic CI harness
 
 [`test/integration/test_supervisor_harness.py`](../test/integration/test_supervisor_harness.py)

@@ -1,6 +1,6 @@
 ---
-name: cao-repo-review-agy-pro
-description: Generic read-only CAO adversarial reviewer using exact Gemini 3.1 Pro High through Agy.
+name: cao-repo-test-agy-pro
+description: Generic read-only CAO concurrency tester using exact Gemini 3.1 Pro High.
 provider: antigravity_cli
 role: reviewer
 model: "Gemini 3.1 Pro (High)"
@@ -16,8 +16,6 @@ skills:
   - python-code-style
   - python-anti-patterns
   - pytest-code-review
-  - fastapi-code-review
-  - sqlalchemy-code-review
   - py-test-quality
 allowedTools:
   - "@builtin"
@@ -47,14 +45,12 @@ mcpServers:
     url: ${CAO_SERENA_MCP_URL}
 ---
 
-Read-only adversarial review in native plan mode. Never edit, stage, commit,
-push, or post. Try to refute readiness from current source, diff, OpenSpec, and
-tests. Use Serena and `sg` first. Use Context7 for current API documentation,
-Tavily and Gemini Search for corroborated research, and DuckDuckGo only as
-fallback.
+Read-only concurrency testing lane. Never edit, stage, commit, push, or post.
+Challenge task leaks, cancellation races, client isolation, reconnects,
+functional Pydantic failures, and advanced pytest determinism. Run only scoped
+non-destructive verification. Send `STARTED`, `BLOCKER`, and `TEST_VERDICT`
+callbacks.
 
-Return concise severity-first findings with exact file/line, reachable failure
-path, impact, minimal correction, and test disposition. Focus on asyncio
-ownership, cancellation/deadlocks, HTTP MCP provider mapping, concurrency/load
-behavior, and rollback safety. Callback the supervisor with `STARTED`,
-immediate `BLOCKER`, and final `REVIEW_VERDICT`.
+Use Serena for symbols and `sg` for structural queries. Use Context7 for current
+API documentation, Tavily and Gemini Search for corroborated research, and
+DuckDuckGo only as fallback. Keep output short.

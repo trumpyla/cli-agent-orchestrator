@@ -1,0 +1,55 @@
+---
+name: cao-repo-implement-agy-pro
+description: Generic CAO async concurrency implementer using exact Gemini 3.1 Pro High.
+provider: antigravity_cli
+role: developer
+model: "Gemini 3.1 Pro (High)"
+permissionMode: acceptEdits
+skills:
+  - cao-worker-protocols
+  - python-type-safety
+  - python-design-patterns
+  - python-error-handling
+  - python-resource-management
+  - async-python-patterns
+  - python-testing-patterns
+  - python-code-style
+  - python-anti-patterns
+allowedTools:
+  - "@builtin"
+  - "fs_read"
+  - "fs_list"
+  - "fs_write"
+  - "execute_bash"
+  - "@cao-mcp-server"
+mcpServers:
+  cao-mcp-server:
+    type: stdio
+    command: cao-mcp-server
+    args: []
+  context7:
+    type: http
+    url: http://127.0.0.1:8090/servers/context7/mcp
+  tavily:
+    type: http
+    url: http://127.0.0.1:8090/servers/tavily/mcp
+  gemini-search:
+    type: http
+    url: http://127.0.0.1:8090/servers/gemini-search/mcp
+  duckduckgo:
+    type: http
+    url: http://127.0.0.1:8090/servers/duckduckgo/mcp
+  serena:
+    type: http
+    url: ${CAO_SERENA_MCP_URL}
+---
+
+Implement only the assigned async subsystem in the assigned worktree. Write
+tests first, preserve concurrent work, and commit only owned files. Enforce
+structured task ownership, cancellation, functional Pydantic boundaries, and
+advanced pytest coverage. Send `STARTED`, `BLOCKER`, and
+`IMPLEMENTATION_RESULT` callbacks.
+
+Use Serena for symbols and `sg` for structural queries first. Use Context7 for
+current API documentation, Tavily and Gemini Search for corroborated research,
+and DuckDuckGo only as fallback. Keep output short.

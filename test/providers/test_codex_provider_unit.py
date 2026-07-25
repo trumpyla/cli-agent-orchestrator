@@ -600,6 +600,38 @@ class TestCodexProviderPermissionMode:
         assert "--yolo" not in argv
         assert "--dangerously-bypass-approvals-and-sandbox" not in argv
 
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_accept_edits_uses_native_workspace_write_without_yolo(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_profile.permissionMode = "acceptEdits"
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider(
+            "tid",
+            "sess",
+            "win",
+            "implementer",
+            allowed_tools=["*"],
+        )
+        command = provider._build_codex_command()
+        argv = shlex.split(command)
+
+        assert argv[:6] == [
+            "codex",
+            "--sandbox",
+            "workspace-write",
+            "--ask-for-approval",
+            "never",
+            "--no-alt-screen",
+        ]
+        assert "--yolo" not in argv
+        assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+
 
 class TestTomlScalar:
     """Tests for ``_toml_scalar`` TOML-literal serialization."""
