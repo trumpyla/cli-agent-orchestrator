@@ -210,3 +210,87 @@ async def test_concurrent_sub_unsub_races(clients):
                 ctg.start_soon(client_lifecycle, i)
 
     assert len(tasks._registry) == 0
+
+@pytest.mark.anyio
+async def test_real_fastmcp_delete_finalization():
+    from fastmcp import FastMCP
+    from mcp.client.session import ClientSession
+    from mcp.shared.memory import create_client_server_memory_streams
+    from pydantic import AnyUrl
+    
+    server = FastMCP("test-delete")
+    low = server._mcp_server
+    worker_started = anyio.Event()
+    server_done = anyio.Event()
+    captured = {}
+
+    @low.subscribe_resource()
+    async def subscribe(uri: AnyUrl) -> None:
+        session = low.request_context.session
+        tasks = FastMcp32SessionTasks(session)
+        captured["tasks"] = tasks
+
+        async def worker():
+            worker_started.set()
+            await anyio.sleep_forever()
+
+        await tasks.subscribe(str(uri), worker)
+
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        client_read, client_write = client_streams
+        server_read, server_write = server_streams
+
+        async def run_server():
+            try:
+                await low.run(server_read, server_write, low.create_initialization_options())
+            finally:
+                server_done.set()
+
+        async with anyio.create_task_group() as outer:
+            outer.start_soon(run_server)
+            async with ClientSession(client_read, client_write) as client:
+                await client.initialize()
+                await client.subscribe_resource(AnyUrl("cao://peers/deadbeef/inbox"))
+                await worker_started.wait()
+                assert len(captured["tasks"]._registry) == 1
+            
+            # Client disconnected
+            with anyio.move_on_after(0.25) as wait_scope:
+                await server_done.wait()
+            
+            assert not wait_scope.cancel_called, "Server exit timed out"
+            assert len(captured["tasks"]._registry) == 0
+            outer.cancel_scope.cancel()
+
+
+@pytest.mark.anyio
+async def test_cancel_all_racing_late():
+    async with anyio.create_task_group() as tg:
+        session = FakeSession(tg)
+        tasks = FastMcp32SessionTasks(session)
+
+        # Start a worker that will be cancelled
+        worker1_started = anyio.Event()
+        async def worker1():
+            worker1_started.set()
+            await anyio.sleep_forever()
+
+        await tasks.subscribe("r://1", worker1)
+        await worker1_started.wait()
+
+        # Concurrently call cancel_all and subscribe
+        async def do_cancel_all():
+            await tasks.cancel_all()
+
+        async def late_subscriber():
+            with pytest.raises(RuntimeError, match="Session is closing"):
+                await tasks.subscribe("r://2", worker1)
+
+        async with anyio.create_task_group() as tg2:
+            tg2.start_soon(do_cancel_all)
+            await anyio.sleep(0.01)  # Ensure cancel_all is in progress
+            tg2.start_soon(late_subscriber)
+            
+        assert len(tasks._registry) == 0
+
+
