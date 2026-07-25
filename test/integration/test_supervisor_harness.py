@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import sqlite3
 import time
+from contextlib import closing
 from pathlib import Path
 from test.fixtures.cao_server import _pick_free_port, _start_cao_server
 from test.fixtures.terminal_factory import TerminalFactory
@@ -45,7 +46,7 @@ def _delivered_callback_exists(server_url: str, terminal_id: str) -> bool:
 
 
 def _assert_database_has_no_runtime_rows(db_path: Path) -> None:
-    with sqlite3.connect(db_path) as connection:
+    with closing(sqlite3.connect(db_path)) as connection:
         terminal_count = connection.execute("SELECT COUNT(*) FROM terminals").fetchone()[0]
         inbox_count = connection.execute("SELECT COUNT(*) FROM inbox").fetchone()[0]
     assert terminal_count == 0
