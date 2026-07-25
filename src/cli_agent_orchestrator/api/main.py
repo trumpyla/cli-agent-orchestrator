@@ -11,6 +11,7 @@ import signal
 import struct
 import subprocess
 import termios
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,6 +38,7 @@ from fastapi.responses import JSONResponse
 from fastmcp.server.dependencies import get_http_headers
 from fastmcp.utilities.lifespan import combine_lifespans
 from pydantic import BaseModel, Field, field_validator, model_validator
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from cli_agent_orchestrator.backends import TerminalBackendError, TerminalNotFoundError
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -670,29 +672,60 @@ def _current_mcp_authorization() -> str | None:
     return get_http_headers(include={"authorization"}).get("authorization")
 
 
-ops_backend = AsgiRequestBackend(authorization=_current_mcp_authorization)
-ops_mcp = create_ops_mcp(ops_backend, auth=CaoTokenVerifier())
-ops_http_app = ops_mcp.http_app(
-    path="/ops",
-    transport="http",
-    stateless_http=False,
-)
-_first_application_lifespan = combine_lifespans(lifespan, ops_http_app.lifespan)
-_ops_lifespan_completed = False
+class _LifecycleBoundOpsHttpApp:
+    """Route MCP requests only to the child owned by the active host lifespan."""
+
+    def __init__(self) -> None:
+        self._active_app: ASGIApp | None = None
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        active_app = self._active_app
+        if active_app is None:
+            if scope["type"] != "http":
+                raise RuntimeError("CAO Ops MCP application is not running")
+            await JSONResponse(
+                {"detail": "CAO Ops MCP application is not running"},
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            )(scope, receive, send)
+            return
+        await active_app(scope, receive, send)
+
+    @asynccontextmanager
+    async def activate(self, application: ASGIApp) -> AsyncIterator[None]:
+        """Publish one initialized child and remove it before child shutdown."""
+        if self._active_app is not None:
+            raise RuntimeError("CAO Ops MCP application is already running")
+        self._active_app = application
+        try:
+            yield
+        finally:
+            self._active_app = None
+
+
+ops_http_app = _LifecycleBoundOpsHttpApp()
 
 
 @asynccontextmanager
-async def _application_lifespan(application: FastAPI):
-    """Run the single-use MCP manager once and keep host test restarts compatible."""
-    global _ops_lifespan_completed
-    if _ops_lifespan_completed:
-        async with lifespan(application):
-            yield
-        return
-
-    async with _first_application_lifespan(application):
-        _ops_lifespan_completed = True
-        yield
+async def _application_lifespan(application: FastAPI) -> AsyncIterator[None]:
+    """Own a fresh stateful MCP server and backend for each host lifecycle."""
+    ops_backend = AsgiRequestBackend(authorization=_current_mcp_authorization)
+    try:
+        ops_mcp = create_ops_mcp(ops_backend, auth=CaoTokenVerifier())
+        lifecycle_http_app = ops_mcp.http_app(
+            path="/ops",
+            transport="http",
+            stateless_http=False,
+        )
+        ops_backend.bind(application)
+        combined_lifespan = combine_lifespans(
+            lifespan,
+            lifecycle_http_app.lifespan,
+        )
+        async with combined_lifespan(application):
+            async with ops_http_app.activate(lifecycle_http_app):
+                yield
+    finally:
+        await ops_backend.aclose()
 
 
 app = FastAPI(
@@ -701,7 +734,6 @@ app = FastAPI(
     version=SERVER_VERSION,
     lifespan=_application_lifespan,
 )
-ops_backend.bind(app)
 
 # Security: DNS Rebinding Protection
 # Validate Host header to prevent DNS rebinding attacks (CVE mitigation)
