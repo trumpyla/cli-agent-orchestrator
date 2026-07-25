@@ -68,19 +68,77 @@ compatible.
 
 #### Scenario: Antigravity HTTP mapping
 - **WHEN** Antigravity launches with an HTTP entry
-- **THEN** its native configuration contains `httpUrl` and no command, args, or env
+- **THEN** its `mcp_config.json` entry contains `url`, does not contain stale `httpUrl`, and contains no command, args, or env
 
 #### Scenario: Kimi HTTP mapping
 - **WHEN** Kimi 0.29 launches with an HTTP entry
-- **THEN** its per-terminal `.kimi-code/mcp.json` entry contains only the supported `url` form and CAO does not pass `--mcp-config`
+- **THEN** its per-terminal `<unique-cwd>/.kimi-code/mcp.json` entry is exactly the supported `{url}` form and CAO does not pass `--mcp-config`
 
-#### Scenario: Terminal identity injection
-- **WHEN** a profile contains command and HTTP entries
-- **THEN** `CAO_TERMINAL_ID` is injected only into command-launched entries
+#### Scenario: Kimi documented configuration discovery
+- **WHEN** the installed Kimi parser resolves MCP configuration
+- **THEN** it recognizes `$KIMI_CODE_HOME/mcp.json` with default `~/.kimi-code/mcp.json`, project-root `.mcp.json`, and cwd `.kimi-code/mcp.json`, with later scopes overriding earlier scopes
+
+#### Scenario: Kimi ordinary HTTP is not legacy SSE
+- **WHEN** CAO serializes an ordinary Kimi HTTP entry
+- **THEN** the entry contains no `transport`, and CAO does not emit the legacy `transport: sse` form
+
+#### Scenario: Kimi model and prompt surfaces
+- **WHEN** CAO selects a Kimi profile model or runs a bounded non-interactive prompt smoke
+- **THEN** it uses the installed `-m` / `--model` or `-p` / `--prompt` surface respectively
+
+#### Scenario: Kimi interactive task submission
+- **WHEN** CAO delivers a task to a retained interactive Kimi TUI
+- **THEN** it writes the task and submits it with `Enter` rather than assuming text injection alone executes the prompt
+
+#### Scenario: HTTP entries have no terminal environment
+- **WHEN** any supported provider translates an HTTP entry
+- **THEN** the emitted entry contains no `env`, `env_vars`, or `CAO_TERMINAL_ID`
 
 #### Scenario: Unsupported provider
 - **WHEN** a provider without a native HTTP mapping receives an HTTP entry
 - **THEN** launch fails clearly rather than coercing it to a command entry
+
+### Requirement: Exact Claude Code model and provider-native effort
+Claude Code profiles MUST pin exact `claude-opus-5` and MUST request the
+highest effort supported by the provider-native Claude Code CLI. For the
+2026-07-25 CLI surface, that effort is `xhigh`, exposed as
+`/effort ultracode`; profiles and tests MUST NOT substitute generic `max` from
+a separate SDK/tool/API effort ladder.
+
+#### Scenario: Claude Code model and native effort
+- **WHEN** a Claude Code profile or launch fixture is validated
+- **THEN** it requires `canonicalModel=claude-opus-5` and provider-native `xhigh`/ultracode evidence without alias fallback or model downgrade
+
+#### Scenario: Non-CLI effort ladder
+- **WHEN** an SDK, tool, or API schema separately enumerates an effort value named `max`
+- **THEN** validation retains the Claude Code CLI `xhigh`/ultracode contract instead of translating or escalating it to generic `max`
+
+### Requirement: Fresh callback identity per created terminal
+Each terminal launch MUST snapshot the newly created terminal ID and MUST
+inject it only into each command-launched identity-bearing `cao-mcp-server`
+entry. Launch MUST NOT reuse terminal identity from a profile, process
+environment, provider cache, persisted provider configuration, prior session,
+or another terminal.
+
+#### Scenario: Identity-bearing command entry
+- **WHEN** a new terminal with a command-launched `cao-mcp-server` entry is created
+- **THEN** its resolved immutable launch copy contains `env.CAO_TERMINAL_ID` equal to that created terminal ID
+
+#### Scenario: Stale identity sources
+- **WHEN** profile, process, provider, persisted-config, or prior-session state contains a different `CAO_TERMINAL_ID`
+- **THEN** launch discards every stale value and exposes only the newly created terminal ID to `cao-mcp-server`
+
+#### Scenario: Unrelated command entry
+- **WHEN** a command-launched MCP entry is not the identity-bearing `cao-mcp-server`
+- **THEN** CAO does not synthesize `CAO_TERMINAL_ID` for that entry
+
+#### Scenario: Consecutive terminal launches
+- **WHEN** two terminals launch from the same profile or provider configuration
+- **THEN** each receives an independent immutable identity snapshot and neither launch can observe the other's terminal ID
+
+#### Scenario: Callback identity smoke
+- **WHEN** a created terminal calls `cao-mcp-server` to send a launch-smoke callback
+- **THEN** the received callback `sender_id` equals the terminal ID returned by creation
 
 ### Requirement: Native Antigravity permission modes
 Antigravity MUST map `permissionMode: plan` and `permissionMode: acceptEdits`

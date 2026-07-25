@@ -30,14 +30,25 @@ testing, and adversarially reviewing the transport and profile changes.
   notifications.
 - Extend profile validation and provider translation so an MCP server is exactly one
   of command-launched stdio or native HTTP, including fail-closed exact environment
-  reference resolution for HTTP URLs at terminal launch.
+  reference resolution for HTTP URLs and a fresh terminal-identity snapshot at
+  terminal launch.
 - Add provider-native HTTP mappings for Codex, Claude, Antigravity, and Kimi
-  0.29. Kimi uses per-terminal project-local MCP JSON rather than the removed
-  `--mcp-config` flag, and Antigravity maps `acceptEdits` to
-  `--mode accept-edits`, without synthetic empty command fields.
-- Add repository-owned CAO swarm profiles, a read-only Serena project definition,
-  and pinned ast-grep structural rules and CI gates for the new async and commandless
-  HTTP invariants.
+  0.29. Kimi uses the documented per-terminal cwd `.kimi-code/mcp.json`,
+  ordinary HTTP entries are exactly `{url}`, and legacy `transport: sse`
+  remains a non-goal. Antigravity 1.1.7 uses `url` rather than stale
+  `httpUrl` and maps `acceptEdits` to `--mode accept-edits`, without synthetic
+  subprocess fields.
+- Add reusable repository-owned CAO swarm profiles across Codex, Claude,
+  Antigravity, and Kimi for supervision, Python and shell implementation,
+  protocol testing, source-backed research, and adversarial review. Profiles
+  use current role-scoped Artagon skills, the command-launched
+  `cao-mcp-server`, and native HTTP Context7, Tavily, Gemini Search,
+  DuckDuckGo, and Serena endpoints. Claude profiles pin exact
+  `claude-opus-5` at the highest supported provider-native Claude Code effort
+  (`xhigh`, surfaced as `/effort ultracode`) and never substitute the separate
+  SDK/tool/API `max` value for that CLI contract.
+- Add a read-only Serena project definition and pinned ast-grep structural
+  rules and CI gates for the new async and commandless HTTP invariants.
 - Coordinate a separate `artagon-scripts` rollout that emits the native CAO Ops URL,
   removes CAO Ops from the generated proxy child set in native mode, preserves a
   temporary proxy rollback mode, and does not take ownership of `cao-server`.
@@ -46,6 +57,8 @@ Explicit non-goals:
 
 - Do not convert the identity-bearing in-session `cao-mcp-server` from stdio.
 - Do not add legacy SSE.
+- Do not emit Kimi `transport: sse` for ordinary HTTP or Antigravity
+  `httpUrl`.
 - Do not run an independent CAO Ops HTTP daemon outside `cao-server`.
 - Do not make MCP resource notifications authoritative; inbox long-poll remains the
   reliable source of messages.
@@ -87,6 +100,10 @@ Web UI, WebSocket, persistence, and backend contracts.
   boundary, are never replaced with the machine-local token for external callers,
   and must not appear in logs or validation errors. Authentication remains
   default-off; when enabled, initialization and all REST calls fail closed.
+- Callback identity: every new terminal snapshots its created terminal ID and
+  overwrites stale profile/session/provider identity for the command-launched
+  `cao-mcp-server`; HTTP entries never receive terminal environment. A launch
+  smoke must observe callback `sender_id` equal to the created terminal.
 - Dependencies: FastMCP is constrained to `>=3.2.0,<3.3.0` because the
   session-owned subscription adapter characterizes one private 3.2 seam;
   ast-grep CI installs version 0.44.1. No database migration is required.

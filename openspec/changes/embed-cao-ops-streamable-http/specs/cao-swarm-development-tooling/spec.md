@@ -1,9 +1,11 @@
 ## ADDED Requirements
 
 ### Requirement: Repository-owned CAO profiles
-The repository MUST ship flat, discoverable CAO profiles for supervision,
-design, implementation, testing, and adversarial review and MUST register them
-through project `agents.extra_dirs`.
+The repository MUST ship flat, discoverable, change-agnostic
+`cli-agent-orchestrator` CAO profiles for supervision, Python and shell
+implementation, Python/protocol testing, source-backed research, and
+adversarial review and MUST register them through project
+`agents.extra_dirs`.
 
 #### Scenario: Profile discovery
 - **WHEN** CAO loads project settings in this repository
@@ -13,9 +15,21 @@ through project `agents.extra_dirs`.
 - **WHEN** a supervisor or worker profile launches
 - **THEN** supervisors receive `cao-supervisor-protocols` and workers receive `cao-worker-protocols`
 
-#### Scenario: Python skill scope
+#### Scenario: Highest validated provider profiles
+- **WHEN** profiles are committed for Codex, Claude, Antigravity, or Kimi
+- **THEN** they use the exact highest requested installed identifier for `gpt-5.6-sol` at maximum reasoning, `claude-opus-5` at provider-native Claude Code `xhigh`/ultracode effort, Gemini Pro High, or Kimi K3 respectively and fail closed instead of substituting or downgrading an unavailable model
+
+#### Scenario: Claude Code effort surface
+- **WHEN** the exact Claude profile's model and effort are tested
+- **THEN** the test requires `canonicalModel=claude-opus-5` and the highest supported provider-native CLI effort (`xhigh`, surfaced as `/effort ultracode`) and rejects generic `max` from a separate SDK/tool/API ladder
+
+#### Scenario: Current Python skill scope
 - **WHEN** a repository profile launches
-- **THEN** the Artagon Python skill directory is registered through `skills.extra_dirs` and the profile advertises only its assigned Python and verification skills
+- **THEN** the current Artagon Python skill directory is registered through `skills.extra_dirs` and the profile advertises only its assigned type-safety, design, error-handling, resource, async, testing, style, and anti-pattern skills
+
+#### Scenario: Stale review protocol excluded
+- **WHEN** any repository profile's skill catalog is validated
+- **THEN** it omits `review-verification-protocol`, and only the final OpenSpec traceability verifier receives `implementation-verification`
 
 #### Scenario: Read-only lanes
 - **WHEN** design, testing, or review profiles launch
@@ -25,22 +39,42 @@ through project `agents.extra_dirs`.
 - **WHEN** an implementation profile launches in an assigned worktree
 - **THEN** its write and execution capabilities are limited to that worktree and owned subsystem
 
+#### Scenario: Claude implementation orchestration
+- **WHEN** a repository-local Claude implementation profile launches
+- **THEN** it starts directly in the assigned worktree with `permissionMode: acceptEdits`, exposes `cao-mcp-server`, establishes project trust, and reaches its first authorized command without a trust prompt
+
 ### Requirement: Required MCP surfaces in profiles
 Every applicable swarm profile MUST include the identity-bearing stdio
-`cao-mcp-server`, managed Context7 HTTP, and
-`${CAO_SERENA_MCP_URL}` HTTP entry.
+`cao-mcp-server` and native HTTP entries for Context7, Tavily, Gemini Search,
+DuckDuckGo, and Serena using exact `${CAO_CONTEXT7_MCP_URL}`,
+`${CAO_TAVILY_MCP_URL}`, `${CAO_GEMINI_SEARCH_MCP_URL}`,
+`${CAO_DUCKDUCKGO_MCP_URL}`, and `${CAO_SERENA_MCP_URL}` references. HTTP
+entries MUST NOT launch `npx`, embed credentials, contain subprocess fields, or
+receive terminal environment.
 
 #### Scenario: Command and HTTP coexistence
-- **WHEN** a profile containing all three MCP entries is translated for a supported provider
-- **THEN** `cao-mcp-server` launches as stdio while Context7 and Serena remain native HTTP entries
+- **WHEN** a profile containing the command entry and all five HTTP entries is translated for a supported provider
+- **THEN** `cao-mcp-server` launches as stdio while Context7, Tavily, Gemini Search, DuckDuckGo, and Serena remain native HTTP entries
 
-#### Scenario: Missing Serena environment
-- **WHEN** `CAO_SERENA_MCP_URL` is unset at terminal launch
+#### Scenario: Missing managed endpoint environment
+- **WHEN** any required managed MCP URL reference is unset at terminal launch
 - **THEN** launch fails closed before starting the provider
+
+#### Scenario: Native HTTP profile example
+- **WHEN** a profile example is validated
+- **THEN** each HTTP server is represented only by `type: http` and its exact `${CAO_*_MCP_URL}` reference
+
+#### Scenario: Documentation and research prompt
+- **WHEN** an agent receives its repository prompt
+- **THEN** it is instructed to use Context7 before relying on library or CLI APIs, Tavily plus Gemini Search for current claims and corroboration, and DuckDuckGo as the general fallback
 
 #### Scenario: Navigation prompt
 - **WHEN** an agent receives its repository prompt
 - **THEN** it is instructed to use Serena for symbol-aware navigation and `sg` for structural queries before broad text search
+
+#### Scenario: Terminal-matching callback smoke
+- **WHEN** a profile launch smoke creates a terminal and sends a callback through its command-launched `cao-mcp-server`
+- **THEN** the callback `sender_id` equals the created terminal ID and no HTTP entry contains `CAO_TERMINAL_ID`
 
 ### Requirement: Read-only shared Serena configuration
 The repository MUST provide `.serena/project.yml` with Python support,

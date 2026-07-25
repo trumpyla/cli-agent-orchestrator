@@ -26,6 +26,15 @@ This change spans the CAO runtime repository and the sibling `artagon-scripts`
 MCP controller. It therefore uses separate branches and cross-linked PRs with a
 deploy-CAO-first rollout.
 
+Provider behavior was refreshed on 2026-07-25 before profile implementation.
+The durable
+[provider CLI source record](research/provider-cli-sources-2026-07-25.md)
+contains the exact official Claude Code, Kimi Code CLI, and Antigravity
+repository/document URLs, Context7 repository IDs, installed
+`kimi 0.29.0` / `agy 1.1.7` probes, and the adjudicated Claude plan-mode smoke.
+Google DevKnowledge was unavailable because its configured surface required
+authentication; no design claim depends on it.
+
 ## Goals / Non-Goals
 
 **Goals:**
@@ -166,6 +175,16 @@ HTTP variants are narrowed before provider translation, and launch-time
 resolution returns a new immutable resolved model rather than mutating the
 loaded profile. Provider serializers consume only resolved typed models.
 
+The same launch boundary snapshots the just-created terminal ID. It discards
+any `CAO_TERMINAL_ID` inherited from a loaded profile, process environment,
+provider cache, persisted provider configuration, or prior session. Only a
+command-launched entry whose resolved command is the identity-bearing
+`cao-mcp-server` receives
+`env.CAO_TERMINAL_ID=<created-terminal-id>`. Other command entries retain only
+their declared environment, and HTTP entries never receive an environment or
+terminal identity. Sequential and concurrent launches build independent
+copies; neither a profile object nor provider-global state is mutated.
+
 Tests follow the repository Python testing guidance: parametrized contract
 matrices and fixture factories cover providers and invalid inputs; async tests
 use deterministic events/cancel scopes rather than timing sleeps; `tmp_path`,
@@ -179,34 +198,117 @@ zero-task cleanup assertions.
   `tool_timeout_sec=600.0` remains valid for HTTP, but HTTP entries receive no
   command, args, env, or env_vars.
 - Claude emits `{"type": "http", "url": "..."}` with no subprocess fields.
-- Antigravity emits `{"httpUrl": "..."}` with no command, args, or env.
-- Kimi 0.29 writes a per-terminal `.kimi-code/mcp.json` beneath its unique
-  temporary working directory. HTTP entries are `{"url": "..."}` with no
-  `type`, `transport`, or subprocess fields; stdio entries retain command,
-  args, and env. CAO does not pass `--mcp-config`.
-- `CAO_TERMINAL_ID` is injected only into command-launched entries.
+- Antigravity 1.1.7 writes `{"url": "..."}` to `mcp_config.json`, with no
+  stale `httpUrl`, command, args, or env.
+- Kimi 0.29 discovers MCP configuration from
+  `$KIMI_CODE_HOME/mcp.json` (default `~/.kimi-code/mcp.json`),
+  project-root `.mcp.json`, then `<cwd>/.kimi-code/mcp.json`, with later
+  scopes overriding earlier scopes. CAO writes the per-terminal file only at
+  `<unique-cwd>/.kimi-code/mcp.json` and does not mutate the user or project
+  files. Ordinary HTTP entries are exactly `{"url": "..."}` with no `type`,
+  `transport`, or subprocess fields; `transport: sse` is legacy SSE and is not
+  emitted. Stdio entries retain command, args, and env. CAO does not pass
+  `--mcp-config`.
+- Kimi passes a profile model through `-m` / `--model`. Its interactive task
+  path writes the task into the TUI and submits it with `Enter`;
+  `-p` / `--prompt` is the bounded non-interactive one-prompt surface used by
+  installed smoke probes, not a substitute for interactive submission.
+- A fresh `CAO_TERMINAL_ID` is injected only into each resolved
+  command-launched `cao-mcp-server` entry. All HTTP entries and unrelated
+  command entries omit it.
 - Antigravity maps `permissionMode: plan` to `--mode plan` and
   `permissionMode: acceptEdits` to `--mode accept-edits`; either explicit mode
   suppresses `--dangerously-skip-permissions`.
 
-Each provider receives focused positive and negative tests. Providers outside
-this rollout continue to accept command entries; HTTP entries fail clearly if
-they lack a supported native mapping rather than being coerced to stdio.
+Each provider receives focused positive and negative tests. A launch smoke
+creates a real terminal with command `cao-mcp-server`, sends a callback, and
+requires callback `sender_id` to equal the terminal ID returned by creation.
+The test seeds stale identity in profile, provider, process, persisted-config,
+and prior-session inputs and proves none survives. Providers outside this
+rollout continue to accept command entries; HTTP entries fail clearly if they
+lack a supported native mapping rather than being coerced to stdio.
 
 ### 7. Repository-owned swarm and navigation profiles
 
-Flat profiles under `.cao/agents/` cover supervision, design, implementation,
-testing, and adversarial review. Project settings register that path through
-`agents.extra_dirs` and the Artagon Python skill path through
-`skills.extra_dirs`.
+Flat profiles under `.cao/agents/` are reusable `cli-agent-orchestrator`
+repository roles, not profiles named for this change. Across applicable Codex,
+Claude, Antigravity, and Kimi families they cover repository supervision,
+Python implementation, Python/protocol testing, source-backed research,
+read-only adversarial review, and shell implementation/testing. Each exact
+provider/model identifier is validated against the installed provider before
+commit; unavailable requested models fail closed without substitution or
+downgrade. The highest-model targets are Codex `gpt-5.6-sol` at maximum
+reasoning, exact Claude `claude-opus-5` at the highest supported
+provider-native Claude Code effort (`xhigh`, surfaced as
+`/effort ultracode`), the highest validated Gemini Pro High model for
+Antigravity, and the highest validated Kimi K3 model. The separate
+five-value SDK/tool/API effort ladder does not replace the launched Claude
+Code CLI surface and MUST NOT cause a generic `max` value to be emitted or
+required for that profile.
+
+The official Claude Code changelog retrieved through Context7 on 2026-07-25
+states that `/effort ultracode` is offered only on models supporting `xhigh`.
+Under authoritative CAO root directive inbox 870, the existing bounded
+plan-mode smoke on terminal `21a9e101` is therefore PASS without relaunch:
+`canonicalModel=claude-opus-5`, live Claude Code effort
+`xhigh`/ultracode, `permissionMode=plan`, and server-stamped callback
+`sender_id=21a9e101` equal to the created terminal. This evidence adjudicates
+the smoke only and does not mark an OpenSpec implementation task complete.
+
+Project settings register `.cao/agents/` through `agents.extra_dirs` and the
+current Artagon Python skill directory through `skills.extra_dirs`. Skills are
+role-scoped: Python implementation uses the current `python-type-safety`,
+`python-design-patterns`, `python-error-handling`,
+`python-resource-management`, `async-python-patterns`,
+`python-code-style`, `python-testing-patterns`, and
+`python-anti-patterns` guidance as applicable; test roles emphasize current
+Python/async testing; shell roles use current Artagon shell authoring,
+defensive, testing, and linting skills. Supervisors receive only current CAO
+orchestration protocols, and the final traceability lane alone receives
+`implementation-verification`. Profiles MUST NOT include the stale
+`review-verification-protocol`.
 
 Supervisors receive `cao-supervisor-protocols`; workers receive
-`cao-worker-protocols`. Profiles include the identity-bearing stdio
-`cao-mcp-server`, managed Context7 HTTP, and the exact
-`${CAO_SERENA_MCP_URL}` HTTP entry. Design/test/review profiles omit native
-write tools; Kimi uses native plan mode and Antigravity uses
-`permissionMode: plan`. Implementation profiles receive write/execute
-capabilities only in their assigned worktrees.
+`cao-worker-protocols`. Every applicable profile includes the
+identity-bearing stdio `cao-mcp-server` plus native HTTP entries with exact
+launch-resolved references:
+
+```yaml
+mcpServers:
+  cao-mcp-server:
+    command: cao-mcp-server
+  context7:
+    type: http
+    url: ${CAO_CONTEXT7_MCP_URL}
+  tavily:
+    type: http
+    url: ${CAO_TAVILY_MCP_URL}
+  gemini-search:
+    type: http
+    url: ${CAO_GEMINI_SEARCH_MCP_URL}
+  duckduckgo:
+    type: http
+    url: ${CAO_DUCKDUCKGO_MCP_URL}
+  serena:
+    type: http
+    url: ${CAO_SERENA_MCP_URL}
+```
+
+These entries use no `npx`, embedded credential, subprocess field, or terminal
+environment. Missing required URL references fail before provider start.
+Profile prompts direct library/API/CLI questions to Context7, current claims to
+Tavily plus Gemini Search for independent corroboration, general/fallback
+search to DuckDuckGo, and symbol/reference navigation to Serena. They require
+Serena and `sg` structural queries before broad text search.
+
+Design/test/review profiles omit native write tools; Kimi uses native plan mode
+and Antigravity uses `permissionMode: plan`. Implementation profiles receive
+write/execute capabilities only in their assigned worktrees. Repository-local
+Claude implementation profiles remain orchestration-capable: they launch
+directly in the assigned worktree, use native `permissionMode: acceptEdits`,
+establish project trust without a first-command prompt, and retain
+`cao-mcp-server` callbacks. A launch smoke proves the requested cwd, callback
+availability, first authorized command, and terminal-matching callback sender.
 
 `.serena/project.yml` enables Python, excludes generated/cache/worktree
 directories, and sets `read_only: true`. The shared warm Serena daemon is
@@ -260,6 +362,10 @@ active CAO sessions.
 - **Native/proxy config drift can leave stale generated entries** → sync removes
   the inactive shape, doctor checks the selected mode, and Bats covers both
   transitions.
+- **Persisted provider config can reuse another terminal's callback identity** →
+  overwrite all stale identity sources from the created-terminal snapshot,
+  keep terminal env off HTTP entries, and require a sender-ID launch smoke
+  across sequential terminal creation.
 - **A stacked CAO branch depends on peer-inbox landing** → keep commits scoped
   and document the base dependency in the PR; rebase onto main after the
   prerequisite merges.
@@ -286,5 +392,11 @@ No database migration or persisted session conversion is required.
   seam behind one compatibility adapter, and requires a loud characterization
   test.
 - Kimi 0.29 native HTTP uses `{"url": "..."}` in project-local MCP JSON and
-  does not support CAO's historical `--mcp-config` launch flag.
-- Antigravity 1.1.7 uses `--mode plan` and `--mode accept-edits`.
+  does not support CAO's historical `--mcp-config` launch flag. Its documented
+  discovery locations are `$KIMI_CODE_HOME/mcp.json` (default
+  `~/.kimi-code/mcp.json`), project `.mcp.json`, and cwd
+  `.kimi-code/mcp.json`; `transport: sse` is legacy SSE, not ordinary HTTP.
+- Kimi 0.29 uses `-m` / `--model`, `-p` / `--prompt`, and `Enter` for
+  interactive TUI submission.
+- Antigravity 1.1.7 uses `url` in `mcp_config.json`, not `httpUrl`, and accepts
+  only `--mode plan` and `--mode accept-edits` for the explicit modes in scope.
