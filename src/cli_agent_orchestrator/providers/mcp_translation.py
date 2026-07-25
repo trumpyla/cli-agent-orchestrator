@@ -26,9 +26,8 @@ def claude_http_entry(url: str) -> Dict[str, str]:
 def antigravity_http_entry(url: str) -> Dict[str, str]:
     """Antigravity (``agy``) mcp_config.json entry for an HTTP server.
 
-    ``mcp_config.json`` accepts ``url`` for a direct MCP server. The previously
-    drafted ``httpUrl`` field is stale and is never emitted: agy would ignore the
-    unknown key and register a server with no endpoint.
+    Agy CLI accepts ``url`` for a direct MCP server. The previously drafted
+    ``httpUrl`` field belongs to Gemini CLI and is never emitted here.
     """
     return {"url": url}
 

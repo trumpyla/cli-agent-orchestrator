@@ -1,0 +1,13 @@
+id: no-blocking-requests-in-async
+language: Python
+severity: error
+message: Blocking requests calls are forbidden inside async functions
+note: Use the injected async request backend so cao-server's event loop stays responsive.
+rule:
+  all:
+    - pattern: requests.$METHOD($$$ARGS)
+    - inside:
+        pattern: |
+          async def $FUNC($$$PARAMS):
+            $$$BODY
+        stopBy: end

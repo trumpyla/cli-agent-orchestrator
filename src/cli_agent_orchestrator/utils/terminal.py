@@ -154,7 +154,12 @@ async def wait_for_shell(
     last_change = time.time()
 
     while time.time() < deadline:
-        buf = read_buffer()
+        # Herdr's history read shells out to its CLI and may block for hundreds
+        # of milliseconds. Provider initialization runs on cao-server's event
+        # loop, so a direct call here stalls every concurrent request and
+        # deferred worker. The tmux/pipe-pane branch is an in-memory
+        # StatusMonitor read and stays synchronous.
+        buf = await asyncio.to_thread(read_buffer) if window is not None else read_buffer()
 
         if buf != previous_buffer:
             previous_buffer = buf

@@ -7,6 +7,7 @@ Lane #1 (future-ready): resources/subscribe seam + resource-updated consumer.
 import asyncio
 import inspect
 import json
+from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -14,11 +15,12 @@ import pytest
 
 from cli_agent_orchestrator.ops_mcp_server.server import (
     _PEER_URI_RE,
+    FastMcp32SessionTasks,
     _async_request_json,
     _consume_inbox,
     _long_poll_inbox,
-    _peer_consumers,
     _peer_inbox_uri,
+    _PeerConsumerHandle,
     _request_json,
     _setup_peer_subscribe,
     mcp,
@@ -26,6 +28,42 @@ from cli_agent_orchestrator.ops_mcp_server.server import (
 )
 
 PEER = "deadbeef"
+
+
+class _TestSessionTaskGroup:
+    """Minimal asyncio-backed model of BaseSession's owning task group."""
+
+    def __init__(self) -> None:
+        self.tasks: set[asyncio.Task[None]] = set()
+
+    def start_soon(self, func, *args) -> None:
+        task = asyncio.create_task(func(*args))
+        self.tasks.add(task)
+        task.add_done_callback(self.tasks.discard)
+
+    async def cancel_all(self) -> None:
+        tasks = list(self.tasks)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def _test_session() -> AsyncMock:
+    session = AsyncMock()
+    session._task_group = _TestSessionTaskGroup()
+    session._exit_stack = AsyncExitStack()
+    session._cao_peer_session_tasks = None
+    return session
+
+
+async def _cleanup_test_sessions(*sessions: AsyncMock) -> None:
+    await asyncio.gather(
+        *(session._exit_stack.aclose() for session in sessions),
+    )
+    await asyncio.gather(
+        *(session._task_group.cancel_all() for session in sessions),
+    )
 
 
 def _response(*, status_code=200, json_data=None, text=""):
@@ -69,7 +107,7 @@ def _low_level_server(captured):
             create_initialization_options=_create_init_opts,
             subscribe_resource=_sub,
             unsubscribe_resource=_unsub,
-            request_context=SimpleNamespace(session=AsyncMock()),
+            request_context=SimpleNamespace(session=_test_session()),
         ),
         counts,
     )
@@ -256,8 +294,8 @@ async def test_subscriptions_are_idempotent_per_session_and_unsubscribe_awaits_c
         finally:
             stopped[id(session)] = True
 
-    session_one = AsyncMock()
-    session_two = AsyncMock()
+    session_one = _test_session()
+    session_two = _test_session()
     try:
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server._consume_inbox",
@@ -267,54 +305,64 @@ async def test_subscriptions_are_idempotent_per_session_and_unsubscribe_awaits_c
             await captured["subscribe"](_peer_inbox_uri(PEER))
             await captured["subscribe"](_peer_inbox_uri(PEER))
             await asyncio.sleep(0)
-            assert len(_peer_consumers) == 1
+            assert session_one._cao_peer_session_tasks.consumer_count == 1
 
             low.request_context.session = session_two
             await captured["subscribe"](_peer_inbox_uri(PEER))
             await asyncio.sleep(0)
-            assert len(_peer_consumers) == 2
+            assert session_one._cao_peer_session_tasks.consumer_count == 1
+            assert session_two._cao_peer_session_tasks.consumer_count == 1
 
             low.request_context.session = session_one
             await captured["unsubscribe"](_peer_inbox_uri(PEER))
             assert stopped[id(session_one)] is True
-            assert len(_peer_consumers) == 1
+            assert session_one._cao_peer_session_tasks.consumer_count == 0
+            assert session_two._cao_peer_session_tasks.consumer_count == 1
     finally:
-        tasks = list(_peer_consumers.values())
-        _peer_consumers.clear()
-        for task in tasks:
-            task.cancel()
-        await asyncio.gather(*tasks, return_exceptions=True)
+        await _cleanup_test_sessions(session_one, session_two)
 
 
 @pytest.mark.asyncio
-async def test_unsubscribe_absorbs_already_failed_consumer():
-    """A same-tick failed task must not fail the resources/unsubscribe request."""
+@pytest.mark.parametrize(
+    "missing_seam",
+    [
+        pytest.param("_task_group", id="owning-task-group"),
+        pytest.param("_exit_stack", id="session-finalizer"),
+    ],
+)
+async def test_subscription_fails_closed_when_session_ownership_seam_is_missing(
+    missing_seam: str,
+) -> None:
     captured = {}
     low, _ = _low_level_server(captured)
     _setup_peer_subscribe(SimpleNamespace(_mcp_server=low))
     session = low.request_context.session
+    setattr(session, missing_seam, None)
 
-    class FailedTask:
-        def done(self):
-            return True
+    with pytest.raises(RuntimeError, match="FastMCP 3.2 session"):
+        await captured["subscribe"](_peer_inbox_uri(PEER))
 
-        def cancel(self):
-            return False
+    assert session._cao_peer_session_tasks is None
 
-        def __await__(self):
-            async def fail():
-                raise RuntimeError("consumer failed")
 
-            return fail().__await__()
+@pytest.mark.asyncio
+async def test_unsubscribe_absorbs_already_failed_consumer():
+    """A same-tick completed handle must not fail resources/unsubscribe."""
+    captured = {}
+    low, _ = _low_level_server(captured)
+    fastmcp = SimpleNamespace(_mcp_server=low)
+    _setup_peer_subscribe(fastmcp)
+    session = low.request_context.session
 
-    key = (id(session), PEER)
-    _peer_consumers[key] = FailedTask()
-    try:
-        await captured["unsubscribe"](_peer_inbox_uri(PEER))
-    finally:
-        _peer_consumers.pop(key, None)
+    session_tasks = FastMcp32SessionTasks.attach(session, None)
+    handle = _PeerConsumerHandle()
+    handle.ready.set()
+    handle.done.set()
+    session_tasks._consumers[PEER] = handle
+    await captured["unsubscribe"](_peer_inbox_uri(PEER))
 
-    assert key not in _peer_consumers
+    assert PEER not in session_tasks._consumers
+    await _cleanup_test_sessions(session)
 
 
 @pytest.mark.asyncio
@@ -334,7 +382,8 @@ async def test_completed_subscription_task_is_removed():
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
-    assert _peer_consumers == {}
+    assert low.request_context.session._cao_peer_session_tasks.consumer_count == 0
+    await _cleanup_test_sessions(low.request_context.session)
 
 
 @pytest.mark.asyncio
@@ -354,7 +403,8 @@ async def test_failed_subscription_task_is_removed():
         await asyncio.sleep(0)
         await asyncio.sleep(0)
 
-    assert _peer_consumers == {}
+    assert low.request_context.session._cao_peer_session_tasks.consumer_count == 0
+    await _cleanup_test_sessions(low.request_context.session)
 
 
 def test_request_json_forwards_local_bearer_without_logging_it(caplog):

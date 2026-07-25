@@ -310,7 +310,22 @@ class CodexProvider(BaseProvider):
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
-        if profile and profile.codexProfile and not yolo:
+        permission_mode = getattr(profile, "permissionMode", None)
+        if permission_mode == "plan":
+            # A profile explicitly advertised as plan/read-only must never
+            # inherit CAO's unattended --yolo default, even when its logical
+            # tool catalog is unrestricted. Codex's native read-only sandbox
+            # is the enforcement boundary; "never" means sandbox denials are
+            # returned to the model instead of parking the headless TUI on an
+            # approval prompt.
+            command_parts = [
+                "codex",
+                "--sandbox",
+                "read-only",
+                "--ask-for-approval",
+                "never",
+            ]
+        elif profile and profile.codexProfile and not yolo:
             command_parts = ["codex", "--profile", profile.codexProfile]
         else:
             command_parts = ["codex", "--yolo"]

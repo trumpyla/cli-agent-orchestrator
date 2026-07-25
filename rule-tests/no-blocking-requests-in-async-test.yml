@@ -1,0 +1,20 @@
+id: no-blocking-requests-in-async
+valid:
+  - |
+    import requests
+
+    def fetch_sync():
+        return requests.get("http://example.test")
+  - |
+    async def fetch_async(client):
+        return await client.get("/health")
+invalid:
+  - |
+    import requests
+
+    async def fetch_async():
+        return requests.get("http://example.test")
+  - |
+    async def post_async(payload):
+        response = requests.post("http://example.test", json=payload)
+        return response.json()

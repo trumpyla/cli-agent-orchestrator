@@ -1,0 +1,29 @@
+id: no-empty-command-in-http-mcp
+language: Python
+severity: error
+message: HTTP MCP entries must not contain a synthetic empty command
+note: Emit only the provider-native URL form for commandless HTTP MCP servers.
+rule:
+  all:
+    - kind: dictionary
+    - has:
+        pattern:
+          context: '{"command": ""}'
+          selector: pair
+        stopBy: end
+    - any:
+        - has:
+            pattern:
+              context: '{"url": $URL}'
+              selector: pair
+            stopBy: end
+        - has:
+            pattern:
+              context: '{"httpUrl": $URL}'
+              selector: pair
+            stopBy: end
+        - has:
+            pattern:
+              context: '{"type": "http"}'
+              selector: pair
+            stopBy: end

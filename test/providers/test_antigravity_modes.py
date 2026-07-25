@@ -10,6 +10,7 @@ bypass or downgrading the mode.
 from __future__ import annotations
 
 import shutil
+import subprocess
 
 import pytest
 
@@ -91,3 +92,17 @@ class TestInstalledModeProbe:
         modes = _agy_supported_modes()
         assert "plan" in modes
         assert "accept-edits" in modes
+
+    @pytest.mark.skipif(shutil.which("agy") is None, reason="agy not installed")
+    def test_installed_agy_documents_direct_url_mcp_entries(self) -> None:
+        """Characterize the exact installed CLI surface used by this rollout."""
+        executable = shutil.which("agy")
+        assert executable is not None
+        completed = subprocess.run(
+            [executable, "changelog"],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        assert "Added support for `url` in `mcp_config.json`" in completed.stdout

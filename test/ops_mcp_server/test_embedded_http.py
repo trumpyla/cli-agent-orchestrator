@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
@@ -218,6 +219,24 @@ async def _notify_initialized(
     )
 
 
+async def _subscribe_peer(
+    client: httpx.AsyncClient,
+    session_id: str,
+    *,
+    peer_id: str = "deadbeef",
+) -> httpx.Response:
+    return await client.post(
+        "/mcp/ops",
+        headers=_mcp_headers(session_id=session_id),
+        json={
+            "jsonrpc": "2.0",
+            "id": 90,
+            "method": "resources/subscribe",
+            "params": {"uri": f"cao://peers/{peer_id}/inbox"},
+        },
+    )
+
+
 async def _assert_initialize_list_call(
     client: httpx.AsyncClient,
     *,
@@ -263,6 +282,73 @@ async def _assert_initialize_list_call(
     assert call_result.get("isError", False) is False
     assert call_result["structuredContent"]["success"] is True
     return session_id
+
+
+@pytest.mark.asyncio
+async def test_streamable_http_delete_cancels_session_owned_peer_subscription(
+    stack_factory: Callable[[], AbstractAsyncContextManager[EmbeddedStack]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MCP DELETE must not retain a consumer or its session/auth context."""
+    monkeypatch.setattr(ops_server, "is_auth_enabled", lambda: False)
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def stalled_consumer(peer_id: str, session: Any) -> None:
+        del peer_id, session
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(ops_server, "_consume_inbox", stalled_consumer)
+    async with stack_factory() as stack:
+        initialized, session_id = await _initialize(stack.client)
+        assert initialized.status_code == 200
+        assert session_id is not None
+        assert (await _notify_initialized(stack.client, session_id, None)).status_code in {200, 202}
+
+        subscribed = await _subscribe_peer(stack.client, session_id)
+        assert subscribed.status_code == 200
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+        deleted = await stack.client.delete(
+            "/mcp/ops",
+            headers=_mcp_headers(session_id=session_id),
+        )
+        assert deleted.status_code == 200
+        await asyncio.wait_for(stopped.wait(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_host_lifespan_shutdown_cancels_all_peer_subscriptions(
+    stack_factory: Callable[[], AbstractAsyncContextManager[EmbeddedStack]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Host shutdown must clean consumers even when the client omits DELETE."""
+    monkeypatch.setattr(ops_server, "is_auth_enabled", lambda: False)
+    started = asyncio.Event()
+    stopped = asyncio.Event()
+
+    async def stalled_consumer(peer_id: str, session: Any) -> None:
+        del peer_id, session
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    monkeypatch.setattr(ops_server, "_consume_inbox", stalled_consumer)
+    async with stack_factory() as stack:
+        initialized, session_id = await _initialize(stack.client)
+        assert initialized.status_code == 200
+        assert session_id is not None
+        assert (await _notify_initialized(stack.client, session_id, None)).status_code in {200, 202}
+        assert (await _subscribe_peer(stack.client, session_id)).status_code == 200
+        await asyncio.wait_for(started.wait(), timeout=1)
+
+    await asyncio.wait_for(stopped.wait(), timeout=1)
 
 
 @pytest.mark.asyncio

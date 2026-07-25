@@ -1,0 +1,43 @@
+id: no-empty-command-in-http-mcp
+snapshots:
+  ? |
+    agy_http_entry = {"httpUrl": endpoint, "command": ""}
+  : labels:
+    - source: '{"httpUrl": endpoint, "command": ""}'
+      style: primary
+      start: 17
+      end: 53
+    - source: '"command": ""'
+      style: secondary
+      start: 39
+      end: 52
+    - source: '"httpUrl": endpoint'
+      style: secondary
+      start: 18
+      end: 37
+  ? |
+    http_entry = {
+        "type": "http",
+        "url": endpoint,
+        "command": "",
+        "args": [],
+    }
+  : labels:
+    - source: |-
+        {
+            "type": "http",
+            "url": endpoint,
+            "command": "",
+            "args": [],
+        }
+      style: primary
+      start: 13
+      end: 92
+    - source: '"command": ""'
+      style: secondary
+      start: 60
+      end: 73
+    - source: '"url": endpoint'
+      style: secondary
+      start: 39
+      end: 54

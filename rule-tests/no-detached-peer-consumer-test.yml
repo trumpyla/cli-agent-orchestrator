@@ -1,0 +1,18 @@
+id: no-detached-peer-consumer
+valid:
+  - |
+    async def subscribe(task_group, key, peer_id, session, backend, handle):
+        task_group.start_soon(
+            _run_peer_consumer,
+            key,
+            peer_id,
+            session,
+            backend,
+            handle,
+        )
+invalid:
+  - |
+    import asyncio
+
+    async def subscribe(peer_id, session):
+        asyncio.create_task(_consume_inbox(peer_id, session))

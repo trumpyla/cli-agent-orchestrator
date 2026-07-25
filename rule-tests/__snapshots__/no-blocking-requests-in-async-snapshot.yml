@@ -1,0 +1,34 @@
+id: no-blocking-requests-in-async
+snapshots:
+  ? |
+    async def post_async(payload):
+        response = requests.post("http://example.test", json=payload)
+        return response.json()
+  : labels:
+    - source: requests.post("http://example.test", json=payload)
+      style: primary
+      start: 46
+      end: 96
+    - source: |-
+        async def post_async(payload):
+            response = requests.post("http://example.test", json=payload)
+            return response.json()
+      style: secondary
+      start: 0
+      end: 123
+  ? |
+    import requests
+
+    async def fetch_async():
+        return requests.get("http://example.test")
+  : labels:
+    - source: requests.get("http://example.test")
+      style: primary
+      start: 53
+      end: 88
+    - source: |-
+        async def fetch_async():
+            return requests.get("http://example.test")
+      style: secondary
+      start: 17
+      end: 88

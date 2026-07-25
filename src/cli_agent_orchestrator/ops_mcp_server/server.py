@@ -6,9 +6,11 @@ import logging
 import re
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from dataclasses import dataclass, field
 from functools import wraps
 from typing import Annotated, Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
+import anyio
 import httpx
 import jwt
 import requests  # type: ignore[import-untyped]
@@ -1193,7 +1195,31 @@ async def peer_inbox_resource(peer_id: str) -> str:
 # (receive_messages) stays the client-agnostic fallback.
 
 _PEER_URI_RE = re.compile(r"^cao://peers/([a-f0-9]{8})/inbox$")
-_peer_consumers: Dict[Tuple[int, str], "asyncio.Task[None]"] = {}
+
+
+@dataclass
+class _PeerConsumerHandle:
+    """Cancelable handle for a consumer owned by FastMCP's session task group."""
+
+    cancel_scope: anyio.CancelScope | None = None
+    ready: anyio.Event = field(default_factory=anyio.Event)
+    done: anyio.Event = field(default_factory=anyio.Event)
+
+    @property
+    def is_done(self) -> bool:
+        return self.done.is_set()
+
+    def cancel(self) -> None:
+        if self.cancel_scope is not None:
+            self.cancel_scope.cancel()
+
+    async def cancel_and_wait(self) -> None:
+        await self.ready.wait()
+        self.cancel()
+        await self.done.wait()
+
+
+_SESSION_TASKS_ATTR = "_cao_peer_session_tasks"
 
 
 def _peer_inbox_uri(peer_id: str) -> str:
@@ -1269,6 +1295,133 @@ async def _consume_inbox(peer_id: str, session: Any) -> None:
         last_notified_id = max(newer_ids)
 
 
+@dataclass
+class FastMcp32SessionTasks:
+    """Own unbounded peer consumers inside one FastMCP 3.2 session.
+
+    The adapter deliberately characterizes FastMCP/MCP 3.2's private
+    ``BaseSession._task_group`` and ``BaseSession._exit_stack`` seams. The
+    former is canceled by ``BaseSession.__aexit__`` after a Streamable HTTP
+    DELETE closes the transport; the latter lets this adapter cancel and await
+    its children before that group is torn down.
+
+    State is attached to the session object itself. There is no daemon-global
+    registry and no integer ``id(session)`` identity that can be reused.
+    """
+
+    session: Any
+    backend: AsyncRequestBackend | None
+    _consumers: Dict[str, _PeerConsumerHandle] = field(default_factory=dict)
+    _closed: bool = False
+    _task_group: Any = field(init=False, repr=False)
+
+    def __post_init__(self) -> None:
+        task_group = getattr(self.session, "_task_group", None)
+        exit_stack = getattr(self.session, "_exit_stack", None)
+        if task_group is None or exit_stack is None:
+            raise RuntimeError("FastMCP 3.2 session task ownership seam is unavailable")
+        push_callback = getattr(exit_stack, "push_async_callback", None)
+        if not callable(push_callback):
+            raise RuntimeError("FastMCP 3.2 session finalization seam is unavailable")
+        self._task_group = task_group
+        push_callback(self.aclose)
+
+    @classmethod
+    def attach(
+        cls,
+        session: Any,
+        backend: AsyncRequestBackend | None,
+    ) -> "FastMcp32SessionTasks":
+        existing = getattr(session, _SESSION_TASKS_ATTR, None)
+        if existing is not None:
+            if not isinstance(existing, cls):
+                raise RuntimeError("FastMCP 3.2 session task ownership seam is occupied")
+            if existing.backend is not backend:
+                raise RuntimeError("FastMCP session cannot be rebound to another request backend")
+            return existing
+        adapter = cls(session=session, backend=backend)
+        setattr(session, _SESSION_TASKS_ATTR, adapter)
+        return adapter
+
+    @property
+    def consumer_count(self) -> int:
+        return len(self._consumers)
+
+    async def subscribe(self, peer_id: str) -> None:
+        if self._closed:
+            raise RuntimeError("FastMCP session is closing")
+        existing = self._consumers.get(peer_id)
+        if existing is not None and not existing.is_done:
+            return
+        handle = _PeerConsumerHandle()
+        self._consumers[peer_id] = handle
+        try:
+            self._task_group.start_soon(
+                self._run_peer_consumer,
+                peer_id,
+                handle,
+            )
+            await handle.ready.wait()
+        except BaseException:
+            if self._consumers.get(peer_id) is handle:
+                self._consumers.pop(peer_id, None)
+            raise
+
+    async def unsubscribe(self, peer_id: str) -> None:
+        handle = self._consumers.get(peer_id)
+        if handle is None:
+            return
+        await handle.cancel_and_wait()
+        if self._consumers.get(peer_id) is handle:
+            self._consumers.pop(peer_id, None)
+
+    async def aclose(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        handles = list(self._consumers.values())
+        # Transport termination reaches BaseSession.__aexit__ from an already
+        # cancelled scope. Shield this bounded cleanup so every child observes
+        # cancellation and completes before the owning task group is torn down.
+        with anyio.CancelScope(shield=True):
+            if handles:
+                await asyncio.gather(
+                    *(handle.cancel_and_wait() for handle in handles),
+                )
+        self._consumers.clear()
+
+    async def _run_peer_consumer(
+        self,
+        peer_id: str,
+        handle: _PeerConsumerHandle,
+    ) -> None:
+        try:
+            with anyio.CancelScope() as cancel_scope:
+                handle.cancel_scope = cancel_scope
+                handle.ready.set()
+                token = _active_backend.set(self.backend) if self.backend is not None else None
+                try:
+                    await _consume_inbox(peer_id, self.session)
+                finally:
+                    if token is not None:
+                        _active_backend.reset(token)
+        except Exception:
+            # A notification/long-poll failure must not crash the MCP session.
+            # _consume_inbox handles recoverable failures; this is the final
+            # containment boundary.
+            logger.debug(
+                "peer-inbox: consumer task failed (%s)",
+                peer_id,
+                exc_info=True,
+            )
+        finally:
+            if self._consumers.get(peer_id) is handle:
+                self._consumers.pop(peer_id, None)
+            if not handle.ready.is_set():
+                handle.ready.set()
+            handle.done.set()
+
+
 def _setup_peer_subscribe(
     server: FastMCP,
     backend: AsyncRequestBackend | None = None,
@@ -1285,7 +1438,6 @@ def _setup_peer_subscribe(
     if getattr(low, "_cao_peer_subscribe_setup", False):
         return
     low._cao_peer_subscribe_setup = True
-
     # 1) Flip resources.subscribe=True in the initialize response.
     original_init = low.create_initialization_options
 
@@ -1319,38 +1471,8 @@ def _setup_peer_subscribe(
             except LookupError:
                 logger.debug("peer-inbox: no request-context session on subscribe for %s", peer_id)
                 return
-            key = (id(session), peer_id)
-            existing = _peer_consumers.get(key)
-            if existing is not None and not existing.done():
-                return
-            if backend is None:
-                task = asyncio.create_task(_consume_inbox(peer_id, session))
-            else:
-                token = _active_backend.set(backend)
-                try:
-                    task = asyncio.create_task(_consume_inbox(peer_id, session))
-                finally:
-                    _active_backend.reset(token)
-            _peer_consumers[key] = task
-
-            def _remove_completed(completed: "asyncio.Task[None]") -> None:
-                if _peer_consumers.get(key) is completed:
-                    _peer_consumers.pop(key, None)
-                if completed.cancelled():
-                    return
-                try:
-                    error = completed.exception()
-                except Exception:
-                    logger.debug("peer-inbox: could not inspect consumer task", exc_info=True)
-                    return
-                if error is not None:
-                    logger.debug(
-                        "peer-inbox: consumer task failed (%s)",
-                        peer_id,
-                        exc_info=(type(error), error, error.__traceback__),
-                    )
-
-            task.add_done_callback(_remove_completed)
+            tasks = FastMcp32SessionTasks.attach(session, backend)
+            await tasks.subscribe(peer_id)
 
         @low.unsubscribe_resource()
         async def _on_unsubscribe(uri: Any) -> None:
@@ -1362,18 +1484,8 @@ def _setup_peer_subscribe(
             except LookupError:
                 logger.debug("peer-inbox: no request-context session on unsubscribe")
                 return
-            task = _peer_consumers.pop((id(session), match.group(1)), None)
-            if task is not None:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-                except Exception:
-                    logger.debug(
-                        "peer-inbox: failed consumer observed during unsubscribe",
-                        exc_info=True,
-                    )
+            tasks = FastMcp32SessionTasks.attach(session, backend)
+            await tasks.unsubscribe(match.group(1))
 
     except Exception:
         logger.warning("peer-inbox: could not register MCP subscribe handlers", exc_info=True)

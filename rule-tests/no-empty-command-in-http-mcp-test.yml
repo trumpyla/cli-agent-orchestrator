@@ -1,0 +1,18 @@
+id: no-empty-command-in-http-mcp
+valid:
+  - |
+    stdio_entry = {"command": "python", "args": ["-m", "server"]}
+  - |
+    http_entry = {"type": "http", "url": endpoint}
+  - |
+    agy_http_entry = {"httpUrl": endpoint}
+invalid:
+  - |
+    http_entry = {
+        "type": "http",
+        "url": endpoint,
+        "command": "",
+        "args": [],
+    }
+  - |
+    agy_http_entry = {"httpUrl": endpoint, "command": ""}

@@ -247,6 +247,20 @@ jobs:
       - name: Install dependencies
         run: uv sync --all-extras --dev
 
+      - name: Set up Node.js for ast-grep
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install pinned ast-grep
+        run: npm install --global @ast-grep/cli@0.44.1
+
+      - name: Test structural rules
+        run: make sg-test
+
+      - name: Scan structural rules
+        run: make sg-scan
+
       - name: Check code formatting with black
         run: uv run black --check src/ test/
 

@@ -1,0 +1,12 @@
+id: no-detached-peer-consumer
+snapshots:
+  ? |
+    import asyncio
+
+    async def subscribe(peer_id, session):
+        asyncio.create_task(_consume_inbox(peer_id, session))
+  : labels:
+    - source: asyncio.create_task(_consume_inbox(peer_id, session))
+      style: primary
+      start: 59
+      end: 112

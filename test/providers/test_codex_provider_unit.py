@@ -565,6 +565,42 @@ class TestCodexProviderCodexProfile:
         assert "--profile" not in command
 
 
+class TestCodexProviderPermissionMode:
+    """Explicit read-only plan mode must override CAO's unattended yolo default."""
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_plan_mode_uses_native_read_only_sandbox_even_with_unrestricted_tools(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_profile.codexConfig = None
+        mock_profile.permissionMode = "plan"
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider(
+            "tid",
+            "sess",
+            "win",
+            "reviewer",
+            allowed_tools=["*"],
+        )
+        command = provider._build_codex_command()
+        argv = shlex.split(command)
+
+        assert argv[:6] == [
+            "codex",
+            "--sandbox",
+            "read-only",
+            "--ask-for-approval",
+            "never",
+            "--no-alt-screen",
+        ]
+        assert "--yolo" not in argv
+        assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+
+
 class TestTomlScalar:
     """Tests for ``_toml_scalar`` TOML-literal serialization."""
 

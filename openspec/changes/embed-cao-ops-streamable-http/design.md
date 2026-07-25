@@ -121,10 +121,13 @@ exception text, and validation inputs do not enter logs or responses.
 
 The dependency range is `fastmcp>=3.2.0,<3.3.0`. A narrow
 `FastMcp32SessionTasks` compatibility adapter characterizes the installed
-`MiddlewareServerSession._subscription_task_group` seam. It attaches one
+`BaseSession._task_group` and `BaseSession._exit_stack` seams. It attaches one
 resource-to-cancel-scope registry to the session object, starts workers through
-the owning task group, and fails closed rather than falling back to
-`asyncio.create_task` when the seam is unavailable.
+the owning task group, registers deterministic finalization on the session exit
+stack, and fails closed rather than falling back to `asyncio.create_task` when
+either seam is unavailable. FastMCP's outer `_subscription_task_group` is not
+used for an unbounded inbox poll because normal task-group exit would wait for
+that child before `BaseSession.__aexit__` could cancel it.
 
 Unsubscribe cancels and awaits the matching worker before removing its entry.
 Explicit MCP DELETE, session-manager failure, and host lifespan shutdown cancel
@@ -179,7 +182,11 @@ zero-task cleanup assertions.
   `tool_timeout_sec=600.0` remains valid for HTTP, but HTTP entries receive no
   command, args, env, or env_vars.
 - Claude emits `{"type": "http", "url": "..."}` with no subprocess fields.
-- Antigravity emits `{"httpUrl": "..."}` with no command, args, or env.
+- Antigravity CLI emits its direct-HTTP `{"url": "..."}` form with no
+  command, args, or env. Installed Agy 1.1.7's changelog records direct `url`
+  support from 1.0.5, and Google's current Antigravity changelog confirms that
+  `mcp_config.json` accepts `url` in addition to the older `serverUrl` alias.
+  The Gemini CLI-only `httpUrl` field is not emitted.
 - Kimi 0.29 writes a per-terminal `.kimi-code/mcp.json` beneath its unique
   temporary working directory. HTTP entries are `{"url": "..."}` with no
   `type`, `transport`, or subprocess fields; stdio entries retain command,

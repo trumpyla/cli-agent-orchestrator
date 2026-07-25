@@ -72,9 +72,8 @@ class TestTranslationRegistry:
         ["codex", "claude_code", "antigravity_cli", "kimi_cli"],
     )
     def test_no_provider_emits_the_stale_httpurl_field(self, provider: str) -> None:
-        # Break guarded: ``httpUrl`` was a drafted Antigravity field that the
-        # official mcp_config.json surface never accepted. Emitting it would
-        # register a server agy silently ignores, so NO provider may produce it.
+        # Break guarded: ``httpUrl`` is Gemini CLI's field, not the direct URL
+        # field accepted by Agy CLI's mcp_config.json surface.
         assert "httpUrl" not in render_http_entry(provider, _OPS_URL)
 
     def test_codex_http_fields_have_no_subprocess_keys(self) -> None:
@@ -232,9 +231,9 @@ class TestAntigravityHttpMapping:
 
         entry = json.loads(cfg.read_text())["mcpServers"]["cao-ops"]
         assert entry == {"url": _OPS_URL}
-        # Break guarded: the drafted ``httpUrl`` key is stale — agy's
-        # mcp_config.json accepts ``url`` for a direct MCP server, so emitting
-        # httpUrl registers a server the CLI silently ignores.
+        # Break guarded: Agy CLI's mcp_config.json accepts ``url`` for a direct
+        # MCP server. ``httpUrl`` belongs to Gemini CLI and must not leak into
+        # this provider's config.
         for forbidden in ("httpUrl", "command", "args", "env"):
             assert forbidden not in entry
 

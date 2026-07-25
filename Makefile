@@ -4,7 +4,7 @@
 # Offline vendoring of the upstream MCP Apps builder skills
 # (modelcontextprotocol/ext-apps). See skills/vendor/ext-apps/README.md.
 
-.PHONY: refresh-ext-apps-skills check-ext-apps-skills
+.PHONY: refresh-ext-apps-skills check-ext-apps-skills sg-test sg-scan
 
 # Re-vendor the ext-apps builder skills from the pinned tag and rewrite NOTICE.
 # To move to a newer upstream release, bump PINNED_REF/PINNED_SHA in
@@ -16,3 +16,11 @@ refresh-ext-apps-skills:
 # Exit 0 = in sync, 1 = drift, 2 = network-gated (could not verify).
 check-ext-apps-skills:
 	uv run python scripts/vendor_ext_apps_skills.py --check
+
+# Exercise every structural rule against its positive and negative fixtures.
+sg-test:
+	sg test
+
+# Fail closed when a structural rule matches repository source or tests.
+sg-scan:
+	sg scan --error

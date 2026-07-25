@@ -68,7 +68,8 @@ compatible.
 
 #### Scenario: Antigravity HTTP mapping
 - **WHEN** Antigravity launches with an HTTP entry
-- **THEN** its native configuration contains `httpUrl` and no command, args, or env
+- **THEN** its native CLI configuration contains `url` and no command, args, or env
+- **AND** it does not emit Gemini CLI's `httpUrl` field
 
 #### Scenario: Kimi HTTP mapping
 - **WHEN** Kimi 0.29 launches with an HTTP entry

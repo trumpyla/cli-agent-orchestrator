@@ -1,6 +1,7 @@
 """Tests for terminal utilities."""
 
 import asyncio
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -225,6 +226,41 @@ class TestWaitForShellEventInbox:
         assert result is True
         backend.get_history.assert_called_with("sess", "win", strip_escapes=True)
         mock_monitor.get_buffer.assert_not_called()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.manager.provider_manager")
+    @patch("cli_agent_orchestrator.backends.registry.get_backend")
+    @patch("cli_agent_orchestrator.services.status_monitor.status_monitor")
+    async def test_blocking_event_inbox_history_read_does_not_starve_event_loop(
+        self, mock_monitor, mock_get_backend, mock_pm
+    ):
+        heartbeat = asyncio.Event()
+
+        def slow_history(*args, **kwargs):
+            time.sleep(0.1)
+            return "user@host:~$ "
+
+        backend = self._backend(history="")
+        backend.get_history.side_effect = slow_history
+        mock_get_backend.return_value = backend
+        mock_pm.get_provider.return_value = self._provider()
+
+        async def beat() -> None:
+            await asyncio.sleep(0.01)
+            heartbeat.set()
+
+        heartbeat_task = asyncio.create_task(beat())
+        await asyncio.sleep(0)
+        result = await wait_for_shell(
+            "t1",
+            timeout=0.5,
+            stable_duration=0.0,
+            polling_interval=0.01,
+        )
+
+        assert result is True
+        assert heartbeat.is_set(), "blocking backend history read starved the asyncio loop"
+        await heartbeat_task
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.manager.provider_manager")

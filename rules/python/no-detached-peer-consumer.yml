@@ -1,0 +1,7 @@
+id: no-detached-peer-consumer
+language: Python
+severity: error
+message: Peer inbox consumers must be started by the owning MCP session task group
+note: Detached consumers retain session and authentication state after disconnect.
+rule:
+  pattern: asyncio.create_task(_consume_inbox($$$ARGS))
