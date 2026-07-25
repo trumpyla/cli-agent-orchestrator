@@ -1793,13 +1793,13 @@ class TestClaudeCodeProviderMisc:
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env(self, mock_load):
-        """Test that existing env vars in MCP config are preserved when injecting CAO_TERMINAL_ID."""
+        """Injecting CAO_TERMINAL_ID preserves the entry's other env vars."""
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
-            "my-server": {
-                "command": "my-server",
+            "cao-mcp-server": {
+                "command": "cao-mcp-server",
                 "env": {"MY_VAR": "my_value", "OTHER": "other_value"},
             }
         }
@@ -1810,7 +1810,7 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         mcp_data = _extract_mcp_config(command)
-        server_env = mcp_data["mcpServers"]["my-server"]["env"]
+        server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         # Original vars preserved
         assert server_env["MY_VAR"] == "my_value"
         assert server_env["OTHER"] == "other_value"
@@ -1818,15 +1818,20 @@ class TestClaudeCodeProviderMisc:
         assert server_env["CAO_TERMINAL_ID"] == "term-99"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
-    def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):
-        """Test that an existing CAO_TERMINAL_ID in MCP env is NOT overwritten."""
+    def test_build_command_mcp_replaces_stale_terminal_id(self, mock_load):
+        """A CAO_TERMINAL_ID already in the profile env is stale and is replaced.
+
+        Callback identity belongs to the terminal being created, not to whatever
+        a profile (or a copied-around profile) happens to carry: a surviving old
+        id would make this terminal's callbacks attribute to another terminal.
+        """
         mock_profile = MagicMock()
         mock_profile.model = None
         mock_profile.system_prompt = None
         mock_profile.mcpServers = {
-            "my-server": {
-                "command": "my-server",
-                "env": {"CAO_TERMINAL_ID": "user-provided-id"},
+            "cao-mcp-server": {
+                "command": "cao-mcp-server",
+                "env": {"CAO_TERMINAL_ID": "stale-profile-id"},
             }
         }
         mock_profile.permissionMode = None
@@ -1836,9 +1841,24 @@ class TestClaudeCodeProviderMisc:
         command = provider._build_claude_command()
 
         mcp_data = _extract_mcp_config(command)
-        server_env = mcp_data["mcpServers"]["my-server"]["env"]
-        # Should keep the user-provided value, NOT overwrite with term-99
-        assert server_env["CAO_TERMINAL_ID"] == "user-provided-id"
+        server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
+        assert server_env["CAO_TERMINAL_ID"] == "term-99"
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_build_command_mcp_no_identity_for_third_party_server(self, mock_load):
+        """A non-orchestration MCP server is never handed the terminal identity."""
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = {"my-server": {"command": "my-server", "args": []}}
+        mock_profile.permissionMode = None
+        mock_load.return_value = mock_profile
+
+        provider = ClaudeCodeProvider("term-99", "test-session", "window-0", "test-agent")
+        command = provider._build_claude_command()
+
+        entry = _extract_mcp_config(command)["mcpServers"]["my-server"]
+        assert "CAO_TERMINAL_ID" not in (entry.get("env") or {})
 
 
 class TestClaudeCodeProviderContainerPathTranslation:

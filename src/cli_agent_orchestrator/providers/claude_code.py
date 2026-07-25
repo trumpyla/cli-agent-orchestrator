@@ -16,10 +16,18 @@ if TYPE_CHECKING:
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.mcp_server import HttpMcpServer, parse_mcp_server_entry
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.mcp_translation import claude_http_entry
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_launch import (
+    apply_terminal_identity,
+    is_identity_bearing_command,
+    resolve_http_url,
+    snapshot_process_env,
+)
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -372,26 +380,44 @@ class ClaudeCodeProvider(BaseProvider):
                 )
 
             # Add MCP config if present.
-            # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
-            # can identify the current terminal for handoff/assign operations.
-            # Claude Code does not automatically forward parent shell env vars
-            # to MCP subprocesses, so we inject it explicitly via the env field.
+            # Claude Code does not forward parent shell env vars to MCP
+            # subprocesses, so the identity-bearing cao-mcp-server entry gets
+            # this launch's CAO_TERMINAL_ID injected explicitly via ``env``.
             if profile.mcpServers:
                 mcp_config = {}
+                # One process-environment snapshot per launch for HTTP resolution.
+                env_snapshot = snapshot_process_env()
                 for server_name, server_config in profile.mcpServers.items():
-                    if isinstance(server_config, dict):
-                        mcp_config[server_name] = dict(server_config)
-                    else:
-                        mcp_config[server_name] = server_config.model_dump(exclude_none=True)
+                    # HTTP entries emit Claude's native {type:http,url} with no
+                    # subprocess fields and no CAO_TERMINAL_ID.
+                    entry = parse_mcp_server_entry(server_config, server_name=server_name)
+                    if isinstance(entry, HttpMcpServer):
+                        url = resolve_http_url(entry.url, env_snapshot, server_name=server_name)
+                        mcp_config[server_name] = claude_http_entry(url)
+                        continue
 
+                    # The narrowed model is the single serialization source: it
+                    # round-trips a legacy command entry byte-for-byte (declared
+                    # fields plus provider extras, unset keys dropped).
+                    mcp_config[server_name] = entry.model_dump(exclude_none=True)
+
+                    # Decided from what the PROFILE declared, before the command
+                    # is rewritten below.
+                    identity_bearing = is_identity_bearing_command(
+                        mcp_config[server_name].get("command"),
+                        mcp_config[server_name].get("args"),
+                    )
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
                     mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
 
-                    env = mcp_config[server_name].get("env", {})
-                    if "CAO_TERMINAL_ID" not in env:
-                        env["CAO_TERMINAL_ID"] = self.terminal_id
-                        mcp_config[server_name]["env"] = env
+                    # Fresh callback identity for THIS terminal: authoritative
+                    # over any stale value the profile carried.
+                    mcp_config[server_name] = apply_terminal_identity(
+                        mcp_config[server_name],
+                        terminal_id=self.terminal_id,
+                        identity_bearing=identity_bearing,
+                    )
 
                 tmp_dir = CAO_HOME_DIR / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)

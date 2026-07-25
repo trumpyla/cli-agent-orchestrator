@@ -45,21 +45,54 @@ import logging
 import re
 import shlex
 import shutil
+import subprocess
 import time
 from pathlib import Path
 from typing import List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import SECURITY_PROMPT
+from cli_agent_orchestrator.models.mcp_server import HttpMcpServer, parse_mcp_server_entry
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.mcp_translation import antigravity_http_entry
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_launch import (
+    apply_terminal_identity,
+    is_identity_bearing_command,
+    resolve_http_url,
+    snapshot_process_env,
+)
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_cao_mcp_command
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+
+# Antigravity native permission modes: a profile ``permissionMode`` maps to an
+# ``agy --mode`` value. Selecting a native mode omits the bypass flag entirely.
+_ANTIGRAVITY_NATIVE_MODES = {"plan": "plan", "acceptEdits": "accept-edits"}
+
+
+def _agy_supported_modes(binary: str = "agy") -> frozenset:
+    """Probe the installed ``agy`` for the native ``--mode`` values it accepts.
+
+    Reads ``agy --help`` and returns the subset of ``{"plan", "accept-edits"}``
+    the CLI advertises. Returns an empty set on any probe failure so an explicit
+    native-mode request fails closed instead of silently enabling bypass.
+    """
+    try:
+        result = subprocess.run([binary, "--help"], capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+    text = (result.stdout or "") + (result.stderr or "")
+    match = re.search(r"--mode\b[^\n]*", text)
+    if not match:
+        return frozenset()
+    line = match.group(0)
+    return frozenset(mode for mode in ("plan", "accept-edits") if mode in line)
 
 
 class ProviderError(Exception):
@@ -243,6 +276,24 @@ class AntigravityCliProvider(BaseProvider):
         """Path to agy's MCP config file (shared ~/.gemini/config/mcp_config.json)."""
         return Path.home() / ".gemini" / "config" / "mcp_config.json"
 
+    def _resolve_native_mode(self, profile: Optional["object"]) -> Optional[str]:
+        """Map a profile ``permissionMode`` to a validated native ``agy --mode``.
+
+        Returns ``None`` for profiles that do not request a native mode (they keep
+        the bypass flag). Raises ``ProviderError`` when the installed CLI cannot
+        support the requested mode — never silently degrading to bypass.
+        """
+        permission_mode = getattr(profile, "permissionMode", None)
+        if permission_mode not in _ANTIGRAVITY_NATIVE_MODES:
+            return None
+        native = _ANTIGRAVITY_NATIVE_MODES[permission_mode]
+        if native not in _agy_supported_modes():
+            raise ProviderError(
+                f"Antigravity CLI does not support native '--mode {native}'; "
+                "refusing to fall back to --dangerously-skip-permissions"
+            )
+        return native
+
     def _build_agy_command(self) -> str:
         """Build the ``agy`` launch command.
 
@@ -265,14 +316,20 @@ class AntigravityCliProvider(BaseProvider):
                 "Install via: curl -fsSL https://antigravity.google/cli/install.sh | bash"
             )
 
-        command_parts = ["agy", "--dangerously-skip-permissions"]
-
         profile = None
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
             except Exception as exc:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {exc}")
+
+        # A native permission mode (plan / accept-edits) replaces the bypass
+        # flag; any other profile keeps the historical unattended bypass.
+        native_mode = self._resolve_native_mode(profile)
+        if native_mode is not None:
+            command_parts = ["agy", "--mode", native_mode]
+        else:
+            command_parts = ["agy", "--dangerously-skip-permissions"]
 
         # Model: profile.model wins over the constructor-provided override.
         model = self._model
@@ -352,11 +409,26 @@ class AntigravityCliProvider(BaseProvider):
             )
             servers = {}
             config["mcpServers"] = servers
+        # One process-environment snapshot per launch for HTTP URL resolution.
+        env_snapshot = snapshot_process_env()
         for server_name, server_config in mcp_servers.items():
-            if isinstance(server_config, dict):
-                cfg = dict(server_config)
-            else:
-                cfg = server_config.model_dump(exclude_none=True)
+            # HTTP entries emit agy's native {url} with no command, args, or
+            # env — and never CAO_TERMINAL_ID. Any previously persisted entry
+            # for this name is replaced wholesale, so a stale identity or a
+            # stale httpUrl left by an earlier session cannot survive.
+            parsed = parse_mcp_server_entry(server_config, server_name=server_name)
+            if isinstance(parsed, HttpMcpServer):
+                url = resolve_http_url(parsed.url, env_snapshot, server_name=server_name)
+                servers[server_name] = antigravity_http_entry(url)
+                self._mcp_server_names.append(server_name)
+                continue
+            # The narrowed model is the single serialization source: it
+            # round-trips a legacy command entry byte-for-byte (declared fields
+            # plus provider extras, unset keys dropped).
+            cfg = parsed.model_dump(exclude_none=True)
+            # Whether this entry is the orchestration server is a property of
+            # what the PROFILE declared, decided before the command is rewritten.
+            identity_bearing = is_identity_bearing_command(cfg.get("command"), cfg.get("args"))
             # Resolve the bundled cao-mcp-server console script to a
             # PATH-independent invocation. persisted=True: this command is
             # written to mcp_config.json and read by agy at later launches,
@@ -369,10 +441,10 @@ class AntigravityCliProvider(BaseProvider):
             entry: dict = dict(cfg)
             entry["command"] = command
             entry["args"] = args
-            env = dict(cfg.get("env", {}))
-            env["CAO_TERMINAL_ID"] = self.terminal_id
-            entry["env"] = env
-            servers[server_name] = entry
+            # Fresh callback identity for THIS terminal.
+            servers[server_name] = apply_terminal_identity(
+                entry, terminal_id=self.terminal_id, identity_bearing=identity_bearing
+            )
             self._mcp_server_names.append(server_name)
 
         with open(path, "w") as f:
