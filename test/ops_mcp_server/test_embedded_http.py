@@ -218,6 +218,53 @@ async def _notify_initialized(
     )
 
 
+async def _assert_initialize_list_call(
+    client: httpx.AsyncClient,
+    *,
+    request_id: int,
+) -> str:
+    """Exercise the retained-session protocol through one exact MCP endpoint."""
+    initialized, session_id = await _initialize(client)
+    assert initialized.status_code == 200
+    assert initialized.history == []
+    assert initialized.url.path == "/mcp/ops"
+    assert session_id is not None
+    assert _jsonrpc_body(initialized)["result"]["serverInfo"]["name"] == "cao-ops-mcp"
+
+    notification = await _notify_initialized(client, session_id, None)
+    assert notification.status_code in {200, 202}
+
+    listed = await client.post(
+        "/mcp/ops",
+        headers=_mcp_headers(session_id=session_id),
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "tools/list",
+            "params": {},
+        },
+    )
+    assert listed.status_code == 200
+    tool_names = {tool["name"] for tool in _jsonrpc_body(listed)["result"]["tools"]}
+    assert "list_sessions" in tool_names
+
+    called = await client.post(
+        "/mcp/ops",
+        headers=_mcp_headers(session_id=session_id),
+        json={
+            "jsonrpc": "2.0",
+            "id": request_id + 1,
+            "method": "tools/call",
+            "params": {"name": "list_sessions", "arguments": {}},
+        },
+    )
+    assert called.status_code == 200
+    call_result = _jsonrpc_body(called)["result"]
+    assert call_result.get("isError", False) is False
+    assert call_result["structuredContent"]["success"] is True
+    return session_id
+
+
 @pytest.mark.asyncio
 async def test_exact_mcp_path_initializes_without_redirect_when_auth_disabled(
     stack_factory: Callable[[], AbstractAsyncContextManager[EmbeddedStack]],
@@ -436,6 +483,58 @@ async def test_current_refresh_header_reaches_rest_and_read_scope_stays_authorit
         assert stack.rest_authorizations == ["Bearer fresh-read-token"]
 
 
+@pytest.mark.asyncio
+async def test_application_lifespan_reentry_uses_fresh_mcp_state_and_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reusing a closed stateful manager breaks the second host lifecycle."""
+    monkeypatch.setattr(ops_server, "is_auth_enabled", lambda: False)
+    backend_instances: list[AsgiRequestBackend] = []
+    backend_type = api_main.AsgiRequestBackend
+
+    class RecordingBackend(backend_type):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            backend_instances.append(self)
+
+    monkeypatch.setattr(api_main, "AsgiRequestBackend", RecordingBackend)
+
+    first_session_id: str | None = None
+    for lifecycle_entry in range(2):
+        async with api_main.app.router.lifespan_context(api_main.app):
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=api_main.app),
+                base_url="http://localhost",
+                follow_redirects=False,
+            ) as client:
+                if first_session_id is not None:
+                    stale = await client.post(
+                        "/mcp/ops",
+                        headers=_mcp_headers(session_id=first_session_id),
+                        json={
+                            "jsonrpc": "2.0",
+                            "id": 50,
+                            "method": "tools/list",
+                            "params": {},
+                        },
+                    )
+                    assert stale.status_code == 404
+                    assert _jsonrpc_body(stale)["error"]["message"] == "Session not found"
+
+                session_id = await _assert_initialize_list_call(
+                    client,
+                    request_id=10 + lifecycle_entry * 10,
+                )
+                if first_session_id is None:
+                    first_session_id = session_id
+
+    assert len(backend_instances) == 2
+    assert backend_instances[0] is not backend_instances[1]
+    for backend in backend_instances:
+        assert backend._client is not None
+        assert backend._client.is_closed is True
+
+
 def test_existing_host_surfaces_keep_health_trusted_host_and_websocket_routes() -> None:
     """Embedding must not displace existing host middleware or routes."""
     client = TestClient(api_main.app)
@@ -461,21 +560,51 @@ def test_existing_host_surfaces_keep_health_trusted_host_and_websocket_routes() 
 async def test_mcp_lifespan_startup_failure_propagates_without_degraded_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Swallowing child startup failure would serve a broken MCP mount."""
+    """A failed first start must close its backend and permit a fresh retry."""
+    monkeypatch.setattr(ops_server, "is_auth_enabled", lambda: False)
+    backend_instances: list[AsgiRequestBackend] = []
+    backend_type = api_main.AsgiRequestBackend
 
-    @asynccontextmanager
-    async def failing_lifespan(_application: FastAPI) -> AsyncIterator[None]:
-        raise RuntimeError("session manager failed")
-        yield  # pragma: no cover
+    class FailFirstStartBackend(backend_type):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            backend_instances.append(self)
 
-    monkeypatch.setattr(api_main, "_first_application_lifespan", failing_lifespan)
-    monkeypatch.setattr(api_main, "_ops_lifespan_completed", False)
+        async def start(self) -> None:
+            if self is backend_instances[0]:
+                raise RuntimeError("session manager failed")
+
+    monkeypatch.setattr(api_main, "AsgiRequestBackend", FailFirstStartBackend)
 
     with pytest.raises(RuntimeError, match="session manager failed"):
-        async with api_main._application_lifespan(FastAPI()):
+        async with api_main.app.router.lifespan_context(api_main.app):
             raise AssertionError("startup failure was swallowed")
 
-    assert api_main._ops_lifespan_completed is False
+    assert len(backend_instances) == 1
+    assert backend_instances[0]._client is not None
+    assert backend_instances[0]._client.is_closed is True
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=api_main.app),
+        base_url="http://localhost",
+        follow_redirects=False,
+    ) as client:
+        unavailable, session_id = await _initialize(client)
+    assert unavailable.status_code == 503
+    assert session_id is None
+
+    async with api_main.app.router.lifespan_context(api_main.app):
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=api_main.app),
+            base_url="http://localhost",
+            follow_redirects=False,
+        ) as client:
+            await _assert_initialize_list_call(client, request_id=70)
+
+    assert len(backend_instances) == 2
+    assert backend_instances[0] is not backend_instances[1]
+    assert backend_instances[1]._client is not None
+    assert backend_instances[1]._client.is_closed is True
 
 
 @pytest.mark.asyncio
