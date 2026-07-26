@@ -87,13 +87,39 @@ load helpers/cao_service_test_helper
 }
 
 @test "held lifecycle lock rejects a concurrent command" {
-    setup_cao_service_test Linux
-    mkdir -p "${HOME}/.local/state/cao/controller.lock"
+  setup_cao_service_test Linux
+  mkdir -p "${HOME}/.local/state/cao/controller.lock"
+  printf '%s\n' "$$" >"${HOME}/.local/state/cao/controller.lock/owner_pid"
 
-    run_service status
+  run_service status
 
-    assert_failure
-    assert_output_contains "lifecycle operation is already running"
+  assert_failure
+  assert_output_contains "lifecycle operation is already running"
+}
+
+@test "stale lifecycle lock is recovered without broad process cleanup" {
+  setup_cao_service_test Linux
+  mkdir -p "${HOME}/.local/state/cao/controller.lock"
+  printf '%s\n' "99999999" \
+    >"${HOME}/.local/state/cao/controller.lock/owner_pid"
+
+  run_service status
+
+  assert_failure
+  refute_output_contains "lifecycle operation is already running"
+  refute_file_exists "${HOME}/.local/state/cao/controller.lock"
+}
+
+@test "symlinked state directory fails closed" {
+  setup_cao_service_test Darwin
+  mkdir -p "${TEST_ROOT}/redirected-state"
+  mkdir -p "${HOME}/.local/state"
+  ln -s "${TEST_ROOT}/redirected-state" "${HOME}/.local/state/cao"
+
+  run_service status
+
+  assert_failure
+  assert_output_contains "state directory must not be a symlink"
 }
 
 @test "unmanaged listener blocks install without kill or adoption" {

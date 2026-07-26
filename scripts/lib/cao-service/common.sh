@@ -26,6 +26,30 @@ cao_service::require_command() {
     cao_service::die "required command not found: $1"
 }
 
+# Print a path owner's numeric UID on supported platforms.
+cao_service::path_owner() {
+  case "${CAO_SERVICE_PLATFORM}" in
+    Darwin) stat -f '%u' "$1" ;;
+    Linux) stat -c '%u' "$1" ;;
+  esac
+}
+
+# Create a private directory or validate an existing user-owned directory.
+cao_service::ensure_private_directory() {
+  local directory_path="$1"
+  if [[ -L "${directory_path}" ]]; then
+    cao_service::die "state directory must not be a symlink: ${directory_path}"
+  fi
+  if [[ -e "${directory_path}" && ! -d "${directory_path}" ]]; then
+    cao_service::die "private path is not a directory: ${directory_path}"
+  fi
+  mkdir -p "${directory_path}"
+  if [[ "$(cao_service::path_owner "${directory_path}")" != "${CAO_SERVICE_UID}" ]]; then
+    cao_service::die "private directory is not owned by the current user"
+  fi
+  chmod 700 "${directory_path}"
+}
+
 # Derive immutable user paths and load the native platform adapter.
 cao_service::init() {
   [[ -n "${HOME:-}" ]] || cao_service::die "HOME is not set"
@@ -77,7 +101,7 @@ cao_service::require_dependencies() {
   local command_name
   local commands=(
     awk basename cat chmod cmp cp curl dirname grep lsof mkdir mktemp
-    mv rm rmdir sed sleep
+    mv rm rmdir sed sleep stat
   )
   for command_name in "${commands[@]}"; do
     cao_service::require_command "${command_name}"
@@ -87,17 +111,35 @@ cao_service::require_dependencies() {
 
 # Serialize controller operations with an atomic directory lock.
 cao_service::acquire_lock() {
-  mkdir -p "${CAO_STATE_DIR}"
-  chmod 700 "${CAO_STATE_DIR}"
+  local owner_file owner_pid
+  cao_service::ensure_private_directory "${CAO_STATE_DIR}"
+  owner_file="${CAO_SERVICE_LOCK}/owner_pid"
   if ! mkdir "${CAO_SERVICE_LOCK}" 2>/dev/null; then
-    cao_service::die "lifecycle operation is already running"
+    if [[ -L "${CAO_SERVICE_LOCK}" ]]; then
+      cao_service::die "lifecycle lock must not be a symlink"
+    fi
+    owner_pid=""
+    if [[ -f "${owner_file}" ]]; then
+      IFS= read -r owner_pid <"${owner_file}"
+    fi
+    if [[ "${owner_pid}" =~ ^[0-9]+$ ]] && kill -0 "${owner_pid}" 2>/dev/null; then
+      cao_service::die "lifecycle operation is already running"
+    fi
+    rm -f "${owner_file}"
+    rmdir "${CAO_SERVICE_LOCK}" 2>/dev/null ||
+      cao_service::die "cannot safely recover stale lifecycle lock"
+    mkdir "${CAO_SERVICE_LOCK}" 2>/dev/null ||
+      cao_service::die "lifecycle operation is already running"
   fi
+  printf '%s\n' "$$" >"${owner_file}"
+  chmod 600 "${owner_file}"
   trap 'cao_service::release_lock' EXIT HUP INT TERM
 }
 
 # Release only the lock directory owned by this invocation.
 cao_service::release_lock() {
   if [[ -n "${CAO_SERVICE_LOCK:-}" && -d "${CAO_SERVICE_LOCK}" ]]; then
+    rm -f "${CAO_SERVICE_LOCK}/owner_pid"
     rmdir "${CAO_SERVICE_LOCK}" 2>/dev/null || true
   fi
 }
