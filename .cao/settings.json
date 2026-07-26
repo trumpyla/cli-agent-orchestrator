@@ -1,7 +1,7 @@
 {
   "skills": {
     "extra_dirs": [
-      "~/Projects/Artagon/artagon-ai-skills/plugins/artagon-python/skills"
+      "${CAO_ARTAGON_PYTHON_SKILLS_DIR}"
     ]
   }
 }

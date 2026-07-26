@@ -116,8 +116,10 @@ Skills (loaded on demand via the `load_skill` MCP tool) are discovered from, in 
 
 `skills.extra_dirs` lets you keep a project's skills in the project repo (e.g. `<repo>/.cao/skills`) and register the directory instead of copying/symlinking each skill into the global store.
 Repository entries may use `~`; relative entries are resolved from the
-repository root. Invalid repository settings fail closed, and discovery stops
-at the first Git worktree root.
+repository root. They may also be one exact `${ENV_NAME}` reference for a
+machine-local skill directory. Missing or malformed references fail closed
+without logging the variable name or resolved value. Invalid repository
+settings fail closed, and discovery stops at the first Git worktree root.
 
 For a launched terminal, CAO records its assigned working directory and uses
 that same repository context for both the advertised skill catalog and later

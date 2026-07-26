@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import requests
@@ -110,7 +111,10 @@ Returns:
 
 
 def _resolve_child_allowed_tools(
-    parent_allowed_tools: Optional[list], child_profile_name: str
+    parent_allowed_tools: Optional[list],
+    child_profile_name: str,
+    *,
+    start: Path | None = None,
 ) -> Optional[str]:
     """Resolve allowed_tools for a child terminal via intersection.
 
@@ -125,7 +129,11 @@ def _resolve_child_allowed_tools(
     from cli_agent_orchestrator.utils.tool_mapping import resolve_allowed_tools
 
     try:
-        child_profile = load_agent_profile(child_profile_name)
+        child_profile = (
+            load_agent_profile(child_profile_name, start=start)
+            if start is not None
+            else load_agent_profile(child_profile_name)
+        )
         mcp_server_names = (
             list(child_profile.mcpServers.keys()) if child_profile.mcpServers else None
         )
@@ -199,8 +207,6 @@ def _create_terminal(
         response.raise_for_status()
         terminal_metadata = response.json()
 
-        # Treat the supervisor provider as a fallback, not an explicit override.
-        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
         session_name = terminal_metadata["session_name"]
         parent_allowed_tools = terminal_metadata.get("allowed_tools")
 
@@ -224,8 +230,19 @@ def _create_terminal(
                     f"Error fetching conductor's working directory: {e}, will use server default"
                 )
 
+        profile_start = Path(working_directory) if working_directory else None
+        provider = resolve_provider(
+            agent_profile,
+            fallback_provider=terminal_metadata["provider"],
+            start=profile_start,
+        )
+
         # Resolve child's allowed_tools via inheritance
-        child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+        child_allowed_tools = _resolve_child_allowed_tools(
+            parent_allowed_tools,
+            agent_profile,
+            start=profile_start,
+        )
 
         # Create new terminal in existing session - always pass working_directory
         params = {"provider": provider, "agent_profile": agent_profile}
@@ -274,7 +291,11 @@ def _create_terminal(
                 "whose task would never be delivered."
             )
         session_name = generate_session_name()
-        provider = resolve_provider(agent_profile, fallback_provider=provider)
+        provider = resolve_provider(
+            agent_profile,
+            fallback_provider=provider,
+            start=Path(working_directory) if working_directory else None,
+        )
         params = {
             "provider": provider,
             "agent_profile": agent_profile,
@@ -510,7 +531,10 @@ class HandoffContext(NamedTuple):
     allowed_tools: Optional[list]
 
 
-def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
+def _resolve_handoff_provider(
+    agent_profile: str,
+    working_directory: Optional[str] = None,
+) -> HandoffContext:
     """Resolve the handoff context for a worker WITHOUT creating a terminal.
 
     Mirrors the resolution branch of the former ``_create_terminal``: a worker
@@ -539,12 +563,22 @@ def _resolve_handoff_provider(agent_profile: str) -> HandoffContext:
     response.raise_for_status()
     terminal_metadata = response.json()
 
-    provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+    profile_directory = working_directory or terminal_metadata.get("working_directory")
+    profile_start = Path(profile_directory) if profile_directory else None
+    provider = resolve_provider(
+        agent_profile,
+        fallback_provider=terminal_metadata["provider"],
+        start=profile_start,
+    )
     # Resolve the child's allowed-tools via the same inheritance the old path
     # used; _resolve_child_allowed_tools returns a comma-separated string (or
     # None for unrestricted), which we split into the list the payload expects.
     parent_allowed_tools = terminal_metadata.get("allowed_tools")
-    child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+    child_allowed_tools = _resolve_child_allowed_tools(
+        parent_allowed_tools,
+        agent_profile,
+        start=profile_start,
+    )
     allowed_tools_list = child_allowed_tools.split(",") if child_allowed_tools else None
     return HandoffContext(
         provider=provider,
@@ -694,7 +728,7 @@ async def _handoff_impl(
         # in the SAME session with #284 callback routing and tool inheritance
         # preserved (BR-8 observable-behavior parity). The endpoint then
         # creates + drives + tears down the terminal.
-        ctx = _resolve_handoff_provider(agent_profile)
+        ctx = _resolve_handoff_provider(agent_profile, working_directory)
         provider = ctx.provider
 
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
@@ -786,10 +820,11 @@ async def _handoff_impl(
         output = data["last_message"]
 
         execution_time = time.time() - start_time
+        cleanup_nudge = await asyncio.to_thread(_get_cleanup_nudge)
         return HandoffResult(
             success=True,
             message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
-            + _get_cleanup_nudge(),
+            + cleanup_nudge,
             output=output,
             terminal_id=terminal_id,
         )
@@ -1197,7 +1232,7 @@ async def send_message(
     Returns:
         Dict with success status and message details
     """
-    return _send_message_impl(receiver_id, message)
+    return await asyncio.to_thread(_send_message_impl, receiver_id, message)
 
 
 @mcp.tool()
@@ -1263,7 +1298,7 @@ async def answer_user_prompt(
     Use this only when the target terminal status is WAITING_USER_ANSWER. Normal
     task delivery should use assign, handoff, or send_message instead.
     """
-    return _send_user_prompt_answer(terminal_id, answer)
+    return await asyncio.to_thread(_send_user_prompt_answer, terminal_id, answer)
 
 
 @mcp.tool(description=LOAD_SKILL_TOOL_DESCRIPTION)
@@ -1271,7 +1306,7 @@ async def load_skill(
     name: str = Field(description="Name of the skill to retrieve"),
 ) -> Any:
     """Retrieve skill content from cao-server."""
-    return _load_skill_impl(name)
+    return await asyncio.to_thread(_load_skill_impl, name)
 
 
 @mcp.tool()

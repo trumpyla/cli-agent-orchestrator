@@ -221,9 +221,11 @@ a fresh clone needs no user-global profile copy or committed absolute path.
 The Artagon Python skill path remains operator-configurable through portable
 `skills.extra_dirs`. This repository commits the portable path in
 `.cao/settings.json`; CAO merges the nearest worktree's validated project
-entries after user-level extras, expands `~`, and resolves relative entries
-from the repository root without committing a username-specific absolute
-path.
+entries after user-level extras, expands `~`, resolves relative entries from
+the repository root, and resolves an exact `${ENV_NAME}` entry for
+machine-local skill stores. Missing or malformed environment references fail
+closed without logging their names or values, so the committed configuration
+does not contain a username-specific path.
 
 The terminal's assigned `working_directory` is persisted as nullable launch
 metadata. Catalog construction, runtime `load_skill`, and restored provider

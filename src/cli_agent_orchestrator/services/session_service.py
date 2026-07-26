@@ -20,6 +20,7 @@ Session Lifecycle:
 """
 
 import logging
+from pathlib import Path
 from typing import Dict, List
 
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
@@ -57,7 +58,15 @@ async def create_session(
     in the same session inherits them. See issue #248.
     """
     if provider is None:
-        resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+        resolved_provider = (
+            resolve_provider(
+                agent_profile,
+                fallback_provider="kiro_cli",
+                start=Path(working_directory),
+            )
+            if working_directory
+            else resolve_provider(agent_profile, fallback_provider="kiro_cli")
+        )
     else:
         resolved_provider = provider
 

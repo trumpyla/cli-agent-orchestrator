@@ -645,6 +645,42 @@ class TestLoadAgentProfileEnvResolution:
         assert profile.mcpServers["service"]["env"]["API_TOKEN"] == "builtin-secret"
 
 
+class TestRepositoryAgentProfileContext:
+    """Repository profiles resolve from the assigned terminal worktree."""
+
+    @patch("cli_agent_orchestrator.services.settings_service.get_extra_agent_dirs", return_value=[])
+    @patch("cli_agent_orchestrator.services.settings_service.get_agent_dirs", return_value={})
+    def test_explicit_start_overrides_daemon_cwd(
+        self, _mock_agent_dirs, _mock_extra_dirs, tmp_path, monkeypatch
+    ):
+        repo = tmp_path / "assigned-repo"
+        nested = repo / "src" / "package"
+        nested.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        profile_dir = repo / ".cao" / "agents"
+        profile_dir.mkdir(parents=True)
+        (profile_dir / "repo-reviewer.md").write_text(
+            "---\n"
+            "name: repo-reviewer\n"
+            "description: Assigned repository reviewer\n"
+            "provider: kimi_cli\n"
+            "permissionMode: plan\n"
+            "skills:\n"
+            "  - repository-review\n"
+            "---\n"
+            "Review the assigned repository.\n"
+        )
+        unrelated = tmp_path / "daemon-cwd"
+        unrelated.mkdir()
+        monkeypatch.chdir(unrelated)
+
+        profile = load_agent_profile("repo-reviewer", start=nested)
+
+        assert profile.provider == "kimi_cli"
+        assert profile.permissionMode == "plan"
+        assert profile.skills == ["repository-review"]
+
+
 class TestCodexConfigParsing:
     """codexConfig frontmatter parses into the AgentProfile field."""
 

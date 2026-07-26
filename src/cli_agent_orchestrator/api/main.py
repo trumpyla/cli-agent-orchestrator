@@ -1687,6 +1687,7 @@ async def set_skill_dirs_endpoint(
 async def get_skill_content(
     name: str,
     terminal_id: Optional[TerminalId] = Query(default=None),
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> SkillContentResponse:
     """Return the full Markdown body for an installed skill."""
     try:
@@ -1914,7 +1915,15 @@ async def create_terminal_in_session(
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
     try:
         if provider is None:
-            resolved_provider = resolve_provider(agent_profile, fallback_provider="kiro_cli")
+            resolved_provider = (
+                resolve_provider(
+                    agent_profile,
+                    fallback_provider="kiro_cli",
+                    start=Path(working_directory),
+                )
+                if working_directory
+                else resolve_provider(agent_profile, fallback_provider="kiro_cli")
+            )
         else:
             resolved_provider = provider
 

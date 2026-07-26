@@ -118,8 +118,10 @@ separate temporary directory.
 `~/.aws/cli-agent-orchestrator/settings.json` and managed through the
 `/settings/skill-dirs` API. A repository may additionally commit the same
 nested key in `.cao/settings.json`; those entries are discovered from the
-nearest Git worktree, may use `~`, and resolve relative paths from the
-repository root. User entries retain precedence over repository entries. See
+nearest Git worktree, may use `~`, resolve relative paths from the repository
+root, or be one exact `${ENV_NAME}` reference. Missing or malformed environment
+references fail closed without logging the variable name or resolved value.
+User entries retain precedence over repository entries. See
 [configuration.md](./configuration.md#skills-skills) for the schema.
 
 ## How Agents Discover Skills

@@ -342,7 +342,7 @@ def parse_agent_profile_text(resolved_text: str, profile_name: str) -> AgentProf
     return AgentProfile(**meta)
 
 
-def _read_agent_profile_source(agent_name: str) -> str:
+def _read_agent_profile_source(agent_name: str, start: Path | None = None) -> str:
     """Locate an agent profile across configured stores and return the raw text.
 
     Search order:
@@ -413,7 +413,7 @@ def _read_agent_profile_source(agent_name: str) -> str:
         if found is not None:
             return found
 
-    project_dir = _project_agent_dir()
+    project_dir = _project_agent_dir(start)
     if project_dir is not None:
         try:
             normalized = normalized_path(project_dir)
@@ -451,10 +451,10 @@ def _read_agent_profile_source(agent_name: str) -> str:
     raise FileNotFoundError(f"Agent profile not found: {agent_name}")
 
 
-def load_agent_profile(agent_name: str) -> AgentProfile:
+def load_agent_profile(agent_name: str, *, start: Path | None = None) -> AgentProfile:
     """Load an agent profile from the configured stores."""
     try:
-        raw_text = _read_agent_profile_source(agent_name)
+        raw_text = _read_agent_profile_source(agent_name, start)
         return parse_agent_profile_text(resolve_env_vars(raw_text), agent_name)
     except (FileNotFoundError, ValueError):
         raise
@@ -462,7 +462,12 @@ def load_agent_profile(agent_name: str) -> AgentProfile:
         raise RuntimeError(f"Failed to load agent profile '{agent_name}': {e}")
 
 
-def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
+def resolve_provider(
+    agent_profile_name: str,
+    fallback_provider: str,
+    *,
+    start: Path | None = None,
+) -> str:
     """Resolve the provider to use for an agent profile.
 
     Loads the agent profile from the CAO agent store and checks for a
@@ -479,7 +484,11 @@ def resolve_provider(agent_profile_name: str, fallback_provider: str) -> str:
         Resolved provider type string.
     """
     try:
-        profile = load_agent_profile(agent_profile_name)
+        profile = (
+            load_agent_profile(agent_profile_name, start=start)
+            if start is not None
+            else load_agent_profile(agent_profile_name)
+        )
     except (FileNotFoundError, RuntimeError):
         # Profile not found or failed to load — provider.initialize()
         # will surface a clear error later.  Fall back for now.

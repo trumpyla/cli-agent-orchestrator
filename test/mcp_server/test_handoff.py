@@ -14,6 +14,7 @@ import asyncio
 import os
 import threading
 import time
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -115,6 +116,51 @@ class TestHandoffMessageContext:
 
         assert result.success is True
         assert events.index("loop-progress") < events.index("post-finished")
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    async def test_cleanup_nudge_does_not_block_event_loop(self, mock_provider):
+        """The post-success cleanup hint may perform HTTP without stalling MCP."""
+        mock_provider.return_value = _ctx("claude_code")
+        started = threading.Event()
+        release = threading.Event()
+        events: list[str] = []
+
+        def blocking_nudge() -> str:
+            started.set()
+            release.wait(timeout=1.0)
+            events.append("nudge-finished")
+            return ""
+
+        def delayed_release() -> None:
+            started.wait(timeout=1.0)
+            time.sleep(0.05)
+            release.set()
+
+        releaser = threading.Thread(target=delayed_release)
+        releaser.start()
+        try:
+            with (
+                patch(
+                    "cli_agent_orchestrator.mcp_server.server.requests.post",
+                    return_value=_ok_run_step_response(),
+                ),
+                patch(
+                    "cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge",
+                    side_effect=blocking_nudge,
+                ),
+            ):
+                task = asyncio.create_task(_handoff_impl("developer", "Implement it"))
+                while not started.is_set():
+                    await asyncio.sleep(0)
+                events.append("loop-progress")
+                result = await task
+        finally:
+            release.set()
+            releaser.join(timeout=1.0)
+
+        assert result.success is True
+        assert events.index("loop-progress") < events.index("nudge-finished")
 
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
@@ -425,6 +471,7 @@ class TestResolveHandoffProvider:
             "provider": "kiro_cli",
             "session_name": "cao-sup",
             "allowed_tools": ["fs_read", "fs_write", "execute_bash"],
+            "working_directory": "/projects/assigned-repo",
         }
         meta.raise_for_status.return_value = None
 
@@ -437,6 +484,16 @@ class TestResolveHandoffProvider:
         assert ctx.session_name == "cao-sup"
         assert ctx.caller_id == "sup-xyz"
         assert ctx.allowed_tools == ["fs_read", "fs_write"]
+        mock_resolve.assert_called_once_with(
+            "developer",
+            fallback_provider="kiro_cli",
+            start=Path("/projects/assigned-repo"),
+        )
+        mock_child_tools.assert_called_once_with(
+            ["fs_read", "fs_write", "execute_bash"],
+            "developer",
+            start=Path("/projects/assigned-repo"),
+        )
 
     @patch("cli_agent_orchestrator.mcp_server.server.resolve_provider")
     def test_outside_cao_terminal_yields_empty_context(self, mock_resolve):

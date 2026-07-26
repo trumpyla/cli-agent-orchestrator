@@ -1,5 +1,6 @@
 """Tests for _resolve_child_allowed_tools in MCP server."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -98,3 +99,22 @@ class TestResolveChildAllowedTools:
         # Parent is unrestricted, child has ["*"] → child_allowed is truthy → joins it
         # But ["*"] joined is "*", which is fine
         assert result == "*"
+
+    @patch("cli_agent_orchestrator.utils.tool_mapping.resolve_allowed_tools")
+    @patch("cli_agent_orchestrator.utils.agent_profiles.load_agent_profile")
+    def test_profile_lookup_uses_assigned_repository(self, mock_load, mock_resolve):
+        mock_profile = MagicMock(allowedTools=["fs_read"], role=None, mcpServers=None)
+        mock_load.return_value = mock_profile
+        mock_resolve.return_value = ["fs_read"]
+
+        result = _resolve_child_allowed_tools(
+            None,
+            "repo-reviewer",
+            start=Path("/projects/assigned-repo"),
+        )
+
+        assert result == "fs_read"
+        mock_load.assert_called_once_with(
+            "repo-reviewer",
+            start=Path("/projects/assigned-repo"),
+        )

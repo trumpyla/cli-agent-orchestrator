@@ -298,7 +298,10 @@ async def create_terminal(
         # provider initialization. The skill catalog is computed only for
         # providers that consume it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         try:
-            profile = load_agent_profile(agent_profile)
+            profile = load_agent_profile(
+                agent_profile,
+                start=Path(working_directory) if working_directory else None,
+            )
         except FileNotFoundError:
             profile = None
         skill_filter = profile.skills if profile else None
@@ -325,7 +328,11 @@ async def create_terminal(
         # but individual restrictions still rely on prompt-level guidance.
         # Surface that loudly at launch so operators route restricted or
         # write-capable roles to hard-enforcement providers instead.
-        if provider in SOFT_ENFORCEMENT_PROVIDERS and allowed_tools and "*" not in allowed_tools:
+        if (
+            provider in SOFT_ENFORCEMENT_PROVIDERS
+            and allowed_tools is not None
+            and "*" not in allowed_tools
+        ):
             logger.warning(
                 f"Terminal {terminal_id}: provider '{provider}' cannot enforce tool "
                 f"restrictions (soft/prompt-level only) but profile '{agent_profile}' "

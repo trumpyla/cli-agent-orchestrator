@@ -16,6 +16,11 @@ valid:
   - |
     async def fetch_async(client):
         return await client.get("/health")
+  - |
+    import asyncio
+
+    async def load_skill(name):
+        return await asyncio.to_thread(_load_skill_impl, name)
 invalid:
   - |
     import requests
@@ -32,3 +37,6 @@ invalid:
     async def post_async(payload):
         response = requests.post("http://example.test", json=payload)
         return response.json()
+  - |
+    async def load_skill(name):
+        return _load_skill_impl(name)

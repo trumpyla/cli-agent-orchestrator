@@ -173,12 +173,13 @@ class ProviderManager:
 
         skill_prompt: Optional[str] = None
         working_directory = metadata.get("working_directory")
-        if working_directory and metadata.get("agent_profile"):
+        if metadata.get("agent_profile"):
             try:
-                profile = load_agent_profile(metadata["agent_profile"])
+                start = Path(working_directory) if working_directory else None
+                profile = load_agent_profile(metadata["agent_profile"], start=start)
                 skill_prompt = build_skill_catalog(
                     profile.skills,
-                    start=Path(working_directory),
+                    start=start,
                 )
             except Exception:
                 logger.warning(

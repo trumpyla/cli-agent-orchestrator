@@ -5,7 +5,12 @@ message: Blocking requests calls are forbidden inside async functions
 note: Use the injected async request backend so cao-server's event loop stays responsive.
 rule:
   all:
-    - pattern: requests.$METHOD($$$ARGS)
+    - any:
+        - pattern: requests.$METHOD($$$ARGS)
+        - pattern: _load_skill_impl($$$ARGS)
+        - pattern: _send_message_impl($$$ARGS)
+        - pattern: _send_user_prompt_answer($$$ARGS)
+        - pattern: _get_cleanup_nudge($$$ARGS)
     - inside:
         any:
           - pattern: |

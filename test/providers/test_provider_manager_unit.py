@@ -226,6 +226,97 @@ def test_get_provider_restores_kimi_skills_from_assigned_repository():
     )
 
 
+def test_get_provider_restores_global_skill_catalog_without_assigned_repository():
+    """A terminal without an explicit cwd keeps the same global catalog after restart."""
+    manager = ProviderManager()
+    profile = MagicMock(skills=["python-design-patterns"])
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.CODEX.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "reviewer",
+                "allowed_tools": ["fs_read"],
+                "working_directory": None,
+                "provider_initialized": True,
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.load_agent_profile",
+            return_value=profile,
+        ) as mock_load_profile,
+        patch(
+            "cli_agent_orchestrator.providers.manager.build_skill_catalog",
+            return_value="## Available Skills\n\n- python-design-patterns",
+        ) as mock_catalog,
+    ):
+        provider = manager.get_provider("t1")
+
+    assert "python-design-patterns" in provider._skill_prompt
+    mock_load_profile.assert_called_once_with("reviewer", start=None)
+    mock_catalog.assert_called_once_with(["python-design-patterns"], start=None)
+
+
+def test_get_provider_restores_real_repository_profile_from_assigned_worktree(
+    tmp_path, monkeypatch
+):
+    """Restore must not depend on cao-server's unrelated process cwd."""
+    repo = tmp_path / "assigned-repo"
+    repo.mkdir()
+    (repo / ".git").mkdir()
+    profile_dir = repo / ".cao" / "agents"
+    profile_dir.mkdir(parents=True)
+    (profile_dir / "repo-reviewer.md").write_text(
+        "---\n"
+        "name: repo-reviewer\n"
+        "description: Repository reviewer\n"
+        "provider: kimi_cli\n"
+        "permissionMode: plan\n"
+        "skills:\n"
+        "  - repository-review\n"
+        "---\n"
+        "Review only.\n"
+    )
+    skill_dir = repo / ".cao" / "skills" / "repository-review"
+    skill_dir.mkdir(parents=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: repository-review\n"
+        "description: Assigned worktree review protocol\n"
+        "---\n"
+        "Review the assigned worktree.\n"
+    )
+    (repo / ".cao" / "settings.json").write_text('{"skills":{"extra_dirs":[".cao/skills"]}}')
+    unrelated = tmp_path / "daemon-cwd"
+    unrelated.mkdir()
+    monkeypatch.chdir(unrelated)
+    manager = ProviderManager()
+    restored_provider = MagicMock()
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.KIMI_CLI.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "repo-reviewer",
+                "allowed_tools": [],
+                "working_directory": str(repo),
+                "provider_initialized": True,
+            },
+        ),
+        patch.object(manager, "create_provider", return_value=restored_provider) as mock_create,
+    ):
+        assert manager.get_provider("t1") is restored_provider
+
+    skill_prompt = mock_create.call_args.kwargs["skill_prompt"]
+    assert "Assigned worktree review protocol" in skill_prompt
+
+
 def test_get_provider_quarantines_kimi_when_undelivered_profile_cannot_load():
     """A missing profile must not crash restoration or permit unrestricted input."""
     manager = ProviderManager()

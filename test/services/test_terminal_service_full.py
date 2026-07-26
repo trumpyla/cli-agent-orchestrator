@@ -320,6 +320,10 @@ class TestCreateTerminal:
             None,
             start=Path("/projects/assigned-repo"),
         )
+        mock_load_profile.assert_called_once_with(
+            "developer",
+            start=Path("/projects/assigned-repo"),
+        )
         assert mock_db_create.call_args.kwargs["working_directory"] == ("/projects/assigned-repo")
 
     @pytest.mark.asyncio

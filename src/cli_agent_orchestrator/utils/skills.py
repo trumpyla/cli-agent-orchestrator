@@ -3,6 +3,8 @@
 import fnmatch
 import json
 import logging
+import os
+import re
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
@@ -14,6 +16,7 @@ from cli_agent_orchestrator.models.skill import SkillMetadata
 from cli_agent_orchestrator.utils.paths import normalized_path
 
 logger = logging.getLogger(__name__)
+_EXACT_ENV_PATH = re.compile(r"^\$\{([A-Z_][A-Z0-9_]*)\}$")
 
 SKILL_CATALOG_INSTRUCTION = (
     "The following skills are available exclusively in this CAO orchestration context. "
@@ -124,6 +127,22 @@ def _project_extra_skill_dirs(start: Path | None = None) -> List[str]:
     project_root = settings_path.parent.parent
     resolved: List[str] = []
     for raw_path in settings.skills.extra_dirs:
+        env_match = _EXACT_ENV_PATH.fullmatch(raw_path)
+        if env_match is not None:
+            env_path = os.environ.get(env_match.group(1))
+            if not env_path:
+                logger.warning(
+                    "Skipping repository skill directory "
+                    "reason=missing_project_skill_environment"
+                )
+                continue
+            raw_path = env_path
+        elif "${" in raw_path:
+            logger.warning(
+                "Skipping repository skill directory "
+                "reason=invalid_project_skill_environment_reference"
+            )
+            continue
         expanded = Path(raw_path).expanduser()
         candidate = expanded if expanded.is_absolute() else project_root / expanded
         resolved.append(str(candidate))

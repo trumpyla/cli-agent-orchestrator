@@ -68,7 +68,7 @@ def test_repository_registers_portable_artagon_python_skill_directory() -> None:
     settings = json.loads(PROJECT_SETTINGS.read_text())
     extra_dirs = settings["skills"]["extra_dirs"]
 
-    assert extra_dirs == ["~/Projects/Artagon/artagon-ai-skills/plugins/artagon-python/skills"]
+    assert extra_dirs == ["${CAO_ARTAGON_PYTHON_SKILLS_DIR}"]
     assert all(not path.startswith("/") for path in extra_dirs)
     assert "/Users/" not in PROJECT_SETTINGS.read_text()
 

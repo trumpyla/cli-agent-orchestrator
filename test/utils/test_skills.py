@@ -282,6 +282,71 @@ class TestExtraSkillDirs:
 
         assert "Assigned repository Python patterns" in catalog
 
+    def test_repo_settings_resolve_exact_environment_path(self, tmp_path, monkeypatch):
+        """Committed settings may use one portable, fail-closed environment reference."""
+        repo = tmp_path / "assigned-repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        settings_file = repo / ".cao" / "settings.json"
+        settings_file.parent.mkdir()
+        shared_skills = tmp_path / "external-python-skills"
+        _write_skill(
+            shared_skills / "python-design-patterns",
+            "python-design-patterns",
+            "Environment referenced Python patterns",
+        )
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "skills": {
+                        "extra_dirs": ["${CAO_ARTAGON_PYTHON_SKILLS_DIR}"],
+                    }
+                }
+            )
+        )
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", global_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+            _project_extra_skill_dirs,
+        )
+        monkeypatch.setenv("CAO_ARTAGON_PYTHON_SKILLS_DIR", str(shared_skills))
+
+        catalog = build_skill_catalog(["python-design-patterns"], start=repo)
+
+        assert "Environment referenced Python patterns" in catalog
+
+    def test_missing_repo_skill_environment_path_fails_closed(self, tmp_path, monkeypatch, caplog):
+        repo = tmp_path / "assigned-repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        settings_file = repo / ".cao" / "settings.json"
+        settings_file.parent.mkdir()
+        settings_file.write_text(
+            json.dumps(
+                {
+                    "skills": {
+                        "extra_dirs": ["${CAO_PRIVATE_SKILL_LOCATION}"],
+                    }
+                }
+            )
+        )
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", global_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+            _project_extra_skill_dirs,
+        )
+        monkeypatch.delenv("CAO_PRIVATE_SKILL_LOCATION", raising=False)
+
+        with caplog.at_level(logging.WARNING):
+            assert list_skills(start=repo) == []
+
+        assert "reason=missing_project_skill_environment" in caplog.text
+        assert "PRIVATE_SKILL_LOCATION" not in caplog.text
+
     def test_load_content_uses_explicit_terminal_repository(self, tmp_path, monkeypatch):
         """Skill bodies resolve from the same repository that produced the catalog."""
         repo = tmp_path / "assigned-repo"

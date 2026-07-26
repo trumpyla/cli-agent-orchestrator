@@ -109,3 +109,17 @@ def test_admin_token_admitted_on_admin_route(client, auth_on):
     app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_ADMIN])
     resp = client.delete("/memory/some-key")
     assert resp.status_code != 403
+
+
+def test_skill_content_requires_a_cao_scope(client, auth_on):
+    """Terminal-context skill lookup is unavailable to an unscoped principal."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([])
+    resp = client.get("/skills/python-testing?terminal_id=deadbeef")
+    assert resp.status_code == 403
+
+
+def test_read_token_admitted_on_skill_content_route(client, auth_on):
+    """A cao:read token passes the read floor on skill content."""
+    app.dependency_overrides[auth.get_current_scopes] = _override_scopes([auth.SCOPE_READ])
+    resp = client.get("/skills/missing-skill")
+    assert resp.status_code != 403

@@ -1,6 +1,7 @@
 """Tests for assign MCP tool."""
 
 import os
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -43,7 +44,11 @@ class TestCreateTerminalProviderResolution:
 
         assert terminal_id == "worker-1"
         assert provider == "claude_code"
-        mock_resolve_provider.assert_called_once_with("reviewer", fallback_provider="kiro_cli")
+        mock_resolve_provider.assert_called_once_with(
+            "reviewer",
+            fallback_provider="kiro_cli",
+            start=Path("/repo"),
+        )
         mock_requests.post.assert_called_once_with(
             f"{API_BASE_URL}/sessions/cao-session/terminals",
             params={
@@ -87,7 +92,11 @@ class TestCreateTerminalProviderResolution:
 
         assert terminal_id == "worker-2"
         assert provider == "kiro_cli"
-        mock_resolve_provider.assert_called_once_with("reviewer", fallback_provider="kiro_cli")
+        mock_resolve_provider.assert_called_once_with(
+            "reviewer",
+            fallback_provider="kiro_cli",
+            start=Path("/repo"),
+        )
         mock_requests.post.assert_called_once_with(
             f"{API_BASE_URL}/sessions/cao-session/terminals",
             params={
