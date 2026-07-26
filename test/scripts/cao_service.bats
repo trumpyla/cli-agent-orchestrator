@@ -46,7 +46,33 @@ load helpers/cao_service_test_helper
 
     assert_success
     [[ "$(cat "${CAO_TEST_STATE}/pid")" == "${first_pid}" ]]
-    [[ "$(manager_call_count bootstrap)" -eq 1 ]]
+  [[ "$(manager_call_count bootstrap)" -eq 1 ]]
+}
+
+@test "repeated Darwin install does not reload unchanged service" {
+  setup_cao_service_test Darwin
+  run_service install
+  assert_success
+  first_pid="$(cat "${CAO_TEST_STATE}/pid")"
+
+  run_service install
+
+  assert_success
+  [[ "$(cat "${CAO_TEST_STATE}/pid")" == "${first_pid}" ]]
+  [[ "$(manager_call_count bootstrap)" -eq 1 ]]
+  [[ "$(manager_call_count bootout)" -eq 0 ]]
+}
+
+@test "copied controller runs independently from installed runtime" {
+  setup_cao_service_test Linux
+  run_service install
+  assert_success
+
+  run "${HOME}/.local/libexec/cao-service/cao-service.sh" status
+
+  assert_success
+  assert_output_contains "manager: active"
+  assert_output_contains "health: healthy"
 }
 
 @test "Linux start is idempotent while healthy" {
@@ -84,6 +110,7 @@ load helpers/cao_service_test_helper
 
 @test "readiness timeout returns failure with diagnostic guidance" {
     setup_cao_service_test Linux
+    export CAO_SERVICE_READY_TIMEOUT=0
     touch "${CAO_TEST_STATE}/suppress-health"
 
     run_service install
@@ -209,5 +236,15 @@ load helpers/cao_service_test_helper
         "${REPO_ROOT}/scripts/cao-service.sh" \
         "${REPO_ROOT}/scripts/lib/cao-service"
 
-    assert_failure
+  assert_failure
+}
+
+@test "temporary files use target-derived names" {
+  setup_cao_service_test Darwin
+
+  run grep -R -E "cao-(executable|definition).*XXXXXX" \
+    "${REPO_ROOT}/scripts/cao-service.sh" \
+    "${REPO_ROOT}/scripts/lib/cao-service"
+
+  assert_failure
 }

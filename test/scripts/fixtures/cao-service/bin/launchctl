@@ -5,39 +5,38 @@ state="${CAO_TEST_STATE:?CAO_TEST_STATE must be set}"
 printf 'launchctl %s\n' "$*" >>"${state}/calls"
 
 mark_running() {
-    touch "${state}/loaded" "${state}/active"
-    if [[ ! -f "${state}/pid" ]]; then
-        printf '4242\n' >"${state}/pid"
-    fi
-    if [[ ! -e "${state}/suppress-health" ]]; then
-        touch "${state}/healthy"
-    fi
+  touch "${state}/loaded" "${state}/active"
+  if [[ ! -f "${state}/pid" ]]; then
+    printf '4242\n' >"${state}/pid"
+  fi
+  if [[ ! -e "${state}/suppress-health" ]]; then
+    touch "${state}/healthy"
+  fi
 }
 
 case "${1:-}" in
-    print)
-        [[ -e "${state}/loaded" ]] || exit 1
-        printf 'service = {\n'
-        if [[ -e "${state}/active" ]]; then
-            printf '    state = running\n    pid = %s\n' "$(cat "${state}/pid")"
-        else
-            printf '    state = exited\n'
-        fi
-        printf '}\n'
-        ;;
-    bootstrap)
-        mark_running
-        ;;
-    bootout)
-        rm -f "${state}/loaded" "${state}/active" "${state}/healthy"
-        ;;
-    kickstart)
-        [[ -e "${state}/loaded" ]] || exit 1
-        mark_running
-        ;;
-    *)
-        printf 'unsupported launchctl command: %s\n' "$*" >&2
-        exit 2
-        ;;
+  print)
+    [[ -e "${state}/loaded" ]] || exit 1
+    printf 'service = {\n'
+    if [[ -e "${state}/active" ]]; then
+      printf '    state = running\n    pid = %s\n' "$(cat "${state}/pid")"
+    else
+      printf '    state = exited\n'
+    fi
+    printf '}\n'
+    ;;
+  bootstrap)
+    mark_running
+    ;;
+  bootout)
+    rm -f "${state}/loaded" "${state}/active" "${state}/healthy"
+    ;;
+  kickstart)
+    [[ -e "${state}/loaded" ]] || exit 1
+    mark_running
+    ;;
+  *)
+    printf 'unsupported launchctl command: %s\n' "$*" >&2
+    exit 2
+    ;;
 esac
-

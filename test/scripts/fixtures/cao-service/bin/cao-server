@@ -4,4 +4,3 @@ set -euo pipefail
 state="${CAO_TEST_STATE:?CAO_TEST_STATE must be set}"
 printf '%s' "${CAO_TEST_VALUE:-}" >"${state}/server-env-value"
 printf '%s' "${PWD}" >"${state}/server-working-directory"
-

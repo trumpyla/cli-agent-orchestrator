@@ -3,8 +3,7 @@ set -euo pipefail
 
 state="${CAO_TEST_STATE:?CAO_TEST_STATE must be set}"
 if [[ -e "${state}/healthy" ]]; then
-    printf '{"status":"healthy"}\n'
-    exit 0
+  printf '{"status":"healthy"}\n'
+  exit 0
 fi
 exit 22
-

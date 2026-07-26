@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+host_platform="$(/usr/bin/uname -s)"
+requested_platform="${FAKE_PLATFORM:-${host_platform}}"
+
+if [[ "${requested_platform}" == "${host_platform}" ]]; then
+  exec /usr/bin/stat "$@"
+fi
+
+case "${requested_platform}:${1:-}:${2:-}" in
+  Linux:-c:%a)
+    exec /usr/bin/stat -f '%Lp' "$3"
+    ;;
+  Linux:-c:%u)
+    exec /usr/bin/stat -f '%u' "$3"
+    ;;
+  Darwin:-f:%Lp)
+    exec /usr/bin/stat -c '%a' "$3"
+    ;;
+  Darwin:-f:%u)
+    exec /usr/bin/stat -c '%u' "$3"
+    ;;
+  *)
+    printf 'unsupported fake stat invocation: %s\n' "$*" >&2
+    exit 2
+    ;;
+esac

@@ -3,12 +3,11 @@ set -euo pipefail
 
 state="${CAO_TEST_STATE:?CAO_TEST_STATE must be set}"
 if [[ -e "${state}/unmanaged-listener" ]]; then
-    printf '999\n'
-    exit 0
+  printf '999\n'
+  exit 0
 fi
 if [[ -e "${state}/active" ]]; then
-    cat "${state}/pid"
-    exit 0
+  cat "${state}/pid"
+  exit 0
 fi
 exit 1
-
