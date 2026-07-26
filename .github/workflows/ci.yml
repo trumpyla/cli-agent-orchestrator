@@ -270,6 +270,45 @@ jobs:
       - name: Run type checker with mypy
         run: uv run mypy src/
 
+  cao-user-service:
+    name: CAO User Service (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install shell test tools on Linux
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y bats shellcheck shfmt lsof
+
+      - name: Install shell test tools on macOS
+        if: runner.os == 'macOS'
+        run: brew install bats-core shellcheck shfmt
+
+      - name: Run CAO service lifecycle tests
+        run: bats test/scripts/cao_service.bats
+
+      - name: Run ShellCheck
+        run: |
+          shellcheck \
+            scripts/cao-service.sh \
+            scripts/lib/cao-service/*.sh \
+            test/scripts/fixtures/cao-service/bin/* \
+            test/scripts/helpers/cao_service_test_helper.bash
+
+      - name: Check Google-style shell formatting
+        run: |
+          shfmt -d -i 2 -ci \
+            scripts/cao-service.sh \
+            scripts/lib/cao-service/*.sh \
+            test/scripts/fixtures/cao-service/bin/* \
+            test/scripts/helpers/cao_service_test_helper.bash
+
   ag-ui-demo:
     name: AG-UI demo (shift-left recording)
     runs-on: ubuntu-latest

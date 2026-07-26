@@ -75,6 +75,74 @@ cao config list                       # every known key, resolved
 cao config path                       # absolute path to settings.json
 ```
 
+## Per-user `cao-server` service
+
+Install one login-started, crash-resilient `cao-server` for the current user:
+
+```bash
+scripts/cao-service.sh install
+scripts/cao-service.sh status
+```
+
+The controller uses a LaunchAgent on macOS and `systemd --user` on Linux. It
+copies its runtime to `~/.local/libexec/cao-service`, so later service starts do
+not depend on the repository that performed the installation. State and macOS
+logs live under `~/.local/state/cao`.
+
+Lifecycle commands are safe to repeat:
+
+```bash
+scripts/cao-service.sh ensure
+scripts/cao-service.sh start
+scripts/cao-service.sh restart
+scripts/cao-service.sh stop
+scripts/cao-service.sh uninstall
+```
+
+`ensure` installs when absent, starts when stopped, and does nothing when the
+managed service is healthy. The controller serializes lifecycle operations and
+refuses to start when another process owns port 9889. It never kills or adopts
+an unmanaged process. `uninstall` removes only the native definition and copied
+controller runtime; it preserves user configuration and state logs.
+
+Optional service-only environment overrides may be placed in
+`~/.config/cao/service.env`. The file is sourced as shell syntax by the user's
+service process, so only put trusted content in it and make it private:
+
+```bash
+chmod 600 ~/.config/cao/service.env
+scripts/cao-service.sh restart
+```
+
+The runner rejects a symlink, a different owner, or any mode other than 600. It
+never prints environment values. Installation captures the exact
+`cao-server` executable on `PATH`; rerun `install` after changing the CAO
+installation.
+
+For native diagnostics:
+
+```bash
+# macOS
+launchctl print "gui/$(id -u)/com.artagon.cao-server"
+tail -n 100 ~/.local/state/cao/stderr.log
+
+# Linux
+systemctl --user status cao-server.service
+journalctl --user -u cao-server.service
+```
+
+The managed server exposes CAO Ops over Streamable HTTP at
+`http://127.0.0.1:9889/mcp/ops`. This does not replace the identity-bearing
+`cao-mcp-server`: agent profiles still launch that MCP server over stdio so CAO
+can inject `CAO_TERMINAL_ID` for the session. Repository profiles resolve from
+each session's working directory.
+
+The service controller does not rewrite agent profiles. A user-store profile
+that explicitly runs `uvx --from git+...@COMMIT cao-mcp-server` remains pinned
+to that commit until the profile is regenerated or reinstalled separately.
+Current repository profiles should declare the bare `cao-mcp-server` command;
+CAO resolves it to the launcher in the active installation at terminal launch.
+
 ## Sections
 
 ### Agents (`agents`)
