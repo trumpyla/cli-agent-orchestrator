@@ -36,6 +36,7 @@ from cli_agent_orchestrator.ops_mcp_server.backend import (
     CLIENT_DEFAULT_TIMEOUT,
     AsyncRequestBackend,
     HttpxRequestBackend,
+    RequestFailure,
     RequestResult,
     RequestTimeout,
 )
@@ -265,15 +266,18 @@ def _request_json(
     try:
         response = requests.request(method, f"{API_BASE_URL}{path}", **request_kwargs)
     except requests.RequestException as exc:
-        return None, f"{operation} failed: {exc}"
+        return None, RequestFailure(f"{operation} failed: {exc}")
 
     if response.status_code >= 400:
-        return None, f"{operation} failed: {_response_detail(response)}"
+        return None, RequestFailure(
+            f"{operation} failed: {_response_detail(response)}",
+            status_code=response.status_code,
+        )
 
     try:
         return response.json(), None
     except ValueError as exc:
-        return None, f"{operation} failed: invalid JSON response ({exc})"
+        return None, RequestFailure(f"{operation} failed: invalid JSON response ({exc})")
 
 
 async def _async_request_json(
@@ -298,15 +302,18 @@ async def _async_request_json(
         async with httpx.AsyncClient() as client:
             response = await client.request(method, f"{API_BASE_URL}{path}", **request_kwargs)
     except httpx.RequestError as exc:
-        return None, f"{operation} failed: {exc}"
+        return None, RequestFailure(f"{operation} failed: {exc}")
 
     if response.status_code >= 400:
-        return None, f"{operation} failed: {_response_detail(response)}"
+        return None, RequestFailure(
+            f"{operation} failed: {_response_detail(response)}",
+            status_code=response.status_code,
+        )
 
     try:
         return response.json(), None
     except ValueError as exc:
-        return None, f"{operation} failed: invalid JSON response ({exc})"
+        return None, RequestFailure(f"{operation} failed: invalid JSON response ({exc})")
 
 
 async def _request_from_active_backend(
@@ -1222,6 +1229,10 @@ class _PeerConsumerHandle:
 _SESSION_TASKS_ATTR = "_cao_peer_session_tasks"
 
 
+class _SubscriptionAuthorizationError(RuntimeError):
+    """Stop a subscription whose credential is no longer authorized."""
+
+
 def _peer_inbox_uri(peer_id: str) -> str:
     return f"cao://peers/{peer_id}/inbox"
 
@@ -1241,6 +1252,8 @@ async def _long_poll_inbox(peer_id: str, wait: float, after_id: int = 0) -> List
         timeout=wait + 5.0,
     )
     if error:
+        if isinstance(error, RequestFailure) and error.status_code in {401, 403}:
+            raise _SubscriptionAuthorizationError(error)
         raise RuntimeError(error)
     return data if isinstance(data, list) else []
 
@@ -1264,6 +1277,12 @@ async def _consume_inbox(peer_id: str, session: Any) -> None:
             backoff = 1.0
         except asyncio.CancelledError:
             raise
+        except _SubscriptionAuthorizationError:
+            logger.debug(
+                "peer-inbox: authorization rejected; consumer stopped (%s)",
+                peer_id,
+            )
+            return
         except Exception:
             logger.debug("peer-inbox: long-poll for %s failed; backing off", peer_id, exc_info=True)
             await asyncio.sleep(backoff)

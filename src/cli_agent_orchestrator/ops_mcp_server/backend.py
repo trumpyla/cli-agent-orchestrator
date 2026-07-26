@@ -20,6 +20,24 @@ class ClientDefaultTimeout(Enum):
 
 CLIENT_DEFAULT_TIMEOUT = ClientDefaultTimeout.VALUE
 RequestTimeout = float | None | ClientDefaultTimeout
+
+
+class RequestFailure(str):
+    """Backward-compatible request error carrying an optional HTTP status."""
+
+    status_code: int | None
+
+    def __new__(
+        cls,
+        message: str,
+        *,
+        status_code: int | None = None,
+    ) -> "RequestFailure":
+        instance = str.__new__(cls, message)
+        instance.status_code = status_code
+        return instance
+
+
 RequestResult = tuple[Any | None, str | None]
 
 
@@ -71,7 +89,7 @@ async def _request_json(
     try:
         response = await client.request(method, path, **request_kwargs)
     except httpx.RequestError as exc:
-        return None, f"{operation} failed: {exc}"
+        return None, RequestFailure(f"{operation} failed: {exc}")
     return _map_response(response, operation)
 
 
@@ -172,9 +190,9 @@ class AsgiRequestBackend:
         timeout: RequestTimeout = CLIENT_DEFAULT_TIMEOUT,
     ) -> RequestResult:
         if not self._is_owned_rest_path(path):
-            return None, f"{operation} failed: embedded REST path is not allowed"
+            return None, RequestFailure(f"{operation} failed: embedded REST path is not allowed")
         if self._client is None:
-            return None, f"{operation} failed: embedded REST backend is not bound"
+            return None, RequestFailure(f"{operation} failed: embedded REST backend is not bound")
 
         return await _request_json(
             self._client,
@@ -210,8 +228,11 @@ def _response_detail(response: httpx.Response) -> str:
 
 def _map_response(response: httpx.Response, operation: str) -> RequestResult:
     if response.status_code >= 400:
-        return None, f"{operation} failed: {_response_detail(response)}"
+        return None, RequestFailure(
+            f"{operation} failed: {_response_detail(response)}",
+            status_code=response.status_code,
+        )
     try:
         return response.json(), None
     except ValueError as exc:
-        return None, f"{operation} failed: invalid JSON response ({exc})"
+        return None, RequestFailure(f"{operation} failed: invalid JSON response ({exc})")

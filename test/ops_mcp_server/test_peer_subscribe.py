@@ -11,11 +11,14 @@ from contextlib import AsyncExitStack
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
+from cli_agent_orchestrator.ops_mcp_server.backend import HttpxRequestBackend
 from cli_agent_orchestrator.ops_mcp_server.server import (
     _PEER_URI_RE,
     FastMcp32SessionTasks,
+    _active_backend,
     _async_request_json,
     _consume_inbox,
     _long_poll_inbox,
@@ -405,6 +408,53 @@ async def test_failed_subscription_task_is_removed():
 
     assert low.request_context.session._cao_peer_session_tasks.consumer_count == 0
     await _cleanup_test_sessions(low.request_context.session)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [401, 403])
+async def test_auth_rejected_subscription_is_removed_and_can_be_recreated(
+    status_code: int,
+) -> None:
+    captured = {}
+    low, _ = _low_level_server(captured)
+    _setup_peer_subscribe(SimpleNamespace(_mcp_server=low))
+    session = low.request_context.session
+    authorized = False
+
+    async def inbox_response(request: httpx.Request) -> httpx.Response:
+        if not authorized:
+            return httpx.Response(
+                status_code,
+                json={"detail": "subscription credential rejected"},
+                request=request,
+            )
+        return httpx.Response(200, json=[], request=request)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(inbox_response),
+        base_url="http://127.0.0.1:9889",
+    )
+    backend = HttpxRequestBackend(
+        base_url="http://127.0.0.1:9889",
+        client=client,
+    )
+    backend_token = _active_backend.set(backend)
+    try:
+        await captured["subscribe"](_peer_inbox_uri(PEER))
+
+        async def wait_for_consumer_count(expected: int) -> None:
+            while session._cao_peer_session_tasks.consumer_count != expected:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_consumer_count(0), timeout=0.2)
+
+        authorized = True
+        await captured["subscribe"](_peer_inbox_uri(PEER))
+        await asyncio.wait_for(wait_for_consumer_count(1), timeout=0.2)
+    finally:
+        _active_backend.reset(backend_token)
+        await backend.aclose()
+        await _cleanup_test_sessions(session)
 
 
 def test_request_json_forwards_local_bearer_without_logging_it(caplog):
