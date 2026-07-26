@@ -10,7 +10,7 @@ This guide explains what each surface is for, when to use it, and how they fit t
 |---|---|---|---|---|
 | **Web UI** | Inbound (outside → CAO) | Human in a browser | HTTP + WebSocket | Interactive management from the browser |
 | **`cao session` CLI + [`cao-session-management`](../skills/cao-session-management/SKILL.md) skill** | Inbound | Human in a terminal, OR an external agent that can run shell commands | Shell → HTTP | Scripts, CI pipelines, headless jobs, agents that cannot speak MCP |
-| **`cao-ops-mcp` server** | Inbound | Any external agent that speaks MCP | MCP (stdio) → HTTP | A primary agent managing CAO from inside its own chat loop |
+| **CAO Ops MCP** | Inbound | Any external agent that speaks MCP | Streamable HTTP, or stdio → HTTP | A primary agent managing CAO from inside its own chat loop |
 | **Plugins** (e.g. `cao-discord`) | **Outbound** (CAO → outside) | `cao-server` itself, fire-and-forget | Python hooks → whatever the plugin chooses (webhook, log, metric) | Forwarding events to chat apps, observability, audit logging |
 
 Separately, the in-session MCP server (`cao-mcp-server`) handles agent-to-agent orchestration *within* a CAO session. That is orthogonal to this document — see [Multi-Agent Orchestration](../README.md#multi-agent-orchestration) in the README for `handoff` / `assign` / `send_message`.
@@ -49,9 +49,24 @@ A set of `cao session <verb>` commands (`list`, `status`, `send`, plus `cao laun
 
 See [Session Management CLI](../README.md#session-management-cli) in the README for the command reference.
 
-### `cao-ops-mcp` server
+### CAO Ops MCP
 
-An MCP server that exposes the same set of management operations as structured tool calls. Add it to a primary agent's MCP configuration and that agent can call `launch_session`, `list_sessions`, `install_profile`, etc. as typed tools.
+CAO Ops exposes the same management operations as structured tool calls. Add it
+to a primary agent's MCP configuration and that agent can call
+`launch_session`, `list_sessions`, `install_profile`, etc. as typed tools.
+
+The preferred transport for clients with native HTTP MCP support is the
+stateful endpoint embedded in `cao-server`:
+
+```text
+http://127.0.0.1:9889/mcp/ops
+```
+
+Use that exact no-trailing-slash URL. The existing
+`cao-ops-mcp-server` command remains available for stdio-only clients and uses
+an asynchronous HTTP backend to reach the same authoritative REST operations.
+Both transports preserve the same tool names, resource URIs, argument schemas,
+and result models.
 
 - **Strength:** structured tool calls instead of shell parsing. Typed arguments, typed results, errors surface as tool-call errors.
 - **When to use:**
@@ -70,12 +85,15 @@ An MCP server that exposes the same set of management operations as structured t
   re-read the resource. A failed notification ends that session's consumer, so the
   client must resubscribe; long-poll remains available throughout. See
   [API: Peers](api.md#peers-bi-directional-bridge).
-- **Authenticated deployments:** `cao-ops-mcp` forwards `CAO_AUTH_LOCAL_TOKEN` as a
-  bearer token on every API call, including subscription long-polls. Inbox reads need
-  `cao:read`, `cao:write`, or `cao:admin`; peer registration and acknowledgement need
-  `cao:write` or `cao:admin`. A `peer_id` is only a routing identifier, not a per-peer
-  capability: `cao:write` is an operator-level scope over all peer inboxes and must not
-  be shared across mutually untrusted tenants. Authentication remains default-off.
+- **Authenticated deployments:** native clients send a bearer token to the
+  exact loopback `/mcp/ops` endpoint; the stdio server forwards
+  `CAO_AUTH_LOCAL_TOKEN`. Every MCP GET, POST, and DELETE is authenticated, and
+  a retained MCP session is bound to the principal that initialized it. Inbox
+  reads need `cao:read`, `cao:write`, or `cao:admin`; peer registration and
+  acknowledgement need `cao:write` or `cao:admin`. A `peer_id` is only a
+  routing identifier, not a per-peer capability: `cao:write` is an
+  operator-level scope over all peer inboxes and must not be shared across
+  mutually untrusted tenants. Authentication remains default-off.
 
 See [CAO Ops MCP Server](../README.md#cao-ops-mcp-server) in the README for setup and the tool catalog.
 

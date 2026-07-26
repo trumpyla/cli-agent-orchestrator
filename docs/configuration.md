@@ -116,8 +116,9 @@ scripts/cao-service.sh restart
 
 The runner rejects a symlink, a different owner, or any mode other than 600. It
 never prints environment values. Installation captures the exact
-`cao-server` executable on `PATH`; rerun `install` after changing the CAO
-installation.
+`cao-server` executable on `PATH`; rerun `install` after changing that
+executable path. After upgrading CAO in place, use `restart` so the managed
+process loads the new version. See [Updating CAO](updating.md#after-updating).
 
 For native diagnostics:
 

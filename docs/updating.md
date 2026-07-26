@@ -49,10 +49,30 @@ update the local source, then reinstall: uv tool install /path --reinstall
 
 ## After updating
 
-Restart any running `cao-server` so it picks up the new version:
+Restart any running `cao-server` with the same mechanism that started it so the
+process picks up the new version.
+
+For a foreground server:
 
 ```bash
 cao update
-# then restart your server, e.g.
+# Stop the old foreground process, then:
 cao-server
 ```
+
+For the per-user service installed from a source checkout:
+
+```bash
+cao update
+scripts/cao-service.sh restart
+scripts/cao-service.sh status
+```
+
+If the checkout's service-controller files also changed, run
+`scripts/cao-service.sh install` instead. Installation refreshes the private
+controller copy under `~/.local/libexec/cao-service` and restarts the service
+when that runtime changed. It does not rewrite CAO settings, agent profiles, or
+the optional `~/.config/cao/service.env`.
+
+See [Per-user `cao-server` service](configuration.md#per-user-cao-server-service)
+for lifecycle and diagnostics.

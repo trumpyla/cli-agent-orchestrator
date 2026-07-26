@@ -36,6 +36,10 @@ CAO implements a hierarchical multi-agent system — one supervisor agent delega
 - **Scheduled flows** — cron-like scheduling for unattended agent runs. See [docs/flows.md](docs/flows.md).
 - **Multi-step workflows** — author and run parameterized, multi-step agent pipelines with fan-out and resume. See [docs/workflows.md](docs/workflows.md).
 - **Web UI, CLI, and MCP control planes** — manage sessions from the browser, `cao session` commands, or the `cao-ops-mcp` server. See [docs/control-planes.md](docs/control-planes.md).
+- **Managed local server** — install `cao-server` as a crash-resilient macOS
+  LaunchAgent or Linux systemd user service, with native CAO Ops Streamable HTTP
+  at `http://127.0.0.1:9889/mcp/ops`. See
+  [Configuration](docs/configuration.md#per-user-cao-server-service).
 - **Tool restrictions per agent** — `role` + `allowedTools` in the profile, translated to each provider's native enforcement where available. See [docs/tool-restrictions.md](docs/tool-restrictions.md).
 - **Persistent agent memory** — agents store and recall knowledge across sessions using `memory_store` and `memory_recall` MCP tools. CAO automatically injects relevant memories as context at session start. See [docs/memory.md](docs/memory.md).
 - **Direct worker steering** — unlike traditional "sub-agent" features, you can attach to a running worker and intervene mid-task.
@@ -114,7 +118,7 @@ For local development (`git clone` + `uv sync`) and the testing/quality workflow
 cao update
 ```
 
-`cao update` upgrades CAO in place, picking the right uv command for **how you installed it** (git, PyPI, an exact pin, or a local clone/wheel) by reading uv's install receipt. Requires that CAO was installed as a **uv tool**; after updating, restart any running `cao-server`. See [docs/updating.md](docs/updating.md) for the full per-source behavior.
+`cao update` upgrades CAO in place, picking the right uv command for **how you installed it** (git, PyPI, an exact pin, or a local clone/wheel) by reading uv's install receipt. Requires that CAO was installed as a **uv tool**; after updating, restart any running `cao-server` with the same mechanism that started it. See [docs/updating.md](docs/updating.md) for the full per-source and managed-service behavior.
 
 ## Devcontainer Feature
 
@@ -173,9 +177,25 @@ cao profile remove <name>                           # Delete from local store
 
 ### 2. Start the server
 
+Run it in the foreground:
+
 ```bash
 cao-server
 ```
+
+From a source checkout, you can instead install a login-started,
+crash-resilient per-user service:
+
+```bash
+scripts/cao-service.sh install
+scripts/cao-service.sh status
+```
+
+The service uses a LaunchAgent on macOS or `systemd --user` on Linux, preserves
+user configuration when uninstalled, and refuses to take over an unrelated
+process on port 9889. See
+[Per-user `cao-server` service](docs/configuration.md#per-user-cao-server-service)
+for lifecycle commands, private environment configuration, and diagnostics.
 
 ### 3. Launch the supervisor
 
@@ -344,14 +364,31 @@ Because `cao session` is just shell commands, any AI assistant that supports she
 
 ### CAO Ops MCP Server
 
-`cao-ops-mcp` exposes the same management operations as structured MCP tools for a primary agent (Claude Code, Claude Desktop, etc.). It is the MCP-flavoured equivalent of `cao session` — pick `cao-ops-mcp` when your caller speaks MCP, `cao session` otherwise.
+CAO Ops exposes the same management operations as structured MCP tools for a
+primary agent (Claude Code, Claude Desktop, etc.). It is the MCP-flavoured
+equivalent of `cao session` — pick CAO Ops when your caller speaks MCP,
+`cao session` otherwise.
 
 | Server | Who uses it | Purpose |
 |--------|-------------|---------|
 | `cao-mcp-server` | Agents **inside** a CAO session | Inter-agent orchestration (`handoff`, `assign`, `send_message`) |
-| `cao-ops-mcp` | A primary agent **outside** a CAO session | Meta management (install profiles, launch/monitor sessions) |
+| CAO Ops (`/mcp/ops` or `cao-ops-mcp-server`) | A primary agent **outside** a CAO session | Meta management (install profiles, launch/monitor sessions) |
 
-**Setup** — add to your primary agent's MCP configuration. Requires `cao-server` running at `localhost:9889`.
+**Recommended setup** — when the client supports MCP Streamable HTTP, point it
+at the stateful endpoint embedded in the running server:
+
+```text
+http://127.0.0.1:9889/mcp/ops
+```
+
+Use the exact no-trailing-slash URL. The endpoint serves MCP directly without a
+redirect and shares `cao-server` lifecycle, authentication, and REST
+authorization. Provider-specific native HTTP configuration is documented in
+[Agent profiles](docs/agent-profile.md) and the individual provider guides.
+
+**Compatible stdio setup** — clients that require a command-launched MCP server
+can keep using `cao-ops-mcp-server`. It forwards calls asynchronously to
+`cao-server` and preserves the existing tool and resource schemas.
 
 For Claude Code, add to `.mcp.json`:
 
@@ -366,7 +403,7 @@ For Claude Code, add to `.mcp.json`:
 }
 ```
 
-Other agents: use the equivalent stdio MCP command:
+Other stdio clients can use the equivalent command:
 
 ```
 uvx --from git+https://github.com/awslabs/cli-agent-orchestrator.git@main cao-ops-mcp-server
@@ -391,8 +428,12 @@ returned id into the task, long-poll with `receive_messages`, then acknowledge p
 ids with `ack_messages`. Pass the highest observed id as `after_id` when waiting for a
 newer message while older rows remain unacknowledged. MCP resource subscription is also
 enabled as a body-free supplemental wakeup, but long-poll remains the reliable fallback.
-When API authentication is enabled, set `CAO_AUTH_LOCAL_TOKEN` for `cao-ops-mcp`; it
-forwards that bearer token on all API requests without exposing it in tool output.
+When API authentication is enabled, configure the exact loopback HTTP endpoint
+with a bearer token or set `CAO_AUTH_LOCAL_TOKEN` for the stdio server. The
+token is validated on every MCP GET, POST, and DELETE, retained sessions are
+bound to the initializing principal, and credentials are not exposed in tool
+output. The identity-bearing in-session `cao-mcp-server` remains a separate
+stdio server because it receives `CAO_TERMINAL_ID`.
 
 ### Flows — scheduled agent sessions
 

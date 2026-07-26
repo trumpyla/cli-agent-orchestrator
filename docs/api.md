@@ -11,6 +11,27 @@ Interactive API docs (Swagger UI) are served live at **`/docs`**, and the raw Op
 schema at **`/openapi.json`** — both auto-generated from the FastAPI route models, so
 they always reflect the running server.
 
+## CAO Ops MCP
+
+The same server exposes stateful MCP Streamable HTTP at the exact
+no-trailing-slash URL:
+
+```text
+http://127.0.0.1:9889/mcp/ops
+```
+
+This MCP surface is not part of the OpenAPI schema. It provides the CAO Ops
+tools and resources described in
+[Control planes](control-planes.md#cao-ops-mcp), while dispatching management
+operations through the authoritative REST handlers. The standalone
+`cao-ops-mcp-server` stdio entrypoint remains compatible for command-only MCP
+clients.
+
+When CAO authentication is enabled, every MCP GET, POST, and DELETE requires a
+valid bearer token with at least one CAO scope. Retained MCP sessions are bound
+to the validated principal that initialized them; reusing a session ID as a
+different principal is rejected.
+
 ## Health Check
 
 ### GET /health
