@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state="${CAO_TEST_STATE:?CAO_TEST_STATE must be set}"
+printf 'systemctl %s\n' "$*" >>"${state}/calls"
+
+if [[ "${1:-}" != "--user" ]]; then
+    printf 'expected --user\n' >&2
+    exit 2
+fi
+shift
+
+mark_running() {
+    touch "${state}/active"
+    if [[ ! -f "${state}/pid" ]]; then
+        printf '4242\n' >"${state}/pid"
+    fi
+    if [[ ! -e "${state}/suppress-health" ]]; then
+        touch "${state}/healthy"
+    fi
+}
+
+case "${1:-}" in
+    daemon-reload)
+        ;;
+    enable)
+        touch "${state}/enabled"
+        mark_running
+        ;;
+    start)
+        mark_running
+        ;;
+    stop)
+        rm -f "${state}/active" "${state}/healthy"
+        ;;
+    restart)
+        mark_running
+        ;;
+    disable)
+        rm -f "${state}/enabled" "${state}/active" "${state}/healthy"
+        ;;
+    is-active)
+        [[ -e "${state}/active" ]]
+        ;;
+    show)
+        if [[ -e "${state}/active" ]]; then
+            cat "${state}/pid"
+        else
+            printf '0\n'
+        fi
+        ;;
+    *)
+        printf 'unsupported systemctl command: %s\n' "$*" >&2
+        exit 2
+        ;;
+esac
+

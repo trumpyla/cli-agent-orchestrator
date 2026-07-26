@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ "${1:-}" == "-s" ]]; then
+    printf '%s\n' "${FAKE_PLATFORM:?FAKE_PLATFORM must be set}"
+    exit 0
+fi
+
+exec /usr/bin/uname "$@"
+
