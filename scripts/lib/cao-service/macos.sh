@@ -70,7 +70,8 @@ cao_service::native::bootstrap() {
   local attempt=1
   while ((attempt <= CAO_SERVICE_NATIVE_RETRY_ATTEMPTS)); do
     if launchctl bootstrap \
-      "gui/${CAO_SERVICE_UID}" "${CAO_NATIVE_DEFINITION}"; then
+      "gui/${CAO_SERVICE_UID}" "${CAO_NATIVE_DEFINITION}" \
+      >/dev/null 2>&1; then
       return 0
     fi
     if cao_service::native::is_loaded; then
@@ -81,6 +82,8 @@ cao_service::native::bootstrap() {
         "ERROR: launchd bootstrap failed after ${attempt} attempts"
       return 1
     fi
+    cao_service::log \
+      "launchd bootstrap attempt ${attempt} failed; retrying"
     sleep "${CAO_SERVICE_NATIVE_RETRY_INTERVAL}"
     attempt=$((attempt + 1))
   done

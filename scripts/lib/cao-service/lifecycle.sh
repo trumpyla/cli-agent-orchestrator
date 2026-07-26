@@ -24,10 +24,14 @@ cao_service::install() {
   cao_service::install_runtime
   cao_service::write_definition
 
+  # Runtime refreshes keep the native label loaded; only definition changes
+  # require an unload/bootstrap cycle.
   if ((was_loaded == 0)); then
     cao_service::native::enable_start
-  elif ((cao_runtime_changed || cao_definition_changed)); then
+  elif ((cao_definition_changed)); then
     cao_service::native::reload
+  elif ((cao_runtime_changed)); then
+    cao_service::native::restart
   elif ! cao_service::native::is_active; then
     cao_service::native::start
   fi

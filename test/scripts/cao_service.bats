@@ -63,19 +63,31 @@ load helpers/cao_service_test_helper
   [[ "$(manager_call_count bootout)" -eq 0 ]]
 }
 
-@test "Darwin reload retries a transient bootstrap failure" {
+@test "Darwin install retries a transient bootstrap failure" {
   setup_cao_service_test Darwin
-  run_service install
-  assert_success
-  printf '\n# force runtime refresh\n' \
-    >>"${HOME}/.local/libexec/cao-service/lib/cao-service/common.sh"
   printf '%s\n' "1" >"${CAO_TEST_STATE}/bootstrap-failures"
 
   run_service install
 
   assert_success
   assert_file_exists "${CAO_TEST_STATE}/active"
-  [[ "$(manager_call_count bootstrap)" -eq 3 ]]
+  [[ "$(manager_call_count bootstrap)" -eq 2 ]]
+}
+
+@test "Darwin runtime refresh kickstarts without unloading the label" {
+  setup_cao_service_test Darwin
+  run_service install
+  assert_success
+  printf '\n# force runtime refresh\n' \
+    >>"${HOME}/.local/libexec/cao-service/lib/cao-service/common.sh"
+
+  run_service install
+
+  assert_success
+  assert_file_exists "${CAO_TEST_STATE}/active"
+  [[ "$(manager_call_count bootstrap)" -eq 1 ]]
+  [[ "$(manager_call_count bootout)" -eq 0 ]]
+  [[ "$(manager_call_count kickstart)" -eq 1 ]]
 }
 
 @test "copied controller runs independently from installed runtime" {
