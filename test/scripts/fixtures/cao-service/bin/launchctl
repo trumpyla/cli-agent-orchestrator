@@ -26,6 +26,13 @@ case "${1:-}" in
     printf '}\n'
     ;;
   bootstrap)
+    if [[ -f "${state}/bootstrap-failures" ]]; then
+      failures="$(cat "${state}/bootstrap-failures")"
+      if ((failures > 0)); then
+        printf '%s\n' "$((failures - 1))" >"${state}/bootstrap-failures"
+        exit 5
+      fi
+    fi
     mark_running
     ;;
   bootout)

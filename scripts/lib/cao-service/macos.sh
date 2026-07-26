@@ -65,9 +65,30 @@ cao_service::native::render_definition() {
 EOF
 }
 
+# Bootstrap launchd with a bounded retry for transient teardown races.
+cao_service::native::bootstrap() {
+  local attempt=1
+  while ((attempt <= CAO_SERVICE_NATIVE_RETRY_ATTEMPTS)); do
+    if launchctl bootstrap \
+      "gui/${CAO_SERVICE_UID}" "${CAO_NATIVE_DEFINITION}"; then
+      return 0
+    fi
+    if cao_service::native::is_loaded; then
+      return 0
+    fi
+    if ((attempt == CAO_SERVICE_NATIVE_RETRY_ATTEMPTS)); then
+      cao_service::log \
+        "ERROR: launchd bootstrap failed after ${attempt} attempts"
+      return 1
+    fi
+    sleep "${CAO_SERVICE_NATIVE_RETRY_INTERVAL}"
+    attempt=$((attempt + 1))
+  done
+}
+
 # Load and start the LaunchAgent.
 cao_service::native::enable_start() {
-  launchctl bootstrap "gui/${CAO_SERVICE_UID}" "${CAO_NATIVE_DEFINITION}"
+  cao_service::native::bootstrap
 }
 
 # Start the loaded service or bootstrap an unloaded definition.

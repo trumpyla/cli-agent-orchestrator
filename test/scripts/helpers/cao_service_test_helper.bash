@@ -12,6 +12,8 @@ setup_cao_service_test() {
   export CAO_TEST_STATE="${TEST_ROOT}/state"
   export CAO_SERVICE_READY_TIMEOUT=2
   export CAO_SERVICE_READY_INTERVAL=0.05
+  export CAO_SERVICE_NATIVE_RETRY_ATTEMPTS=3
+  export CAO_SERVICE_NATIVE_RETRY_INTERVAL=0
   export PATH="${FIXTURE_BIN}:${ORIGINAL_PATH}"
   mkdir -p "${HOME}" "${CAO_TEST_STATE}"
 }
