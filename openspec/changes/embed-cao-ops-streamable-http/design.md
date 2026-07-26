@@ -50,8 +50,9 @@ deploy-CAO-first rollout.
 - Converting the identity-bearing in-session `cao-mcp-server` from stdio.
 - Adding legacy SSE or a second CAO Ops daemon.
 - Treating resource notifications as message payloads or delivery authority.
-- Changing database schema, tmux/Herdr lifecycle, terminal readiness/status,
-  full-PTY WebSocket authentication, or the default loopback bind.
+- Converting persisted sessions, changing tmux/Herdr lifecycle, terminal
+  readiness/status, full-PTY WebSocket authentication, or the default loopback
+  bind. One additive nullable terminal-assignment column is in scope.
 - Supporting arbitrary URL interpolation, userinfo URLs, redirects to
   untrusted origins, or silent provider/model downgrade.
 
@@ -224,6 +225,15 @@ entries after user-level extras, expands `~`, and resolves relative entries
 from the repository root without committing a username-specific absolute
 path.
 
+The terminal's assigned `working_directory` is persisted as nullable launch
+metadata. Catalog construction, runtime `load_skill`, and restored provider
+state resolve repository settings from that same assignment rather than from
+the daemon process directory or a provider-specific temporary directory. The
+identity-bearing MCP supplies its terminal identifier to the skill endpoint;
+the API resolves the stored assignment and does not accept a caller-supplied
+filesystem path. This also keeps Kimi restoration correct after a daemon
+restart even though Kimi runs from its own lock-isolation directory.
+
 Supervisors receive `cao-supervisor-protocols`; workers receive
 `cao-worker-protocols`. Profiles include the identity-bearing stdio
 `cao-mcp-server`, managed Context7 HTTP, and the exact
@@ -309,7 +319,10 @@ active CAO sessions.
 5. If any native client fails, set `MCP_CAO_OPS_TRANSPORT=proxy`, rerun config
    sync, and leave `cao-server` plus active sessions untouched.
 
-No database migration or persisted session conversion is required.
+The existing startup migration adds one nullable `working_directory` column to
+terminal records. Existing rows remain valid and resolve skills from the
+server's normal context until a new launch records an assignment; no persisted
+session conversion or backfill is required.
 
 ## Resolved compatibility constraints
 

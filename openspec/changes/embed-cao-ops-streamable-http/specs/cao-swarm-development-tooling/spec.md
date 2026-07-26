@@ -22,9 +22,17 @@ machine-specific user setting.
 - **WHEN** design, testing, or review profiles launch
 - **THEN** they have no native write tools and Kimi/Antigravity enter their validated plan modes without a bypass flag
 
+#### Scenario: Explicit Kimi plan floor
+- **WHEN** a Kimi profile explicitly selects plan mode, including with an empty allowed-tools list
+- **THEN** launch uses `--plan` without `--yolo` and capability inference cannot widen that explicit mode
+
 #### Scenario: Implementation lane
 - **WHEN** an implementation profile launches in an assigned worktree
 - **THEN** its write and execution capabilities are limited to that worktree and owned subsystem
+
+#### Scenario: Worktree-consistent skill resolution
+- **WHEN** a terminal launches in an assigned worktree and later loads a skill, including after a daemon restart or through a provider temporary directory
+- **THEN** its advertised catalog and runtime `load_skill` resolve repository settings from the same persisted assigned worktree
 
 ### Requirement: Required MCP surfaces in profiles
 Every applicable swarm profile MUST include the identity-bearing stdio

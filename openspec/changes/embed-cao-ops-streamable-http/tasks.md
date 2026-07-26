@@ -2,7 +2,7 @@
 
 - [x] 1.1 Record the clean CI-equivalent baseline with `uv sync --all-extras --dev` and `uv run pytest test/ --ignore=test/providers/test_kiro_cli_integration.py --ignore=test/e2e -m "not e2e"`; preserve any unrelated pre-existing failure as explicit evidence.
 - [ ] 1.2 Launch the exact requested read-only design lanes; never downgrade an unavailable model. Record a blocked exact-model lane explicitly and keep this task unchecked until a report or user waiver exists.
-  - Blocked evidence: Claude Fable was attempted twice through CAO and once through the documented acpx fallback; the exact model was unavailable or terminated before a report, and no downgrade was made. Both Gemini reports, the exact Kimi K3 report, and the Sol synthesis completed.
+  - Current evidence: exact Claude Opus and Gemini 3.1 Pro High reports completed in the first remediation round. The exact Kimi K3 session was verified in ACPX metadata but exhausted two targeted attempts without a valid final report, so this task remains blocked rather than counting the lane as passed.
 - [x] 1.3 Synthesize the completed exact-model reports plus independent source evidence, resolve the FastMCP/Kimi/Antigravity constraints, and run `openspec validate embed-cao-ops-streamable-http --strict`.
 
 ## 2. Async CAO Ops factory and compatibility
@@ -41,6 +41,7 @@
 - [ ] 6.3 Add `.serena/project.yml` with Python, generated/cache/worktree exclusions, and `read_only: true`; start the managed project Serena daemon through `artagon-scripts/scripts/mcp.sh`, export its direct URL, and prove symbol navigation from more than one read-only lane.
 - [x] 6.4 Add failing ast-grep fixtures for blocking requests in async handlers, detached subscription tasks, and empty HTTP commands; add `sgconfig.yml`, `rules/python/`, and `rule-tests/` until `sg test` passes and `sg scan --error` rejects each prohibited mutation.
 - [x] 6.5 Add `sg-test` and `sg-scan` Make targets and a CI step pinned to ast-grep 0.44.1; run both targets locally with zero findings.
+- [x] 6.6 Preserve the assigned worktree across terminal persistence, provider restoration, catalog construction, and identity-MCP `load_skill`; add migration, API, database, provider, and utility regression tests.
 
 ## 7. artagon-scripts native-mode rollout
 
@@ -58,3 +59,4 @@
 - [x] 8.5 Run final `artagon-scripts` native/proxy Bats, shell, config-sync, status/doctor, direct-handshake, and diff gates; confirm no CAO proxy child in native mode and no active session termination.
 - [ ] 8.6 Run `openspec validate embed-cao-ops-streamable-http --strict`, obtain an independent implementation-verifier requirement/task/test/evidence verdict, and mark tasks complete only where fresh evidence exists.
 - [ ] 8.7 Prepare separate scoped commits and PR-ready summaries for both branches that cross-link the OpenSpec change, companion PR, detailed swarm findings, verification evidence, deployment order, and rollback; do not push or create PRs without explicit publication authorization.
+- [x] 8.8 Remediate first-round adversarial findings test-first: keep explicit empty Kimi allowlists in plan mode, make explicit plan mode a safety floor, detect annotated async handlers structurally, and offload every resulting blocking identity-MCP HTTP call.

@@ -108,6 +108,11 @@ Each registered directory is scanned one level deep — every immediate subfolde
 
 **Resolution order.** Directories are searched global store first, then `extra_skill_dirs` in the configured order. The first *valid* match for a given name wins, so a skill in the global store is never shadowed by a same-named skill in a later extra directory, and an invalid (unloadable) folder does not shadow a later valid one of the same name — `cao skills list` and `load_skill` resolve a name to the same skill.
 
+For a running terminal, catalog construction and `load_skill` use the terminal's
+persisted assigned working directory as their repository context. This remains
+true after a CAO server restart and for providers such as Kimi that run from a
+separate temporary directory.
+
 **Configuration.** User-wide extra skill directories are stored under
 `skills.extra_dirs` in
 `~/.aws/cli-agent-orchestrator/settings.json` and managed through the
@@ -176,7 +181,9 @@ Skills are delivered to agents differently depending on the provider. The table 
 
 For these providers, the skill catalog is built fresh each time a terminal is created. The catalog — a list of skill names and descriptions — is appended to the system prompt via the provider's native CLI flags.
 
-The agent retrieves full skill content at runtime by calling the `load_skill` MCP tool, which fetches the skill body from the CAO server.
+The agent retrieves full skill content at runtime by calling the `load_skill`
+MCP tool, which identifies the calling terminal and fetches the skill body from
+the CAO server using that terminal's assigned repository context.
 
 No action is needed after `cao skills add` or `cao skills remove` — the next terminal created will automatically reflect the current set of installed skills.
 

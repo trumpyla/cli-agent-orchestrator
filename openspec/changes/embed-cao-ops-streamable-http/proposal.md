@@ -50,7 +50,9 @@ Explicit non-goals:
 - Do not make MCP resource notifications authoritative; inbox long-poll remains the
   reliable source of messages.
 - Do not widen the default loopback bind, change the full-PTY WebSocket trust
-  boundary, add persistence migrations, or change tmux/Herdr terminal semantics.
+  boundary, convert persisted sessions, or change tmux/Herdr terminal semantics.
+  One additive nullable terminal-assignment column is allowed so restored
+  providers and runtime skill loading retain the launch worktree.
 
 ## Capabilities
 
@@ -87,9 +89,11 @@ Web UI, WebSocket, persistence, and backend contracts.
   boundary, are never replaced with the machine-local token for external callers,
   and must not appear in logs or validation errors. Authentication remains
   default-off; when enabled, initialization and all REST calls fail closed.
-- Dependencies: FastMCP is constrained to `>=3.2.0,<3.3.0` because the
-  session-owned subscription adapter characterizes one private 3.2 seam;
-  ast-grep CI installs version 0.44.1. No database migration is required.
+- Dependencies and persistence: FastMCP is constrained to `>=3.2.0,<3.3.0`
+  because the session-owned subscription adapter characterizes one private 3.2
+  seam; ast-grep CI installs version 0.44.1. A backward-compatible migration
+  adds nullable terminal `working_directory` metadata for restart-safe provider
+  restoration and skill resolution.
 - Development and rollout: new `.cao/agents/`, `.serena/project.yml`,
   `sgconfig.yml`, `rules/python/`, `rule-tests/`, Make targets, CI checks,
   documentation, and cross-repository verification evidence. The CAO change deploys

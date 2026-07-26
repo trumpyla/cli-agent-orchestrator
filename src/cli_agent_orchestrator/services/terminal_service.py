@@ -344,6 +344,7 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             caller_id=caller_id,
+            working_directory=working_directory,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -441,6 +442,7 @@ async def create_terminal(
             agent_profile=agent_profile,
             caller_id=caller_id,
             allowed_tools=allowed_tools,
+            working_directory=working_directory,
             shell_command=shell_command,
             status=initial_status,
             last_active=datetime.now(),
@@ -838,6 +840,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "agent_profile": metadata["agent_profile"],
             "caller_id": metadata.get("caller_id"),
             "allowed_tools": metadata.get("allowed_tools"),
+            "working_directory": metadata.get("working_directory"),
             "status": status,
             "last_active": metadata["last_active"],
         }

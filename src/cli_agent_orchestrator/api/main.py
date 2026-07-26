@@ -1684,12 +1684,29 @@ async def set_skill_dirs_endpoint(
 
 
 @app.get("/skills/{name}", response_model=SkillContentResponse)
-async def get_skill_content(name: str) -> SkillContentResponse:
+async def get_skill_content(
+    name: str,
+    terminal_id: Optional[TerminalId] = Query(default=None),
+) -> SkillContentResponse:
     """Return the full Markdown body for an installed skill."""
     try:
         skill_name = validate_skill_name(name)
-        content = load_skill_content(skill_name)
+        working_directory: Optional[str] = None
+        if terminal_id is not None:
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata is None:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Terminal not found: {terminal_id}",
+                )
+            working_directory = metadata.get("working_directory")
+        content = load_skill_content(
+            skill_name,
+            start=Path(working_directory) if working_directory else None,
+        )
         return SkillContentResponse(name=name, content=content)
+    except HTTPException:
+        raise
     except SkillNameError:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,

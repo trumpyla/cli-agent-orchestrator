@@ -156,7 +156,11 @@ def _skill_search_dirs(start: Path | None = None) -> List[Path]:
     return dirs
 
 
-def _resolve_skill(skill_name: str) -> Tuple[SkillMetadata, str]:
+def _resolve_skill(
+    skill_name: str,
+    *,
+    start: Path | None = None,
+) -> Tuple[SkillMetadata, str]:
     """Load a skill by name from the global store or extra directories.
 
     Scans the search dirs in resolution order and returns the first
@@ -174,7 +178,7 @@ def _resolve_skill(skill_name: str) -> Tuple[SkillMetadata, str]:
     path is raised instead.
     """
     first_error: Optional[Exception] = None
-    for directory in _skill_search_dirs():
+    for directory in _skill_search_dirs(start):
         candidate = directory / skill_name
         if not (candidate / "SKILL.md").is_file():
             continue
@@ -188,15 +192,15 @@ def _resolve_skill(skill_name: str) -> Tuple[SkillMetadata, str]:
     return _load_skill_folder(SKILLS_DIR / skill_name)
 
 
-def load_skill_metadata(name: str) -> SkillMetadata:
+def load_skill_metadata(name: str, *, start: Path | None = None) -> SkillMetadata:
     """Load validated metadata for a single installed skill."""
-    metadata, _ = _resolve_skill(validate_skill_name(name))
+    metadata, _ = _resolve_skill(validate_skill_name(name), start=start)
     return metadata
 
 
-def load_skill_content(name: str) -> str:
+def load_skill_content(name: str, *, start: Path | None = None) -> str:
     """Load the Markdown body content for a single installed skill."""
-    _, content = _resolve_skill(validate_skill_name(name))
+    _, content = _resolve_skill(validate_skill_name(name), start=start)
     return content
 
 

@@ -7,7 +7,14 @@ rule:
   all:
     - pattern: requests.$METHOD($$$ARGS)
     - inside:
-        pattern: |
-          async def $FUNC($$$PARAMS):
-            $$$BODY
+        any:
+          - pattern: |
+              async def $FUNC($$$PARAMS):
+                $$$BODY
+          - pattern: |
+              async def $FUNC($$$PARAMS) -> $RETURN:
+                $$$BODY
         stopBy: end
+constraints:
+  METHOD:
+    regex: ^(get|post|put|patch|delete|request|head|options)$

@@ -1,5 +1,6 @@
 """CLI Agent Orchestrator MCP Server implementation."""
 
+import asyncio
 import logging
 import os
 import re
@@ -638,7 +639,11 @@ def _extract_error_detail(response: requests.Response, fallback: str) -> str:
 def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
     """Fetch a skill body from cao-server and return content or a structured error."""
     try:
-        response = requests.get(f"{API_BASE_URL}/skills/{name}", timeout=_mcp_timeout())
+        terminal_id = os.environ.get("CAO_TERMINAL_ID")
+        request_kwargs: Dict[str, Any] = {"timeout": _mcp_timeout()}
+        if terminal_id:
+            request_kwargs["params"] = {"terminal_id": terminal_id}
+        response = requests.get(f"{API_BASE_URL}/skills/{name}", **request_kwargs)
         response.raise_for_status()
         return response.json()["content"]
     except requests.HTTPError as exc:
@@ -734,7 +739,8 @@ async def _handoff_impl(
         # plus headroom; the server enforces the per-step timeout internally.
         client_timeout = float(timeout) + 180.0
         try:
-            response = requests.post(
+            response = await asyncio.to_thread(
+                requests.post,
                 f"{API_BASE_URL}/terminals/run-step",
                 json=payload,
                 timeout=client_timeout,
@@ -1223,7 +1229,8 @@ async def emit_ui(
         Dict with the emitted event id and component name.
     """
     terminal_id = os.getenv("CAO_TERMINAL_ID")
-    response = requests.post(
+    response = await asyncio.to_thread(
+        requests.post,
         f"{API_BASE_URL}/agui/v1/emit_ui",
         json={
             "component": component,
@@ -1623,7 +1630,8 @@ async def workflow_return(
         payload["output_schema"] = output_schema
 
     try:
-        response = requests.post(
+        response = await asyncio.to_thread(
+            requests.post,
             f"{API_BASE_URL}/workflows/runs/{run_id}/steps/{step_id}/output",
             json=payload,
             timeout=_mcp_timeout(),
@@ -1666,7 +1674,8 @@ async def workflow_run(
         # The server awaits the WHOLE run inline (Q1=A), so this blocks for the full
         # run duration — use the worst-case-covering run timeout, NOT the short
         # per-call _mcp_timeout() (mirrors handoff's timeout + 180.0 reasoning).
-        response = requests.post(
+        response = await asyncio.to_thread(
+            requests.post,
             f"{API_BASE_URL}/workflows/runs",
             json=payload,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
@@ -1703,7 +1712,8 @@ async def workflow_resume(
     try:
         # Resume re-drives the WHOLE run inline, so block for the full run duration
         # using the worst-case run timeout, NOT the short per-call _mcp_timeout().
-        response = requests.post(
+        response = await asyncio.to_thread(
+            requests.post,
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
         )
@@ -1735,7 +1745,8 @@ async def workflow_cancel(
     run settles to CANCELLED.
     """
     try:
-        response = requests.post(
+        response = await asyncio.to_thread(
+            requests.post,
             f"{API_BASE_URL}/workflows/runs/{run_id}/cancel",
             timeout=_mcp_timeout(),
         )

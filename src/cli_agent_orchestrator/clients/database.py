@@ -43,6 +43,7 @@ class TerminalModel(Base):
     provider = Column(String, nullable=False)  # "kiro_cli", "claude_code"
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
+    working_directory = Column(String, nullable=True)  # assigned launch repository context
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     # NULL identifies rows created before lifecycle persistence was introduced.
     # New rows start False and flip True only after provider.initialize() succeeds.
@@ -578,6 +579,9 @@ def _migrate_terminals_schema() -> None:
             if "allowed_tools" not in columns:
                 conn.execute("ALTER TABLE terminals ADD COLUMN allowed_tools TEXT")
                 logger.info("Migration: added allowed_tools column to terminals table")
+            if "working_directory" not in columns:
+                conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
+                logger.info("Migration: added working_directory column to terminals table")
             if "shell_command" not in columns:
                 conn.execute("ALTER TABLE terminals ADD COLUMN shell_command TEXT")
                 logger.info("Migration: added shell_command column to terminals table")
@@ -607,6 +611,7 @@ def create_terminal(
     allowed_tools: Optional[List[str]] = None,
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
+    working_directory: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -618,7 +623,8 @@ def create_terminal(
             tmux_window=tmux_window,
             provider=provider,
             agent_profile=agent_profile,
-            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            allowed_tools=(_json.dumps(allowed_tools) if allowed_tools is not None else None),
+            working_directory=working_directory,
             shell_command=shell_command,
             provider_initialized=False,
             profile_prompt_delivered=False,
@@ -633,6 +639,7 @@ def create_terminal(
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
             "allowed_tools": allowed_tools,
+            "working_directory": terminal.working_directory,
             "shell_command": terminal.shell_command,
             "provider_initialized": terminal.provider_initialized,
             "profile_prompt_delivered": terminal.profile_prompt_delivered,
@@ -718,6 +725,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "provider": terminal.provider,
             "agent_profile": terminal.agent_profile,
             "allowed_tools": allowed_tools,
+            "working_directory": terminal.working_directory,
             "shell_command": terminal.shell_command,
             "provider_initialized": terminal.provider_initialized,
             "profile_prompt_delivered": terminal.profile_prompt_delivered,
@@ -737,6 +745,7 @@ def list_terminals_by_session(tmux_session: str) -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
                 "last_active": t.last_active,
             }
             for t in terminals
@@ -798,6 +807,7 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "tmux_window": t.tmux_window,
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
+                "working_directory": t.working_directory,
                 "last_active": t.last_active,
             }
             for t in terminals

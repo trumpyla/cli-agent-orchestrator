@@ -118,6 +118,7 @@ class TestCreateTerminal:
             "developer",
             ["fs_read"],
             caller_id=None,
+            working_directory=None,
         )
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
@@ -319,6 +320,7 @@ class TestCreateTerminal:
             None,
             start=Path("/projects/assigned-repo"),
         )
+        assert mock_db_create.call_args.kwargs["working_directory"] == ("/projects/assigned-repo")
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")

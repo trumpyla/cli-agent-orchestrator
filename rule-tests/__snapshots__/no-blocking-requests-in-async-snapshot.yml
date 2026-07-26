@@ -1,6 +1,24 @@
 id: no-blocking-requests-in-async
 snapshots:
   ? |
+    import requests
+
+    async def fetch_annotated(payload: dict) -> dict:
+        response = requests.post("http://example.test", json=payload)
+        return response.json()
+  : labels:
+    - source: requests.post("http://example.test", json=payload)
+      style: primary
+      start: 82
+      end: 132
+    - source: |-
+        async def fetch_annotated(payload: dict) -> dict:
+            response = requests.post("http://example.test", json=payload)
+            return response.json()
+      style: secondary
+      start: 17
+      end: 159
+  ? |
     async def post_async(payload):
         response = requests.post("http://example.test", json=payload)
         return response.json()

@@ -119,6 +119,12 @@ Repository entries may use `~`; relative entries are resolved from the
 repository root. Invalid repository settings fail closed, and discovery stops
 at the first Git worktree root.
 
+For a launched terminal, CAO records its assigned working directory and uses
+that same repository context for both the advertised skill catalog and later
+`load_skill` calls. Provider restoration after a server restart preserves this
+context; callers identify the terminal and never submit an arbitrary skill
+search path.
+
 ### Server (`server`)
 
 Timeouts and buffer sizes used by the CAO runtime. All values have safe defaults — only override if you experience timeouts or queue overflows.

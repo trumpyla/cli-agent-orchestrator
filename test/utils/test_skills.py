@@ -282,6 +282,36 @@ class TestExtraSkillDirs:
 
         assert "Assigned repository Python patterns" in catalog
 
+    def test_load_content_uses_explicit_terminal_repository(self, tmp_path, monkeypatch):
+        """Skill bodies resolve from the same repository that produced the catalog."""
+        repo = tmp_path / "assigned-repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        settings_file = repo / ".cao" / "settings.json"
+        settings_file.parent.mkdir()
+        shared_skills = tmp_path / "shared-skills"
+        _write_skill(
+            shared_skills / "python-design-patterns",
+            "python-design-patterns",
+            "Assigned repository Python patterns",
+            body="# Assigned Patterns\n\nUse immutable values.",
+        )
+        settings_file.write_text(json.dumps({"skills": {"extra_dirs": ["../shared-skills"]}}))
+        unrelated_cwd = tmp_path / "daemon-cwd"
+        unrelated_cwd.mkdir()
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", global_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+            _project_extra_skill_dirs,
+        )
+        monkeypatch.chdir(unrelated_cwd)
+
+        content = load_skill_content("python-design-patterns", start=repo)
+
+        assert content == "# Assigned Patterns\n\nUse immutable values."
+
     @pytest.mark.parametrize(
         "settings_text",
         [

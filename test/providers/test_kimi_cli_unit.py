@@ -840,6 +840,51 @@ class TestKimiCliProviderBuildCommand:
         assert "--agent-file" not in command
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_command_uses_plan_mode_for_explicit_empty_allowlist(self, mock_load):
+        """An explicit deny-all policy must never become Kimi yolo mode."""
+        mock_profile = MagicMock()
+        mock_profile.model = "kimi-code/k3"
+        mock_profile.system_prompt = "Review only."
+        mock_profile.mcpServers = None
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider(
+            "term-1",
+            "session-1",
+            "window-1",
+            agent_profile="reviewer",
+            allowed_tools=[],
+        )
+
+        command = provider._build_kimi_command()
+
+        assert "--plan" in command
+        assert "--yolo" not in command
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_explicit_plan_mode_cannot_be_overridden_by_write_tools(self, mock_load):
+        """A profile's explicit safety mode takes precedence over inferred capabilities."""
+        mock_profile = MagicMock()
+        mock_profile.model = "kimi-code/k3"
+        mock_profile.system_prompt = "Plan only."
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = "plan"
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider(
+            "term-1",
+            "session-1",
+            "window-1",
+            agent_profile="reviewer",
+            allowed_tools=["fs_read", "fs_write", "execute_bash"],
+        )
+
+        command = provider._build_kimi_command()
+
+        assert "--plan" in command
+        assert "--yolo" not in command
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_with_pydantic_mcp_config(self, mock_load, tmp_path):
         """MCP servers supplied as Pydantic model objects narrow and serialize."""
         mock_profile = MagicMock()

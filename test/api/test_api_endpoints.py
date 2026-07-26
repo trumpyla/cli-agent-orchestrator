@@ -7,6 +7,7 @@ flow_daemon, lifespan, and the main() entry point.
 
 import asyncio
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import ANY, AsyncMock, MagicMock, Mock, call, patch
 
 import pytest
@@ -200,6 +201,26 @@ class TestGetSkillContent:
             "name": "python-testing",
             "content": "# Python Testing\n\nUse pytest.",
         }
+
+    def test_get_skill_uses_terminal_assigned_repository(self, client):
+        """Identity-bound skill loading uses persisted launch context, not daemon cwd."""
+        with (
+            patch(
+                "cli_agent_orchestrator.api.main.get_terminal_metadata",
+                return_value={"working_directory": "/projects/assigned-repo"},
+            ),
+            patch(
+                "cli_agent_orchestrator.api.main.load_skill_content",
+                return_value="# Assigned Skill",
+            ) as mock_load,
+        ):
+            response = client.get("/skills/python-testing?terminal_id=deadbeef")
+
+        assert response.status_code == 200
+        mock_load.assert_called_once_with(
+            "python-testing",
+            start=Path("/projects/assigned-repo"),
+        )
 
     def test_get_skill_returns_400_for_invalid_name(self, client):
         """GET /skills/{name} returns 400 for path traversal names."""

@@ -452,10 +452,9 @@ class KimiCliProvider(BaseProvider):
         """
         command_parts = ["kimi"]
         read_only = False
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             write_capabilities = {"fs_write", "fs_*", "execute_bash"}
             read_only = write_capabilities.isdisjoint(self._allowed_tools)
-        command_parts.append("--plan" if read_only else "--yolo")
 
         # Always create a temp directory for this instance.
         # Kimi CLI v1.20.0+ has a per-directory single-instance lock, so each
@@ -469,6 +468,9 @@ class KimiCliProvider(BaseProvider):
         if self._agent_profile is not None:
             try:
                 profile = load_agent_profile(self._agent_profile)
+
+                if profile.permissionMode == "plan":
+                    read_only = True
 
                 if profile.model:
                     command_parts.extend(["--model", profile.model])
@@ -535,6 +537,10 @@ class KimiCliProvider(BaseProvider):
                 raise
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+        # An explicit profile plan mode is a safety floor: capability inference
+        # may make a profile more restrictive, but never less restrictive.
+        command_parts.insert(1, "--plan" if read_only else "--yolo")
 
         # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
         kimi_cmd = shlex.join(command_parts)

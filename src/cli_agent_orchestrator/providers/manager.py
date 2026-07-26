@@ -1,6 +1,7 @@
 """Provider manager as module singleton with direct terminal_id → provider mapping."""
 
 import logging
+from pathlib import Path
 from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -16,6 +17,8 @@ from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.skills import build_skill_catalog
 
 logger = logging.getLogger(__name__)
 
@@ -168,6 +171,21 @@ class ProviderManager:
         if not metadata:
             raise ValueError(f"Terminal {terminal_id} not found in database")
 
+        skill_prompt: Optional[str] = None
+        working_directory = metadata.get("working_directory")
+        if working_directory and metadata.get("agent_profile"):
+            try:
+                profile = load_agent_profile(metadata["agent_profile"])
+                skill_prompt = build_skill_catalog(
+                    profile.skills,
+                    start=Path(working_directory),
+                )
+            except Exception:
+                logger.warning(
+                    "Could not restore repository skill catalog for terminal %s",
+                    terminal_id,
+                )
+
         # Create provider on-demand
         provider = self.create_provider(
             metadata["provider"],
@@ -176,6 +194,7 @@ class ProviderManager:
             metadata["tmux_window"],
             metadata["agent_profile"],
             metadata.get("allowed_tools"),
+            skill_prompt=skill_prompt,
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since

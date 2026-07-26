@@ -35,6 +35,10 @@ class Terminal(BaseModel):
         None, description="Terminal that created this one via handoff/assign (callback target)"
     )
     allowed_tools: Optional[List[str]] = Field(None, description="Allowed CAO tools")
+    working_directory: Optional[str] = Field(
+        None,
+        description="Repository context assigned when the terminal was launched",
+    )
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
     )

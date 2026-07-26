@@ -6,6 +6,14 @@ valid:
     def fetch_sync():
         return requests.get("http://example.test")
   - |
+    async def record_request(requests, payload):
+        requests.append(payload)
+  - |
+    import requests
+
+    async def classify_error():
+        return requests.ConnectionError("offline")
+  - |
     async def fetch_async(client):
         return await client.get("/health")
 invalid:
@@ -14,6 +22,12 @@ invalid:
 
     async def fetch_async():
         return requests.get("http://example.test")
+  - |
+    import requests
+
+    async def fetch_annotated(payload: dict) -> dict:
+        response = requests.post("http://example.test", json=payload)
+        return response.json()
   - |
     async def post_async(payload):
         response = requests.post("http://example.test", json=payload)

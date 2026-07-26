@@ -69,6 +69,48 @@ class TestTerminalOperations:
         mock_session.commit.assert_called_once()
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_persists_assigned_working_directory(self, mock_session_class):
+        """Launch context survives daemon restart for repository-scoped skill loading."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        result = create_terminal(
+            "test123",
+            "cao-session",
+            "window-0",
+            "kimi_cli",
+            "reviewer",
+            working_directory="/projects/assigned-repo",
+        )
+
+        persisted = mock_session.add.call_args.args[0]
+        assert persisted.working_directory == "/projects/assigned-repo"
+        assert result["working_directory"] == "/projects/assigned-repo"
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_create_terminal_preserves_explicit_empty_allowlist(self, mock_session_class):
+        """A deny-all policy must survive persistence instead of becoming unrestricted."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+        mock_session_class.return_value = mock_session
+
+        result = create_terminal(
+            "test123",
+            "cao-session",
+            "window-0",
+            "kimi_cli",
+            "reviewer",
+            allowed_tools=[],
+        )
+
+        persisted = mock_session.add.call_args.args[0]
+        assert persisted.allowed_tools == "[]"
+        assert result["allowed_tools"] == []
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_found(self, mock_session_class):
         """Test getting terminal metadata that exists."""
         mock_session = MagicMock()
@@ -82,6 +124,7 @@ class TestTerminalOperations:
         mock_terminal.provider = "kiro_cli"
         mock_terminal.agent_profile = "developer"
         mock_terminal.allowed_tools = None
+        mock_terminal.working_directory = "/projects/assigned-repo"
         mock_terminal.last_active = datetime.now()
 
         mock_query = MagicMock()
@@ -93,6 +136,7 @@ class TestTerminalOperations:
 
         assert result is not None
         assert result["id"] == "test123"
+        assert result["working_directory"] == "/projects/assigned-repo"
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_not_found(self, mock_session_class):
@@ -763,6 +807,7 @@ class TestTerminalsSchemaMigration:
                 "FROM terminals"
             ).fetchall()
         assert "caller_id" in columns
+        assert "working_directory" in columns
         assert "provider_initialized" in columns
         assert "profile_prompt_delivered" in columns
         assert rows == [
@@ -796,6 +841,7 @@ class TestTerminalsSchemaMigration:
             columns = [row[1] for row in conn.execute("PRAGMA table_info(terminals)")]
         assert columns.count("caller_id") == 1
         assert columns.count("allowed_tools") == 1
+        assert columns.count("working_directory") == 1
 
 
 class TestInboxAutoincrementMigration:

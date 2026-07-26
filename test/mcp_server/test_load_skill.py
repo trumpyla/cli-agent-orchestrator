@@ -1,6 +1,7 @@
 """Tests for the load_skill MCP tool."""
 
 import asyncio
+import os
 from unittest.mock import MagicMock, patch
 
 import requests
@@ -35,6 +36,24 @@ class TestLoadSkillImpl:
         assert result == "# Use pytest"
         mock_get.assert_called_once_with(
             "http://127.0.0.1:9889/skills/python-testing", timeout=_mcp_timeout()
+        )
+
+    @patch.dict(os.environ, {"CAO_TERMINAL_ID": "deadbeef"})
+    @patch("cli_agent_orchestrator.mcp_server.server.requests.get")
+    def test_forwards_identity_terminal_for_repository_skill_resolution(self, mock_get):
+        """Identity MCP loads skill bodies in its terminal's assigned repository."""
+        from cli_agent_orchestrator.mcp_server.server import _load_skill_impl
+
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.json.return_value = {"name": "python-testing", "content": "# Use pytest"}
+        mock_get.return_value = response
+
+        assert _load_skill_impl("python-testing") == "# Use pytest"
+        mock_get.assert_called_once_with(
+            "http://127.0.0.1:9889/skills/python-testing",
+            params={"terminal_id": "deadbeef"},
+            timeout=_mcp_timeout(),
         )
 
     @patch("cli_agent_orchestrator.mcp_server.server.requests.get")

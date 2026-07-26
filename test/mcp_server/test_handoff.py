@@ -12,6 +12,8 @@ contract; the caller is deliberately rewritten.)
 
 import asyncio
 import os
+import threading
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -73,6 +75,46 @@ class TestShapeHandoffMessage:
 
 class TestHandoffMessageContext:
     """Handoff sends the shaped prompt to the run-step endpoint."""
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    async def test_run_step_http_wait_does_not_block_event_loop(self, mock_provider, _nudge):
+        """The stdio MCP adapter keeps other async tools responsive during HTTP waits."""
+        mock_provider.return_value = _ctx("claude_code")
+        started = threading.Event()
+        release = threading.Event()
+        events: list[str] = []
+
+        def blocking_post(*_args, **_kwargs):
+            started.set()
+            release.wait(timeout=1.0)
+            events.append("post-finished")
+            return _ok_run_step_response()
+
+        def delayed_release() -> None:
+            started.wait(timeout=1.0)
+            time.sleep(0.05)
+            release.set()
+
+        releaser = threading.Thread(target=delayed_release)
+        releaser.start()
+        try:
+            with patch(
+                "cli_agent_orchestrator.mcp_server.server.requests.post",
+                side_effect=blocking_post,
+            ):
+                task = asyncio.create_task(_handoff_impl("developer", "Implement it"))
+                while not started.is_set():
+                    await asyncio.sleep(0)
+                events.append("loop-progress")
+                result = await task
+        finally:
+            release.set()
+            releaser.join(timeout=1.0)
+
+        assert result.success is True
+        assert events.index("loop-progress") < events.index("post-finished")
 
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")

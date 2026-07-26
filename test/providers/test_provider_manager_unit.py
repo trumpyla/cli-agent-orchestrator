@@ -1,5 +1,6 @@
 """Unit tests for ProviderManager."""
 
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -181,6 +182,48 @@ def test_get_provider_restores_undelivered_kimi_profile_prompt():
     prepared = provider.prepare_input("Inspect PR #1")
     assert "Review only." in prepared
     assert "You only have access to these tools: fs_read" in prepared
+
+
+def test_get_provider_restores_kimi_skills_from_assigned_repository():
+    """Restarted Kimi rebuilds its deferred skill catalog from persisted launch context."""
+    manager = ProviderManager()
+    profile = MagicMock(system_prompt="Review only.", skills=["python-design-patterns"])
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value={
+                "provider": ProviderType.KIMI_CLI.value,
+                "tmux_session": "s1",
+                "tmux_window": "w1",
+                "agent_profile": "reviewer",
+                "allowed_tools": ["fs_read"],
+                "working_directory": "/projects/assigned-repo",
+                "shell_command": None,
+                "provider_initialized": True,
+                "profile_prompt_delivered": False,
+            },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.load_agent_profile",
+            return_value=profile,
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.build_skill_catalog",
+            return_value="## Available Skills\n\n- python-design-patterns",
+        ) as mock_catalog,
+        patch(
+            "cli_agent_orchestrator.providers.kimi_cli.load_agent_profile",
+            return_value=profile,
+        ),
+    ):
+        provider = manager.get_provider("t1")
+
+    assert "python-design-patterns" in provider.prepare_input("Inspect PR #1")
+    mock_catalog.assert_called_once_with(
+        ["python-design-patterns"],
+        start=Path("/projects/assigned-repo"),
+    )
 
 
 def test_get_provider_quarantines_kimi_when_undelivered_profile_cannot_load():
