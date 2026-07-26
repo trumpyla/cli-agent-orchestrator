@@ -437,7 +437,7 @@ class KimiCliProvider(BaseProvider):
         Uses shlex.join() for safe escaping of all arguments.
 
         Command structure:
-            cd <temp_dir> && TERM=xterm-256color kimi --yolo [--plan]
+            cd <temp_dir> && TERM=xterm-256color kimi (--plan | --yolo)
 
         The ``cd`` is required because Kimi CLI v1.20.0+ enforces a per-directory
         single-instance lock — only one kimi process can run in a given directory.
@@ -446,14 +446,16 @@ class KimiCliProvider(BaseProvider):
         The ``TERM=xterm-256color`` override is needed because Kimi CLI v1.20.0+
         silently exits when TERM=tmux-256color (the tmux default).
 
-        The --yolo flag auto-approves all tool actions, which is required for
-        non-interactive operation in CAO-managed tmux sessions.
+        Read-only profiles use native ``--plan`` without ``--yolo`` so review
+        and design lanes retain an approval boundary. Other profiles keep the
+        historical non-interactive ``--yolo`` behavior.
         """
-        command_parts = ["kimi", "--yolo"]
+        command_parts = ["kimi"]
+        read_only = False
         if self._allowed_tools and "*" not in self._allowed_tools:
             write_capabilities = {"fs_write", "fs_*", "execute_bash"}
-            if write_capabilities.isdisjoint(self._allowed_tools):
-                command_parts.append("--plan")
+            read_only = write_capabilities.isdisjoint(self._allowed_tools)
+        command_parts.append("--plan" if read_only else "--yolo")
 
         # Always create a temp directory for this instance.
         # Kimi CLI v1.20.0+ has a per-directory single-instance lock, so each

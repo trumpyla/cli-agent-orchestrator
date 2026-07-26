@@ -1,6 +1,7 @@
 """Full tests for terminal service."""
 
 from datetime import datetime
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -297,7 +298,12 @@ class TestCreateTerminal:
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
-        await create_terminal("codex", "developer", new_session=True)
+        await create_terminal(
+            "codex",
+            "developer",
+            new_session=True,
+            working_directory="/projects/assigned-repo",
+        )
 
         skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
         assert skill_prompt == (
@@ -308,6 +314,10 @@ class TestCreateTerminal:
             "commands or directories.\n\n"
             "- **cao-worker-protocols**: Worker communication\n"
             "- **python-testing**: Pytest conventions"
+        )
+        mock_build_skill_catalog.assert_called_once_with(
+            None,
+            start=Path("/projects/assigned-repo"),
         )
 
     @pytest.mark.asyncio

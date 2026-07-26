@@ -21,6 +21,10 @@ def _default_no_extra_skill_dirs(monkeypatch):
         "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
         lambda: [],
     )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+        lambda: [],
+    )
 
 
 def _create_skill(folder: Path, name: str, description: str, body: str = "# Skill\n\nBody") -> None:

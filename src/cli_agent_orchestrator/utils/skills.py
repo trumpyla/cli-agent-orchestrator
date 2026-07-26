@@ -1,12 +1,13 @@
 """Skill loading and validation utilities."""
 
 import fnmatch
+import json
 import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 import frontmatter
-from pydantic import ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from cli_agent_orchestrator.constants import SKILLS_DIR
 from cli_agent_orchestrator.models.skill import SkillMetadata
@@ -23,6 +24,22 @@ SKILL_CATALOG_INSTRUCTION = (
 
 class SkillNameError(ValueError):
     """Raised when a skill name is empty or unsafe to resolve on disk."""
+
+
+class _ProjectSkillsSettings(BaseModel):
+    """Strict repository-owned subset of the user skills settings schema."""
+
+    model_config = ConfigDict(extra="ignore", strict=True, frozen=True)
+
+    extra_dirs: List[str] = Field(default_factory=list)
+
+
+class _ProjectSettings(BaseModel):
+    """Validated project settings relevant to skill discovery."""
+
+    model_config = ConfigDict(extra="ignore", strict=True, frozen=True)
+
+    skills: _ProjectSkillsSettings = Field(default_factory=_ProjectSkillsSettings)
 
 
 def validate_skill_name(skill_name: str) -> str:
@@ -72,18 +89,63 @@ def _load_skill_folder(skill_path: Path) -> Tuple[SkillMetadata, str]:
     return metadata, content
 
 
-def _skill_search_dirs() -> List[Path]:
+def _project_settings_path(start: Path | None = None) -> Path | None:
+    """Find the nearest repository-owned ``.cao/settings.json``.
+
+    The search stops at the first Git worktree root so a nested checkout never
+    inherits settings from an unrelated parent repository.
+    """
+    current = (start or Path.cwd()).resolve()
+    for directory in (current, *current.parents):
+        candidate = directory / ".cao" / "settings.json"
+        if candidate.is_file():
+            return candidate
+        if (directory / ".git").exists():
+            return None
+    return None
+
+
+def _project_extra_skill_dirs(start: Path | None = None) -> List[str]:
+    """Return validated project ``skills.extra_dirs`` paths.
+
+    Relative entries are resolved against the repository root containing
+    ``.cao/settings.json``. Invalid JSON or schema shapes fail closed without
+    logging configured path values.
+    """
+    settings_path = _project_settings_path(start)
+    if settings_path is None:
+        return []
+    try:
+        settings = _ProjectSettings.model_validate(json.loads(settings_path.read_text()))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValidationError):
+        logger.warning("Skipping repository skill settings reason=invalid_project_settings")
+        return []
+
+    project_root = settings_path.parent.parent
+    resolved: List[str] = []
+    for raw_path in settings.skills.extra_dirs:
+        expanded = Path(raw_path).expanduser()
+        candidate = expanded if expanded.is_absolute() else project_root / expanded
+        resolved.append(str(candidate))
+    return resolved
+
+
+def _skill_search_dirs(start: Path | None = None) -> List[Path]:
     """Return skill store directories in resolution order.
 
     The global skill store (``SKILLS_DIR``) is searched first, followed by any
-    user-added directories from the ``extra_skill_dirs`` setting. This mirrors
-    agent-profile resolution (global store first, then extra user directories),
-    so a skill in the global store is never shadowed by a later extra directory.
+    user-added directories and repository-owned ``skills.extra_dirs``. Existing
+    user precedence is preserved, and a skill in the global store is never
+    shadowed by a later extra directory.
     """
     from cli_agent_orchestrator.services.settings_service import get_extra_skill_dirs
 
     dirs: List[Path] = [Path(normalized_path(SKILLS_DIR))]
-    for index, extra in enumerate(get_extra_skill_dirs()):
+    project_dirs = (
+        _project_extra_skill_dirs(start) if start is not None else _project_extra_skill_dirs()
+    )
+    configured_dirs = [*get_extra_skill_dirs(), *project_dirs]
+    for index, extra in enumerate(configured_dirs):
         try:
             dirs.append(Path(normalized_path(extra)))
         except ValueError:
@@ -138,7 +200,7 @@ def load_skill_content(name: str) -> str:
     return content
 
 
-def list_skills() -> List[SkillMetadata]:
+def list_skills(*, start: Path | None = None) -> List[SkillMetadata]:
     """Return all valid skills from the global store and extra directories.
 
     Directories are scanned in resolution order (global store first, then
@@ -149,7 +211,7 @@ def list_skills() -> List[SkillMetadata]:
     result is sorted by name.
     """
     skills_by_name: Dict[str, SkillMetadata] = {}
-    for directory in _skill_search_dirs():
+    for directory in _skill_search_dirs(start):
         if not directory.is_dir():
             continue
         for item in directory.iterdir():
@@ -170,7 +232,11 @@ def list_skills() -> List[SkillMetadata]:
     return sorted(skills_by_name.values(), key=lambda skill: skill.name)
 
 
-def build_skill_catalog(skill_filter: Optional[List[str]] = None) -> str:
+def build_skill_catalog(
+    skill_filter: Optional[List[str]] = None,
+    *,
+    start: Path | None = None,
+) -> str:
     """Build the injected skill catalog block.
 
     Args:
@@ -181,8 +247,11 @@ def build_skill_catalog(skill_filter: Optional[List[str]] = None) -> str:
             least one pattern are listed; an empty list advertises no skills at
             all. Patterns that match no installed skill are logged (usually a
             typo or a stale skill name).
+        start: Optional terminal working directory used to discover the nearest
+            repository-owned ``.cao/settings.json``. When omitted, the process
+            working directory preserves CLI compatibility.
     """
-    skills = list_skills()
+    skills = list_skills(start=start) if start is not None else list_skills()
     if skill_filter is not None:
         matched_patterns: Set[str] = set()
         selected: List[SkillMetadata] = []

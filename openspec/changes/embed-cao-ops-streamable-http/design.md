@@ -218,15 +218,20 @@ testing, and adversarial review. CAO discovers the nearest repository-owned
 `.cao/agents/` directory automatically up to the current Git worktree root, so
 a fresh clone needs no user-global profile copy or committed absolute path.
 The Artagon Python skill path remains operator-configurable through portable
-`skills.extra_dirs`.
+`skills.extra_dirs`. This repository commits the portable path in
+`.cao/settings.json`; CAO merges the nearest worktree's validated project
+entries after user-level extras, expands `~`, and resolves relative entries
+from the repository root without committing a username-specific absolute
+path.
 
 Supervisors receive `cao-supervisor-protocols`; workers receive
 `cao-worker-protocols`. Profiles include the identity-bearing stdio
 `cao-mcp-server`, managed Context7 HTTP, and the exact
 `${CAO_SERENA_MCP_URL}` HTTP entry. Design/test/review profiles omit native
 write tools; Kimi uses native plan mode and Antigravity uses
-`permissionMode: plan`. Implementation profiles receive write/execute
-capabilities only in their assigned worktrees.
+`permissionMode: plan`. Kimi plan-mode profiles omit `--yolo`; writable Kimi
+profiles retain it. Implementation profiles receive write/execute capabilities
+only in their assigned worktrees.
 
 Supervisor profiles additionally include the embedded `cao-ops` native HTTP
 endpoint. This keeps them in Codex plan/read-only mode while providing

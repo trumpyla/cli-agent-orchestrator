@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import frontmatter
@@ -11,6 +12,7 @@ from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROFILE_DIR = REPO_ROOT / ".cao" / "agents"
+PROJECT_SETTINGS = REPO_ROOT / ".cao" / "settings.json"
 
 SUPERVISORS = {
     "cao-repo-supervisor-sol": ("codex", "gpt-5.6-sol"),
@@ -60,6 +62,15 @@ PYTHON_SKILLS = {
     "python-code-style",
     "python-anti-patterns",
 }
+
+
+def test_repository_registers_portable_artagon_python_skill_directory() -> None:
+    settings = json.loads(PROJECT_SETTINGS.read_text())
+    extra_dirs = settings["skills"]["extra_dirs"]
+
+    assert extra_dirs == ["~/Projects/Artagon/artagon-ai-skills/plugins/artagon-python/skills"]
+    assert all(not path.startswith("/") for path in extra_dirs)
+    assert "/Users/" not in PROJECT_SETTINGS.read_text()
 
 
 def _read(name: str) -> tuple[AgentProfile, str]:

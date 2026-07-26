@@ -24,6 +24,7 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Dict, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -300,11 +301,15 @@ async def create_terminal(
             profile = load_agent_profile(agent_profile)
         except FileNotFoundError:
             profile = None
-        skill_prompt = (
-            build_skill_catalog(profile.skills if profile else None)
-            if provider in RUNTIME_SKILL_PROMPT_PROVIDERS
-            else None
-        )
+        skill_filter = profile.skills if profile else None
+        if provider in RUNTIME_SKILL_PROMPT_PROVIDERS:
+            skill_prompt = (
+                build_skill_catalog(skill_filter, start=Path(working_directory))
+                if working_directory
+                else build_skill_catalog(skill_filter)
+            )
+        else:
+            skill_prompt = None
 
         # Step 3b: Resolve allowed_tools from profile if not explicitly provided
         if allowed_tools is None and profile is not None:
@@ -315,9 +320,9 @@ async def create_terminal(
                 profile.allowedTools, profile.role, mcp_server_names
             )
 
-        # Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
-        # mechanism (kimi runs --yolo; restrictions are prompt-level text
-        # only), so a restricted policy on them is advisory, not enforced.
+        # Soft-enforcement guard: kimi_cli/codex do not implement CAO's exact
+        # tool allowlist natively. Kimi read-only profiles use native plan mode,
+        # but individual restrictions still rely on prompt-level guidance.
         # Surface that loudly at launch so operators route restricted or
         # write-capable roles to hard-enforcement providers instead.
         if provider in SOFT_ENFORCEMENT_PROVIDERS and allowed_tools and "*" not in allowed_tools:

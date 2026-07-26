@@ -45,8 +45,9 @@ Define the agent's role, responsibilities, and behavior here.
   read-only sandbox and `acceptEdits` to its workspace-write sandbox; both use
   `--ask-for-approval never` so a headless terminal cannot park, and neither
   uses `--yolo`. Antigravity maps `plan` and `acceptEdits` to its native
-  `--mode` values and omits the bypass flag. Kimi write access is derived from
-  the profile tool boundary instead of this field. See
+  `--mode` values and omits the bypass flag. Kimi derives read-only operation
+  from the profile tool boundary, launches those profiles with `--plan`, and
+  omits `--yolo`; writable profiles retain `--yolo`. See
   [Claude Code permission modes](https://code.claude.com/docs/en/permission-modes).
 - `native_agent` (string, `claude_code` only): Name of a native Claude Code agent (`~/.claude/agents/`). When set, the provider passes `--agent <name>` directly and skips system prompt / MCP config decomposition (thin-wrapper mode). See [Claude Code native agent routing](claude-code.md#native-agent-routing).
 - `codexProfile` (string, `codex` only): Names a `[profiles.<name>]` block in `~/.codex/config.toml`. When set, the provider drops `--yolo` and passes `--profile <name>` instead. See [Custom Codex Profile](codex-cli.md#custom-codex-profile).

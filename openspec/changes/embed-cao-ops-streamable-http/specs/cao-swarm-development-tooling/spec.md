@@ -20,7 +20,7 @@ machine-specific user setting.
 
 #### Scenario: Read-only lanes
 - **WHEN** design, testing, or review profiles launch
-- **THEN** they have no native write tools and Kimi/Antigravity enter their validated plan modes
+- **THEN** they have no native write tools and Kimi/Antigravity enter their validated plan modes without a bypass flag
 
 #### Scenario: Implementation lane
 - **WHEN** an implementation profile launches in an assigned worktree

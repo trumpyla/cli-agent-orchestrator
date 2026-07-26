@@ -275,10 +275,10 @@ Do NOT attempt to use: execute_bash, fs_write
 ```
 
 For Kimi profiles whose resolved CAO tools contain no `fs_write`, `fs_*`, or
-`execute_bash`, CAO also launches the interactive CLI with `--plan`. This is a
-useful native guardrail for reviewer sessions, but it does not turn Kimi into a
-hard-enforcement provider: Kimi plan mode still permits shell-tool behavior, so
-the prompt restriction remains part of the boundary.
+`execute_bash`, CAO launches the interactive CLI with `--plan` and omits
+`--yolo`. This is a useful native guardrail for reviewer sessions, but it does
+not turn Kimi into a hard-enforcement provider: Kimi plan mode still permits
+shell-tool behavior, so the prompt restriction remains part of the boundary.
 
 ## Cross-Provider Inheritance
 

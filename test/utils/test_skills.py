@@ -1,5 +1,6 @@
 """Tests for skill utilities."""
 
+import json
 import logging
 from pathlib import Path
 from unittest.mock import patch
@@ -8,6 +9,7 @@ import pytest
 
 from cli_agent_orchestrator.models.skill import SkillMetadata
 from cli_agent_orchestrator.utils.skills import (
+    _project_extra_skill_dirs,
     build_skill_catalog,
     list_skills,
     load_skill_content,
@@ -28,15 +30,18 @@ def _write_skill(folder: Path, name: str, description: str, body: str = "# Title
 
 @pytest.fixture(autouse=True)
 def _default_no_extra_skill_dirs(monkeypatch):
-    """Default ``extra_skill_dirs`` to empty for every test.
+    """Default user and repository ``extra_skill_dirs`` to empty for every test.
 
     Existing tests patch only ``SKILLS_DIR``; without this they would read the
-    developer's real ``settings.json``. Tests that exercise extra dirs override
-    this via ``_use_skill_dirs``.
+    developer's real settings. Tests that exercise extra dirs override this.
     """
     monkeypatch.setattr(
         "cli_agent_orchestrator.services.settings_service.get_extra_skill_dirs",
         lambda: [],
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+        lambda _start=None: [],
     )
 
 
@@ -207,6 +212,184 @@ class TestListSkills:
 
 class TestExtraSkillDirs:
     """Resolving skills from ``extra_skill_dirs`` (mirrors ``extra_agent_dirs``)."""
+
+    def test_repo_settings_register_external_python_skills(self, tmp_path, monkeypatch):
+        """A fresh repo resolves its declared external skills without user settings."""
+        repo = tmp_path / "repo"
+        nested_cwd = repo / "src" / "package"
+        nested_cwd.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        project_settings = repo / ".cao" / "settings.json"
+        project_settings.parent.mkdir()
+
+        shared_skills = tmp_path / "artagon-python-skills"
+        _write_skill(
+            shared_skills / "python-design-patterns",
+            "python-design-patterns",
+            "Functional Python design patterns",
+        )
+        project_settings.write_text(
+            json.dumps(
+                {
+                    "skills": {
+                        "extra_dirs": [
+                            "../artagon-python-skills",
+                        ]
+                    }
+                }
+            )
+        )
+
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", global_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+            _project_extra_skill_dirs,
+        )
+        monkeypatch.chdir(nested_cwd)
+
+        catalog = build_skill_catalog(["python-design-patterns"])
+
+        assert "Functional Python design patterns" in catalog
+
+    def test_explicit_start_overrides_daemon_cwd(self, tmp_path, monkeypatch):
+        """A terminal catalog resolves settings from its assigned repository."""
+        repo = tmp_path / "assigned-repo"
+        repo.mkdir()
+        (repo / ".git").mkdir()
+        settings_file = repo / ".cao" / "settings.json"
+        settings_file.parent.mkdir()
+        shared_skills = tmp_path / "shared-skills"
+        _write_skill(
+            shared_skills / "python-design-patterns",
+            "python-design-patterns",
+            "Assigned repository Python patterns",
+        )
+        settings_file.write_text(json.dumps({"skills": {"extra_dirs": ["../shared-skills"]}}))
+        unrelated_cwd = tmp_path / "daemon-cwd"
+        unrelated_cwd.mkdir()
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", global_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+            _project_extra_skill_dirs,
+        )
+        monkeypatch.chdir(unrelated_cwd)
+
+        catalog = build_skill_catalog(["python-design-patterns"], start=repo)
+
+        assert "Assigned repository Python patterns" in catalog
+
+    @pytest.mark.parametrize(
+        "settings_text",
+        [
+            pytest.param("{not-json", id="malformed-json"),
+            pytest.param('{"skills": []}', id="skills-not-object"),
+            pytest.param(
+                '{"skills": {"extra_dirs": "/private/secret-skills"}}',
+                id="extra-dirs-not-list",
+            ),
+            pytest.param(
+                '{"skills": {"extra_dirs": [123]}}',
+                id="extra-dir-not-string",
+            ),
+            pytest.param('{"skills": null}', id="skills-null"),
+            pytest.param(
+                '{"skills": {"extra_dirs": [null]}}',
+                id="extra-dir-null",
+            ),
+        ],
+    )
+    def test_invalid_repo_settings_fail_closed_without_disclosing_values(
+        self, tmp_path, monkeypatch, caplog, settings_text
+    ):
+        repo = tmp_path / "repo"
+        nested_cwd = repo / "src"
+        nested_cwd.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        settings_file = repo / ".cao" / "settings.json"
+        settings_file.parent.mkdir()
+        settings_file.write_text(settings_text)
+
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", global_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+            _project_extra_skill_dirs,
+        )
+        monkeypatch.chdir(nested_cwd)
+
+        with caplog.at_level(logging.WARNING):
+            assert list_skills() == []
+
+        assert "reason=invalid_project_settings" in caplog.text
+        assert "secret-skills" not in caplog.text
+
+    def test_non_utf8_repo_settings_fail_closed_without_disclosing_values(
+        self, tmp_path, monkeypatch, caplog
+    ):
+        repo = tmp_path / "repo"
+        nested_cwd = repo / "src"
+        nested_cwd.mkdir(parents=True)
+        (repo / ".git").mkdir()
+        settings_file = repo / ".cao" / "settings.json"
+        settings_file.parent.mkdir()
+        settings_file.write_bytes(b'{"skills":{"extra_dirs":["secret-\xff"]}}')
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", global_dir)
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+            _project_extra_skill_dirs,
+        )
+
+        with caplog.at_level(logging.WARNING):
+            assert list_skills(start=nested_cwd) == []
+
+        assert "reason=invalid_project_settings" in caplog.text
+        assert "secret-" not in caplog.text
+
+    @pytest.mark.parametrize("git_marker", ["directory", "gitfile"])
+    def test_repo_settings_do_not_cross_nested_git_root(self, tmp_path, monkeypatch, git_marker):
+        parent = tmp_path / "parent"
+        parent_settings = parent / ".cao" / "settings.json"
+        parent_settings.parent.mkdir(parents=True)
+        parent_settings.write_text(json.dumps({"skills": {"extra_dirs": ["../shared-skills"]}}))
+        nested_repo = parent / "nested"
+        nested_cwd = nested_repo / "src"
+        nested_cwd.mkdir(parents=True)
+        if git_marker == "directory":
+            (nested_repo / ".git").mkdir()
+        else:
+            (nested_repo / ".git").write_text("gitdir: ../metadata/worktrees/nested\n")
+
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+            _project_extra_skill_dirs,
+        )
+        monkeypatch.chdir(nested_cwd)
+
+        assert _project_extra_skill_dirs() == []
+
+    def test_user_extra_dir_precedes_repository_extra_dir(self, tmp_path, monkeypatch):
+        global_dir = tmp_path / "global"
+        global_dir.mkdir()
+        user_dir = tmp_path / "user"
+        repo_dir = tmp_path / "repo"
+        _write_skill(user_dir / "task", "task", "User task")
+        _write_skill(repo_dir / "task", "task", "Repository task")
+        _use_skill_dirs(monkeypatch, global_dir, [user_dir])
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.utils.skills._project_extra_skill_dirs",
+            lambda: [str(repo_dir)],
+        )
+
+        metadata = load_skill_metadata("task")
+
+        assert metadata.description == "User task"
 
     def test_load_metadata_from_extra_dir(self, tmp_path, monkeypatch):
         global_dir = tmp_path / "global"

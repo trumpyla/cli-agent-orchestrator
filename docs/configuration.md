@@ -110,9 +110,14 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 Skills (loaded on demand via the `load_skill` MCP tool) are discovered from, in order:
 
 1. **Global skill store** — `~/.aws/cli-agent-orchestrator/skills/`
-2. **Extra custom directories** — `skills.extra_dirs`
+2. **User extra directories** — `skills.extra_dirs` in the user settings file
+3. **Repository extra directories** — `skills.extra_dirs` in the nearest
+   `.cao/settings.json`
 
 `skills.extra_dirs` lets you keep a project's skills in the project repo (e.g. `<repo>/.cao/skills`) and register the directory instead of copying/symlinking each skill into the global store.
+Repository entries may use `~`; relative entries are resolved from the
+repository root. Invalid repository settings fail closed, and discovery stops
+at the first Git worktree root.
 
 ### Server (`server`)
 

@@ -836,6 +836,7 @@ class TestKimiCliProviderBuildCommand:
         command = provider._build_kimi_command()
 
         assert "--plan" in command
+        assert "--yolo" not in command
         assert "--agent-file" not in command
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
