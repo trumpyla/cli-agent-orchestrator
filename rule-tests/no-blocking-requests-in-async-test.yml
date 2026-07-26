@@ -40,3 +40,12 @@ invalid:
   - |
     async def load_skill(name):
         return _load_skill_impl(name)
+  - |
+    async def assign(profile, message):
+        return _assign_impl(profile, message, None)
+  - |
+    async def handoff(profile):
+        return _resolve_handoff_provider(profile)
+  - |
+    async def memory_recall():
+        return _get_terminal_context_from_env()

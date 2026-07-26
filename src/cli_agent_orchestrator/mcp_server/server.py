@@ -728,7 +728,11 @@ async def _handoff_impl(
         # in the SAME session with #284 callback routing and tool inheritance
         # preserved (BR-8 observable-behavior parity). The endpoint then
         # creates + drives + tears down the terminal.
-        ctx = _resolve_handoff_provider(agent_profile, working_directory)
+        ctx = await asyncio.to_thread(
+            _resolve_handoff_provider,
+            agent_profile,
+            working_directory,
+        )
         provider = ctx.provider
 
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
@@ -1105,7 +1109,12 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Optional working directory where the agent should execute"
         ),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, working_directory)
+        return await asyncio.to_thread(
+            _assign_impl,
+            agent_profile,
+            message,
+            working_directory,
+        )
 
 else:
 
@@ -1116,7 +1125,7 @@ else:
         ),
         message: str = Field(description=_assign_message_field_desc),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, None)
+        return await asyncio.to_thread(_assign_impl, agent_profile, message, None)
 
 
 # Implementation function for send_message
@@ -1460,7 +1469,7 @@ async def memory_store(
 
     try:
         service = MemoryService()
-        terminal_context = _get_terminal_context_from_env()
+        terminal_context = await asyncio.to_thread(_get_terminal_context_from_env)
         memory = await service.store(
             content=content,
             scope=scope,
@@ -1556,7 +1565,7 @@ async def memory_recall(
 
     try:
         service = MemoryService()
-        terminal_context = _get_terminal_context_from_env()
+        terminal_context = await asyncio.to_thread(_get_terminal_context_from_env)
         memories = await service.recall(
             query=query,
             scope=scope,
@@ -1607,7 +1616,7 @@ async def memory_forget(
 
     try:
         service = MemoryService()
-        terminal_context = _get_terminal_context_from_env()
+        terminal_context = await asyncio.to_thread(_get_terminal_context_from_env)
         deleted = await service.forget(
             key=key,
             scope=scope,

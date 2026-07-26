@@ -162,6 +162,53 @@ class TestHandoffMessageContext:
         assert result.success is True
         assert events.index("loop-progress") < events.index("nudge-finished")
 
+    @pytest.mark.asyncio
+    async def test_context_resolution_does_not_block_event_loop(self):
+        """Supervisor HTTP/profile resolution runs outside the MCP event loop."""
+        started = threading.Event()
+        release = threading.Event()
+        events: list[str] = []
+
+        def blocking_context(*_args):
+            started.set()
+            release.wait(timeout=1.0)
+            events.append("context-finished")
+            return _ctx("claude_code")
+
+        def delayed_release() -> None:
+            started.wait(timeout=1.0)
+            time.sleep(0.05)
+            release.set()
+
+        releaser = threading.Thread(target=delayed_release)
+        releaser.start()
+        try:
+            with (
+                patch(
+                    "cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider",
+                    side_effect=blocking_context,
+                ),
+                patch(
+                    "cli_agent_orchestrator.mcp_server.server.requests.post",
+                    return_value=_ok_run_step_response(),
+                ),
+                patch(
+                    "cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge",
+                    return_value="",
+                ),
+            ):
+                task = asyncio.create_task(_handoff_impl("developer", "Implement it"))
+                while not started.is_set():
+                    await asyncio.sleep(0)
+                events.append("loop-progress")
+                result = await task
+        finally:
+            release.set()
+            releaser.join(timeout=1.0)
+
+        assert result.success is True
+        assert events.index("loop-progress") < events.index("context-finished")
+
     @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_codex_provider_sends_banner_to_endpoint(self, mock_provider, _nudge):
