@@ -67,7 +67,11 @@ async def embedded_stack() -> AsyncIterator[EmbeddedStack]:
     """Build a fresh session manager per test so retained state cannot leak."""
     rest_authorizations: list[str | None] = []
     backend = AsgiRequestBackend(authorization=_authorization_from_current_mcp_request)
-    mcp = ops_server.create_ops_mcp(backend, auth=ops_server.CaoTokenVerifier())
+    mcp = ops_server.create_ops_mcp(
+        backend,
+        auth=ops_server.CaoTokenVerifier(),
+        subscription_authorization=_authorization_from_current_mcp_request,
+    )
     mcp_http = mcp.http_app(path="/ops", transport="http", stateless_http=False)
     host = FastAPI(lifespan=mcp_http.lifespan)
     host.add_middleware(
@@ -95,6 +99,12 @@ async def embedded_stack() -> AsyncIterator[EmbeddedStack]:
             {"id": "deadbeef", "session_name": "cao-write"},
             status_code=201,
         )
+
+    @host.get("/terminals/{peer_id}/inbox/messages")
+    async def receive_inbox(peer_id: str, request: Request) -> JSONResponse:
+        del peer_id
+        rest_authorizations.append(request.headers.get("authorization"))
+        return JSONResponse([])
 
     host.mount("/mcp", mcp_http)
     backend.bind(host)
@@ -224,10 +234,11 @@ async def _subscribe_peer(
     session_id: str,
     *,
     peer_id: str = "deadbeef",
+    token: str | None = None,
 ) -> httpx.Response:
     return await client.post(
         "/mcp/ops",
-        headers=_mcp_headers(session_id=session_id),
+        headers=_mcp_headers(token, session_id),
         json={
             "jsonrpc": "2.0",
             "id": 90,
@@ -294,8 +305,12 @@ async def test_streamable_http_delete_cancels_session_owned_peer_subscription(
     started = asyncio.Event()
     stopped = asyncio.Event()
 
-    async def stalled_consumer(peer_id: str, session: Any) -> None:
-        del peer_id, session
+    async def stalled_consumer(
+        peer_id: str,
+        session: Any,
+        authorization: Any,
+    ) -> None:
+        del peer_id, session, authorization
         started.set()
         try:
             await asyncio.Event().wait()
@@ -331,8 +346,12 @@ async def test_host_lifespan_shutdown_cancels_all_peer_subscriptions(
     started = asyncio.Event()
     stopped = asyncio.Event()
 
-    async def stalled_consumer(peer_id: str, session: Any) -> None:
-        del peer_id, session
+    async def stalled_consumer(
+        peer_id: str,
+        session: Any,
+        authorization: Any,
+    ) -> None:
+        del peer_id, session, authorization
         started.set()
         try:
             await asyncio.Event().wait()
@@ -567,6 +586,59 @@ async def test_current_refresh_header_reaches_rest_and_read_scope_stays_authorit
         assert body["result"]["structuredContent"]["success"] is False
         assert "Forbidden" in body["result"]["structuredContent"]["message"]
         assert stack.rest_authorizations == ["Bearer fresh-read-token"]
+
+
+@pytest.mark.asyncio
+async def test_subscription_worker_uses_subscribe_request_authorization(
+    stack_factory: Callable[[], AbstractAsyncContextManager[EmbeddedStack]],
+    enable_fake_auth: Callable[[dict[str, TokenIdentity]], None],
+) -> None:
+    """Background polling must receive an explicit subscribe-request credential."""
+    enable_fake_auth(
+        {
+            "subscription-token": TokenIdentity(
+                scopes=["cao:read"],
+                issuer="https://issuer-a.test/",
+                subject="subject-a",
+                client_id="client-a",
+            )
+        }
+    )
+
+    async with stack_factory() as stack:
+        initialized, session_id = await _initialize(
+            stack.client,
+            token="subscription-token",
+        )
+        assert initialized.status_code == 200
+        assert session_id is not None
+        assert (
+            await _notify_initialized(
+                stack.client,
+                session_id,
+                "subscription-token",
+            )
+        ).status_code in {200, 202}
+
+        subscribed = await _subscribe_peer(
+            stack.client,
+            session_id,
+            token="subscription-token",
+        )
+        assert subscribed.status_code == 200
+
+        async def wait_for_poll() -> None:
+            while not stack.rest_authorizations:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_poll(), timeout=1)
+        assert stack.rest_authorizations[0] == "Bearer subscription-token"
+
+        deleted = await stack.client.delete(
+            "/mcp/ops",
+            headers=_mcp_headers("subscription-token", session_id),
+        )
+        assert deleted.status_code == 200
 
 
 @pytest.mark.asyncio

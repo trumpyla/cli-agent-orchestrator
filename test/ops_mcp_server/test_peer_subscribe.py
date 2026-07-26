@@ -457,6 +457,96 @@ async def test_auth_rejected_subscription_is_removed_and_can_be_recreated(
         await _cleanup_test_sessions(session)
 
 
+@pytest.mark.asyncio
+async def test_subscription_uses_explicitly_captured_request_authorization(
+    caplog,
+) -> None:
+    captured = {}
+    low, _ = _low_level_server(captured)
+    requests_seen: list[httpx.Request] = []
+
+    async def inbox_response(request: httpx.Request) -> httpx.Response:
+        requests_seen.append(request)
+        return httpx.Response(
+            401,
+            json={"detail": "subscription credential rejected"},
+            request=request,
+        )
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(inbox_response),
+        base_url="http://127.0.0.1:9889",
+    )
+    backend = HttpxRequestBackend(
+        base_url="http://127.0.0.1:9889",
+        client=client,
+        authorization=lambda: None,
+    )
+    _setup_peer_subscribe(
+        SimpleNamespace(_mcp_server=low),
+        backend,
+        subscription_authorization=lambda: "Bearer subscribe-request-secret",
+    )
+    session = low.request_context.session
+    try:
+        await captured["subscribe"](_peer_inbox_uri(PEER))
+
+        async def wait_for_consumer_removal() -> None:
+            while session._cao_peer_session_tasks.consumer_count:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(wait_for_consumer_removal(), timeout=0.2)
+    finally:
+        await backend.aclose()
+        await _cleanup_test_sessions(session)
+
+    assert requests_seen[0].headers["authorization"] == "Bearer subscribe-request-secret"
+    assert "subscribe-request-secret" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_cancelled_subscribe_cancels_child_not_yet_started() -> None:
+    gate = asyncio.Event()
+
+    class DelayedStartTaskGroup(_TestSessionTaskGroup):
+        def start_soon(self, func, *args) -> None:
+            async def delayed_start() -> None:
+                await gate.wait()
+                await func(*args)
+
+            super().start_soon(delayed_start)
+
+    session = _test_session()
+    session._task_group = DelayedStartTaskGroup()
+    session_tasks = FastMcp32SessionTasks.attach(session, None)
+
+    async def consumer(peer_id, active_session, authorization):
+        await asyncio.Event().wait()
+
+    try:
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server._consume_inbox",
+            side_effect=consumer,
+        ):
+            subscribe = asyncio.create_task(session_tasks.subscribe(PEER))
+            await asyncio.sleep(0)
+            subscribe.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await subscribe
+
+            gate.set()
+
+            async def wait_for_owned_tasks_to_finish() -> None:
+                while session._task_group.tasks:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_for_owned_tasks_to_finish(), timeout=0.2)
+    finally:
+        await _cleanup_test_sessions(session)
+
+    assert session_tasks.consumer_count == 0
+
+
 def test_request_json_forwards_local_bearer_without_logging_it(caplog):
     with (
         patch(

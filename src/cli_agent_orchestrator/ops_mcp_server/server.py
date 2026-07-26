@@ -33,9 +33,12 @@ logger = logging.getLogger(__name__)
 
 from cli_agent_orchestrator.constants import API_BASE_URL
 from cli_agent_orchestrator.ops_mcp_server.backend import (
+    AUTHORIZATION_FROM_PROVIDER,
     CLIENT_DEFAULT_TIMEOUT,
     AsyncRequestBackend,
+    AuthorizationProvider,
     HttpxRequestBackend,
+    RequestAuthorization,
     RequestFailure,
     RequestResult,
     RequestTimeout,
@@ -237,8 +240,16 @@ def _response_detail(response: Any) -> str:
     return text or f"HTTP {response.status_code}"
 
 
-def _auth_headers() -> Dict[str, str]:
+def _auth_headers(
+    authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
+) -> Dict[str, str]:
     """Build the local bearer header for the operations-MCP to API hop."""
+    if authorization is not AUTHORIZATION_FROM_PROVIDER:
+        return (
+            {"Authorization": authorization}
+            if isinstance(authorization, str) and authorization
+            else {}
+        )
     token = get_local_bearer()
     return {"Authorization": f"Bearer {token}"} if token else {}
 
@@ -251,6 +262,7 @@ def _request_json(
     json: Optional[Any] = None,
     operation: str,
     timeout: Optional[float] = None,
+    authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
 ) -> tuple[Optional[Any], Optional[str]]:
     """Execute an API request and return either JSON data or an error message.
 
@@ -258,7 +270,7 @@ def _request_json(
     needed for a long-poll receive that holds the connection open server-side).
     """
     request_kwargs: Dict[str, Any] = {"params": params, "json": json}
-    headers = _auth_headers()
+    headers = _auth_headers(authorization)
     if headers:
         request_kwargs["headers"] = headers
     if timeout is not None:
@@ -288,10 +300,11 @@ async def _async_request_json(
     json: Optional[Any] = None,
     operation: str,
     timeout: Optional[float] = None,
+    authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
 ) -> tuple[Optional[Any], Optional[str]]:
     """Execute a cancellation-aware API request for long-polling MCP calls."""
     request_kwargs: Dict[str, Any] = {"params": params, "json": json}
-    headers = _auth_headers()
+    headers = _auth_headers(authorization)
     if headers:
         request_kwargs["headers"] = headers
     # httpx otherwise installs its own 5-second default. ``None`` intentionally
@@ -324,10 +337,20 @@ async def _request_from_active_backend(
     json: Optional[Any] = None,
     operation: str,
     timeout: RequestTimeout = CLIENT_DEFAULT_TIMEOUT,
+    authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
 ) -> RequestResult:
     """Dispatch through the factory backend, preserving direct-call compatibility."""
     backend = _active_backend.get()
     if backend is not None:
+        if authorization is AUTHORIZATION_FROM_PROVIDER:
+            return await backend.request_json(
+                method,
+                path,
+                params=params,
+                json=json,
+                operation=operation,
+                timeout=timeout,
+            )
         return await backend.request_json(
             method,
             path,
@@ -335,6 +358,7 @@ async def _request_from_active_backend(
             json=json,
             operation=operation,
             timeout=timeout,
+            authorization=authorization,
         )
 
     # Direct imports of the historical helper functions remain compatible for
@@ -347,6 +371,7 @@ async def _request_from_active_backend(
             params=params,
             json=json,
             operation=operation,
+            authorization=authorization,
         )
     return await _async_request_json(
         method,
@@ -355,6 +380,7 @@ async def _request_from_active_backend(
         json=json,
         operation=operation,
         timeout=timeout,
+        authorization=authorization,
     )
 
 
@@ -1211,12 +1237,18 @@ class _PeerConsumerHandle:
     cancel_scope: anyio.CancelScope | None = None
     ready: anyio.Event = field(default_factory=anyio.Event)
     done: anyio.Event = field(default_factory=anyio.Event)
+    cancel_requested: bool = field(default=False, repr=False)
+    authorization: RequestAuthorization = field(
+        default=AUTHORIZATION_FROM_PROVIDER,
+        repr=False,
+    )
 
     @property
     def is_done(self) -> bool:
         return self.done.is_set()
 
     def cancel(self) -> None:
+        self.cancel_requested = True
         if self.cancel_scope is not None:
             self.cancel_scope.cancel()
 
@@ -1237,7 +1269,12 @@ def _peer_inbox_uri(peer_id: str) -> str:
     return f"cao://peers/{peer_id}/inbox"
 
 
-async def _long_poll_inbox(peer_id: str, wait: float, after_id: int = 0) -> List[Any]:
+async def _long_poll_inbox(
+    peer_id: str,
+    wait: float,
+    after_id: int = 0,
+    authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
+) -> List[Any]:
     """Cancellation-aware long-poll of a peer inbox; return pending rows."""
     data, error = await _request_from_active_backend(
         "get",
@@ -1250,6 +1287,7 @@ async def _long_poll_inbox(peer_id: str, wait: float, after_id: int = 0) -> List
         },
         operation=f"Subscribe to peer inbox '{peer_id}'",
         timeout=wait + 5.0,
+        authorization=authorization,
     )
     if error:
         if isinstance(error, RequestFailure) and error.status_code in {401, 403}:
@@ -1258,7 +1296,11 @@ async def _long_poll_inbox(peer_id: str, wait: float, after_id: int = 0) -> List
     return data if isinstance(data, list) else []
 
 
-async def _consume_inbox(peer_id: str, session: Any) -> None:
+async def _consume_inbox(
+    peer_id: str,
+    session: Any,
+    authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
+) -> None:
     """Long-poll a peer inbox and emit resources/updated when messages land.
 
     Reuses the same long-poll endpoint as ``receive_messages`` (no separate SSE stream —
@@ -1273,7 +1315,15 @@ async def _consume_inbox(peer_id: str, session: Any) -> None:
     last_notified_id = 0
     while True:
         try:
-            rows = await _long_poll_inbox(peer_id, 25.0, last_notified_id)
+            if authorization is AUTHORIZATION_FROM_PROVIDER:
+                rows = await _long_poll_inbox(peer_id, 25.0, last_notified_id)
+            else:
+                rows = await _long_poll_inbox(
+                    peer_id,
+                    25.0,
+                    last_notified_id,
+                    authorization,
+                )
             backoff = 1.0
         except asyncio.CancelledError:
             raise
@@ -1366,13 +1416,19 @@ class FastMcp32SessionTasks:
     def consumer_count(self) -> int:
         return len(self._consumers)
 
-    async def subscribe(self, peer_id: str) -> None:
+    async def subscribe(
+        self,
+        peer_id: str,
+        authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
+    ) -> None:
         if self._closed:
             raise RuntimeError("FastMCP session is closing")
         existing = self._consumers.get(peer_id)
         if existing is not None and not existing.is_done:
-            return
-        handle = _PeerConsumerHandle()
+            if existing.authorization == authorization:
+                return
+            await existing.cancel_and_wait()
+        handle = _PeerConsumerHandle(authorization=authorization)
         self._consumers[peer_id] = handle
         try:
             self._task_group.start_soon(
@@ -1382,6 +1438,7 @@ class FastMcp32SessionTasks:
             )
             await handle.ready.wait()
         except BaseException:
+            handle.cancel()
             if self._consumers.get(peer_id) is handle:
                 self._consumers.pop(peer_id, None)
             raise
@@ -1417,10 +1474,19 @@ class FastMcp32SessionTasks:
         try:
             with anyio.CancelScope() as cancel_scope:
                 handle.cancel_scope = cancel_scope
+                if handle.cancel_requested:
+                    cancel_scope.cancel()
                 handle.ready.set()
                 token = _active_backend.set(self.backend) if self.backend is not None else None
                 try:
-                    await _consume_inbox(peer_id, self.session)
+                    if handle.authorization is AUTHORIZATION_FROM_PROVIDER:
+                        await _consume_inbox(peer_id, self.session)
+                    else:
+                        await _consume_inbox(
+                            peer_id,
+                            self.session,
+                            handle.authorization,
+                        )
                 finally:
                     if token is not None:
                         _active_backend.reset(token)
@@ -1444,6 +1510,8 @@ class FastMcp32SessionTasks:
 def _setup_peer_subscribe(
     server: FastMCP,
     backend: AsyncRequestBackend | None = None,
+    *,
+    subscription_authorization: AuthorizationProvider | None = None,
 ) -> None:
     """Advertise resources/subscribe and wire subscribe/unsubscribe to stream consumers.
 
@@ -1491,7 +1559,10 @@ def _setup_peer_subscribe(
                 logger.debug("peer-inbox: no request-context session on subscribe for %s", peer_id)
                 return
             tasks = FastMcp32SessionTasks.attach(session, backend)
-            await tasks.subscribe(peer_id)
+            authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER
+            if subscription_authorization is not None:
+                authorization = subscription_authorization()
+            await tasks.subscribe(peer_id, authorization)
 
         @low.unsubscribe_resource()
         async def _on_unsubscribe(uri: Any) -> None:
@@ -1551,6 +1622,7 @@ def create_ops_mcp(
     backend: AsyncRequestBackend,
     *,
     auth: AuthProvider | None = None,
+    subscription_authorization: AuthorizationProvider | None = None,
 ) -> FastMCP:
     """Create a CAO Ops MCP server backed by asynchronous REST requests."""
 
@@ -1573,7 +1645,11 @@ def create_ops_mcp(
     for handler in _TOOL_HANDLERS:
         server.tool()(_bind_backend(handler, backend))
     server.resource("cao://peers/{peer_id}/inbox")(_bind_backend(peer_inbox_resource, backend))
-    _setup_peer_subscribe(server, backend)
+    _setup_peer_subscribe(
+        server,
+        backend,
+        subscription_authorization=subscription_authorization,
+    )
     return server
 
 
@@ -1604,6 +1680,7 @@ class _StdioRequestBackend(HttpxRequestBackend):
         json: Optional[Any] = None,
         operation: str,
         timeout: RequestTimeout = CLIENT_DEFAULT_TIMEOUT,
+        authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
     ) -> RequestResult:
         if self._running:
             return await super().request_json(
@@ -1613,6 +1690,7 @@ class _StdioRequestBackend(HttpxRequestBackend):
                 json=json,
                 operation=operation,
                 timeout=timeout,
+                authorization=authorization,
             )
         if timeout is CLIENT_DEFAULT_TIMEOUT or timeout is None:
             return _request_json(
@@ -1621,6 +1699,7 @@ class _StdioRequestBackend(HttpxRequestBackend):
                 params=params,
                 json=json,
                 operation=operation,
+                authorization=authorization,
             )
         return _request_json(
             method,
@@ -1629,6 +1708,7 @@ class _StdioRequestBackend(HttpxRequestBackend):
             json=json,
             operation=operation,
             timeout=timeout,
+            authorization=authorization,
         )
 
 

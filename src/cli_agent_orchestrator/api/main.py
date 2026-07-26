@@ -738,7 +738,11 @@ async def _application_lifespan(application: FastAPI) -> AsyncIterator[None]:
     """Own a fresh stateful MCP server and backend for each host lifecycle."""
     ops_backend = AsgiRequestBackend(authorization=_current_mcp_authorization)
     try:
-        ops_mcp = create_ops_mcp(ops_backend, auth=CaoTokenVerifier())
+        ops_mcp = create_ops_mcp(
+            ops_backend,
+            auth=CaoTokenVerifier(),
+            subscription_authorization=_current_mcp_authorization,
+        )
         lifecycle_http_app = ops_mcp.http_app(
             path="/ops",
             transport="http",

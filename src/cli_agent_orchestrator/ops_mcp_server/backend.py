@@ -22,6 +22,16 @@ CLIENT_DEFAULT_TIMEOUT = ClientDefaultTimeout.VALUE
 RequestTimeout = float | None | ClientDefaultTimeout
 
 
+class AuthorizationDefault(Enum):
+    """Sentinel selecting the backend's configured authorization provider."""
+
+    VALUE = "authorization-provider-default"
+
+
+AUTHORIZATION_FROM_PROVIDER = AuthorizationDefault.VALUE
+RequestAuthorization = str | None | AuthorizationDefault
+
+
 class RequestFailure(str):
     """Backward-compatible request error carrying an optional HTTP status."""
 
@@ -53,6 +63,7 @@ class AsyncRequestBackend(Protocol):
         json: Any | None = None,
         operation: str,
         timeout: RequestTimeout = CLIENT_DEFAULT_TIMEOUT,
+        authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
     ) -> RequestResult: ...
 
     async def aclose(self) -> None: ...
@@ -77,12 +88,16 @@ async def _request_json(
     json: Any | None,
     operation: str,
     timeout: RequestTimeout,
+    authorization: RequestAuthorization,
 ) -> RequestResult:
     request_kwargs: dict[str, Any] = {"params": params, "json": json}
-    if authorization_provider is not None:
-        authorization = authorization_provider()
-        if authorization:
-            request_kwargs["headers"] = {"Authorization": authorization}
+    resolved_authorization = authorization
+    if authorization is AUTHORIZATION_FROM_PROVIDER:
+        resolved_authorization = (
+            authorization_provider() if authorization_provider is not None else None
+        )
+    if isinstance(resolved_authorization, str) and resolved_authorization:
+        request_kwargs["headers"] = {"Authorization": resolved_authorization}
     if timeout is not CLIENT_DEFAULT_TIMEOUT:
         request_kwargs["timeout"] = timeout
 
@@ -119,6 +134,7 @@ class HttpxRequestBackend:
         json: Any | None = None,
         operation: str,
         timeout: RequestTimeout = CLIENT_DEFAULT_TIMEOUT,
+        authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
     ) -> RequestResult:
         return await _request_json(
             self._client,
@@ -129,6 +145,7 @@ class HttpxRequestBackend:
             json=json,
             operation=operation,
             timeout=timeout,
+            authorization=authorization,
         )
 
     async def aclose(self) -> None:
@@ -188,6 +205,7 @@ class AsgiRequestBackend:
         json: Any | None = None,
         operation: str,
         timeout: RequestTimeout = CLIENT_DEFAULT_TIMEOUT,
+        authorization: RequestAuthorization = AUTHORIZATION_FROM_PROVIDER,
     ) -> RequestResult:
         if not self._is_owned_rest_path(path):
             return None, RequestFailure(f"{operation} failed: embedded REST path is not allowed")
@@ -203,6 +221,7 @@ class AsgiRequestBackend:
             json=json,
             operation=operation,
             timeout=timeout,
+            authorization=authorization,
         )
 
     async def aclose(self) -> None:
