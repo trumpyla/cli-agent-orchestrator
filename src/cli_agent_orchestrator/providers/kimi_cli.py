@@ -209,11 +209,12 @@ def _is_live_turn_spinner_line(line: str) -> bool:
     )
 
 
-# A response/thinking bullet ("• …") at line start. Its presence means a turn
+# A response/thinking bullet ("• …" or current Kimi 0.29 "● …") at line start.
+# Its presence means a turn
 # has produced output — used to latch "input received" on the new TUI (the
 # welcome banner / update nag contain no "•", so this won't false-trigger at
 # init).
-ANY_BULLET_PATTERN = r"(?m)^\s*•"
+ANY_BULLET_PATTERN = r"(?m)^\s*[•●]"
 
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
@@ -810,7 +811,7 @@ class KimiCliProvider(BaseProvider):
                 default=-1,
             )
             last_bullet = max(
-                (i for i, line in enumerate(lines) if re.match(r"\s*•", line)),
+                (i for i, line in enumerate(lines) if re.match(r"\s*[•●]\s", line)),
                 default=-1,
             )
             spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
@@ -954,7 +955,7 @@ class KimiCliProvider(BaseProvider):
         if any(
             re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
             for ln in rows
-            if not re.match(r"\s*•", ln)
+            if not re.match(r"\s*[•●]\s", ln)
         ):
             return TerminalStatus.PROCESSING
 
@@ -1020,6 +1021,32 @@ class KimiCliProvider(BaseProvider):
         # Work line-by-line for reliable mapping between raw and clean output.
         raw_lines = script_output.split("\n")
         clean_lines = clean_output.split("\n")
+
+        # Kimi Code 0.29 renders both reasoning and final messages with ``●``.
+        # Prefer the last non-italic circle marker and stop at the ready input
+        # box, rather than anchoring extraction after that box on footer chrome.
+        if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
+            circle_lines = [i for i, line in enumerate(clean_lines) if re.match(r"^\s*●\s+", line)]
+            if circle_lines:
+                response_lines = [i for i in circle_lines if "\x1b[3m" not in raw_lines[i]]
+                response_start = (response_lines or circle_lines)[-1]
+                response_end = len(clean_lines)
+                for i in range(response_start + 1, len(clean_lines)):
+                    if re.match(r"^\s*╭─{2,}", clean_lines[i]) or re.search(
+                        NEW_TUI_STATUS_PATTERN, clean_lines[i]
+                    ):
+                        response_end = i
+                        break
+                extracted = [
+                    clean_lines[i].strip()
+                    for i in range(response_start, response_end)
+                    if clean_lines[i].strip()
+                ]
+                if extracted:
+                    extracted[0] = re.sub(r"^●\s+", "", extracted[0])
+                    result = "\n".join(line for line in extracted if line).strip()
+                    if result:
+                        return result
 
         # Strategy 1: Find the last user input box end line (╰─) — pre-v1.20.0
         box_end_idx = None

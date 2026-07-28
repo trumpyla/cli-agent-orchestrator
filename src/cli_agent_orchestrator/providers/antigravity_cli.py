@@ -135,6 +135,29 @@ IDLE_PROMPT_PATTERN = r"^\s*>\s*$"
 # sections. Anchored to a full line; tolerates surrounding whitespace.
 SEPARATOR_PATTERN = r"^\s*─{20,}\s*$"
 
+
+def _has_ready_input_surface(output: str) -> bool:
+    """Return whether ``output`` contains Agy's live ready prompt panel."""
+    clean = strip_terminal_escapes(output)
+    rows = [line.strip() for line in clean.splitlines() if line.strip()]
+    for index in range(len(rows) - 3, -1, -1):
+        if not re.fullmatch(r"─{20,}", rows[index]):
+            continue
+        if not re.fullmatch(r">.*", rows[index + 1]):
+            continue
+        if not re.fullmatch(r"─{20,}", rows[index + 2]):
+            continue
+
+        footer_rows = rows[index + 3 : index + 8]
+        footer = "\n".join(footer_rows)
+        return bool(
+            re.search(IDLE_FOOTER_PATTERN, footer)
+            and not re.search(PROCESSING_FOOTER_PATTERN, footer)
+            and not any(re.search(PROCESSING_SPINNER_PATTERN, line) for line in footer_rows)
+        )
+    return False
+
+
 # Workspace-trust dialog shown on the FIRST launch in an untrusted directory:
 # "Antigravity CLI requires permission to read, edit, and execute files here."
 # with a "> Yes, I trust this folder / No, exit" picker (Yes pre-selected).
@@ -598,11 +621,7 @@ class AntigravityCliProvider(BaseProvider):
                 # A footer can paint one frame before a late feedback survey.
                 # Require the actual empty input widget too; otherwise keep the
                 # dialog watcher alive long enough to dismiss that survey.
-                if re.search(IDLE_FOOTER_PATTERN, clean) and re.search(
-                    IDLE_PROMPT_PATTERN,
-                    clean,
-                    re.MULTILINE,
-                ):
+                if _has_ready_input_surface(clean):
                     return
             time.sleep(1.0)
 
@@ -670,15 +689,15 @@ class AntigravityCliProvider(BaseProvider):
         timeout: float = 5.0,
         poll_interval: float = 0.5,
     ) -> bool:
-        """Require two identical rendered captures of Agy's interactive prompt.
+        """Require two consecutive ready captures of Agy's prompt panel.
 
         Agy can briefly report IDLE while the ``-i`` acknowledgement is still
         painting. Input sent in that gap is accepted by the PTY but dropped by
-        the TUI. A stable ready footer plus empty prompt proves the input widget
-        has finished mounting.
+        the TUI. The rendered prompt panel plus idle footer proves the input
+        widget has mounted. Dynamic footer data may change between captures.
         """
         deadline = time.monotonic() + timeout
-        previous: Optional[str] = None
+        consecutive_ready = 0
         capture_failures = 0
         while time.monotonic() < deadline:
             try:
@@ -692,7 +711,7 @@ class AntigravityCliProvider(BaseProvider):
             except Exception as exc:
                 capture_failures += 1
                 logger.warning("Antigravity input-ready capture failed: %s", exc)
-                previous = None
+                consecutive_ready = 0
                 if capture_failures >= 3:
                     logger.error(
                         "Antigravity input-ready capture failed %d consecutive times; "
@@ -706,14 +725,12 @@ class AntigravityCliProvider(BaseProvider):
 
             capture_failures = 0
             clean = strip_terminal_escapes(current or "")
-            ready = bool(
-                re.search(IDLE_FOOTER_PATTERN, clean)
-                and re.search(IDLE_PROMPT_PATTERN, clean, re.MULTILINE)
-            )
-            if ready and previous == clean:
-                return True
-
-            previous = clean
+            if _has_ready_input_surface(clean):
+                consecutive_ready += 1
+                if consecutive_ready >= 2:
+                    return True
+            else:
+                consecutive_ready = 0
             await asyncio.sleep(poll_interval)
 
         logger.warning(
@@ -876,10 +893,30 @@ class AntigravityCliProvider(BaseProvider):
         clean = strip_terminal_escapes(script_output)
         lines = clean.split("\n")
 
+        def _is_ready_input_prompt(index: int) -> bool:
+            """Identify the prompt row inside the mounted ready input panel."""
+            previous = index - 1
+            while previous >= 0 and not lines[previous].strip():
+                previous -= 1
+            following = index + 1
+            while following < len(lines) and not lines[following].strip():
+                following += 1
+            if previous < 0 or following >= len(lines):
+                return False
+            if not re.search(SEPARATOR_PATTERN, lines[previous]):
+                return False
+            if not re.search(SEPARATOR_PATTERN, lines[following]):
+                return False
+            footer = "\n".join(lines[following + 1 : following + 6])
+            return bool(
+                re.search(IDLE_FOOTER_PATTERN, footer)
+                and not re.search(PROCESSING_FOOTER_PATTERN, footer)
+            )
+
         # Index of the last echoed user query line.
         last_query_idx: Optional[int] = None
         for i, line in enumerate(lines):
-            if re.search(QUERY_PROMPT_PATTERN, line):
+            if re.search(QUERY_PROMPT_PATTERN, line) and not _is_ready_input_prompt(i):
                 last_query_idx = i
         if last_query_idx is None:
             raise ValueError("No Antigravity CLI user query found - no '> <text>' line detected")

@@ -13,6 +13,8 @@ from cli_agent_orchestrator.providers.antigravity_cli import (
     ProviderError,
 )
 
+_REAL_HANDLE_STARTUP_DIALOG = AntigravityCliProvider._handle_startup_dialog
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
@@ -41,6 +43,40 @@ def make_provider(
         model=model,
         skill_prompt=skill_prompt,
     )
+
+
+def test_handle_startup_dialog_accepts_plan_mode_ready_surface(monkeypatch):
+    """A ready plan prompt must end startup watching without burning the timeout."""
+    provider = make_provider()
+    calls = 0
+    ready = (
+        "────────────────────\n"
+        "> Plan mode: research & plan only (shift+tab to cycle)\n"
+        "────────────────────\n"
+        "? for shortcuts        plan · Gemini 3.1 Pro · high"
+    )
+
+    class FakeBackend:
+        def get_history(self, session, window):
+            nonlocal calls
+            calls += 1
+            return ready
+
+    monotonic_values = iter([0.0, 0.0, 0.0, 0.5, 1.0])
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.time.monotonic",
+        lambda: next(monotonic_values),
+    )
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.time.sleep", lambda _: None
+    )
+
+    _REAL_HANDLE_STARTUP_DIALOG(provider, idle_gap=0.25, outer_timeout=1.0)
+
+    assert calls == 1
 
 
 # --------------------------------------------------------------------------- #
@@ -180,6 +216,24 @@ def test_extract_completed_response():
         make_provider().extract_last_message_from_script(load_fixture("agy_completed.txt"))
         == "PONG"
     )
+
+
+def test_extract_ignores_plan_mode_ready_placeholder_after_response():
+    """The mounted plan prompt is input chrome, not the last echoed user query."""
+    rule = "─" * 30
+    script = (
+        f"{rule}\n"
+        "> /plan ^[[200~Reply exactly: AGY_INSTALLED_READY^[[201~\n"
+        "▸ Thought for 5s, 335 tokens\n"
+        "  Prioritizing Tool Usage\n"
+        "  AGY_INSTALLED_READY\n"
+        f"{rule}\n"
+        "> Plan mode: research & plan only (shift+tab to cycle)\n"
+        f"{rule}\n"
+        "? for shortcuts   plan · Gemini 3.1 Pro · high\n"
+    )
+
+    assert make_provider().extract_last_message_from_script(script) == "AGY_INSTALLED_READY"
 
 
 def test_extract_raises_without_query():
@@ -775,6 +829,43 @@ async def test_wait_until_input_ready_requires_stable_interactive_surface(monkey
     )
 
     assert await p.wait_until_input_ready(timeout=0.2, poll_interval=0.01) is True
+
+
+@pytest.mark.asyncio
+async def test_wait_until_input_ready_accepts_dynamic_plan_mode_prompt_panel(monkeypatch):
+    """Agy 1.1.7 may repaint footer data around a ready plan-mode placeholder."""
+    provider = make_provider()
+    captures = [
+        (
+            "render tick 1\n"
+            "────────────────────\n"
+            "> Plan mode: research & plan only (shift+tab to cycle)\n"
+            "────────────────────\n"
+            "? for shortcuts        plan · Gemini 3.1 Pro · high"
+        ),
+        (
+            "render tick 2\n"
+            "────────────────────\n"
+            "> Plan mode: research & plan only (shift+tab to cycle)\n"
+            "────────────────────\n"
+            "? for shortcuts        plan · Gemini 3.1 Pro · high · AI Credits: 16878"
+        ),
+    ]
+
+    class FakeBackend:
+        calls = 0
+
+        def get_history(self, session, window, tail_lines):
+            capture = captures[min(self.calls, len(captures) - 1)]
+            self.calls += 1
+            return capture
+
+    backend = FakeBackend()
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: backend
+    )
+
+    assert await provider.wait_until_input_ready(timeout=0.2, poll_interval=0.01) is True
 
 
 @pytest.mark.asyncio

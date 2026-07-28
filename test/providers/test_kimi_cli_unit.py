@@ -1409,6 +1409,19 @@ class TestKimiCodeNewTuiExtraction:
         "yolo  agent (Kimi-k2.6 ●)  /tmp/cao_kimi_x  ctrl-o: editor\n"
         "context: 4.0% (10.4k/262.1k)\n"
     )
+    KIMI_029_CAPTURE = (
+        "╭──────────────────────────────╮\n"
+        "│  Welcome to Kimi Code!       │\n"
+        "╰──────────────────────────────╯\n"
+        "\x1b[1m\x1b[38;2;255;203;107m✨ ^[[200~Reply exactly: KIMI_READY^[[201~\x1b[0m\n"
+        "\x1b[38;2;136;136;136m● \x1b[3mThe user requests an exact reply.\x1b[0m\n"
+        "\x1b[38;2;224;224;224m● \x1b[39mKIMI_READY\n"
+        "╭──────────────────────────────╮\n"
+        "│ >                            │\n"
+        "╰──────────────────────────────╯\n"
+        "yolo plan  K3 thinking: max  /tmp/cao_kimi\n"
+        "context: 5% (43.1k/1M)\n"
+    )
 
     def test_extracts_response_after_sparkle_prompt(self):
         provider = KimiCliProvider("test123", "test-session", "window-0")
@@ -1422,6 +1435,15 @@ class TestKimiCodeNewTuiExtraction:
         assert "context:" not in result
         assert "Welcome to Kimi Code CLI" not in result
         assert "cao-mcp-server, 3.4.2" not in result
+
+    def test_extracts_kimi_029_circle_response_before_ready_input_box(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        assert provider.extract_last_message_from_script(self.KIMI_029_CAPTURE) == "KIMI_READY"
+
+    def test_kimi_029_circle_response_marks_rendered_screen_completed(self):
+        provider = KimiCliProvider("test123", "test-session", "window-0")
+        clean = re.sub(ANSI_CODE_PATTERN, "", self.KIMI_029_CAPTURE)
+        assert provider.get_status_from_screen(clean.splitlines()) == TerminalStatus.COMPLETED
 
 
 class TestKimiCodeDispatchGrace:
