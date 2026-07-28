@@ -88,6 +88,12 @@ class TestGetStatusEventInbox:
 class TestScreenDetection:
     """Rendered-screen detection should fail soft and keep monitoring alive."""
 
+    def test_private_device_status_report_does_not_break_pyte_stream(self):
+        """Modern TUIs emit CSI ? 5 n, which pyte 0.8.2 dispatches with private=True."""
+        sm = StatusMonitor()
+        sm._feed_screen_locked("t1", "\x1b[?5n")
+        assert "t1" in sm._screens
+
     @patch("cli_agent_orchestrator.services.status_monitor.provider_manager")
     def test_render_error_falls_back_to_raw_buffer_detection(self, mock_pm):
         class BrokenScreen:

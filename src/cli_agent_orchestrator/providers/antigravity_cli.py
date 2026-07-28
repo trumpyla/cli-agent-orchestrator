@@ -91,12 +91,39 @@ PROCESSING_SPINNER_PATTERN = r"[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⣾⣽⣻⢿⡿⣟
 # Start-of-line anchored so it does not match the empty idle prompt ("> ").
 QUERY_PROMPT_PATTERN = r"^\s*>\s+\S"
 
-# Empty idle input prompt: a lone "> " on its own line.
-IDLE_PROMPT_PATTERN = r"^\s*>\s*$"
-
 # Full-width horizontal rule (U+2500) delimiting the input box / transcript
 # sections. Anchored to a full line; tolerates surrounding whitespace.
 SEPARATOR_PATTERN = r"^\s*─{20,}\s*$"
+
+
+def _has_ready_input_surface(output: str) -> bool:
+    """Return whether ``output`` contains Agy's live ready prompt panel.
+
+    Agy can render placeholder text after the prompt marker (for example,
+    ``Plan mode: research & plan only ...``), so readiness cannot require a
+    literally empty ``>`` line.  The stable contract is structural: the latest
+    prompt row is enclosed by separator rules and followed by the idle footer.
+    Processing chrome in that same footer region wins over a stale idle marker.
+    """
+    clean = strip_terminal_escapes(output)
+    rows = [line.strip() for line in clean.splitlines() if line.strip()]
+    for index in range(len(rows) - 3, -1, -1):
+        if not re.fullmatch(r"─{20,}", rows[index]):
+            continue
+        if not re.fullmatch(r">.*", rows[index + 1]):
+            continue
+        if not re.fullmatch(r"─{20,}", rows[index + 2]):
+            continue
+
+        footer_rows = rows[index + 3 : index + 8]
+        footer = "\n".join(footer_rows)
+        return bool(
+            re.search(IDLE_FOOTER_PATTERN, footer)
+            and not re.search(PROCESSING_FOOTER_PATTERN, footer)
+            and not any(re.search(PROCESSING_SPINNER_PATTERN, line) for line in footer_rows)
+        )
+    return False
+
 
 # Workspace-trust dialog shown on the FIRST launch in an untrusted directory:
 # "Antigravity CLI requires permission to read, edit, and execute files here."
@@ -483,11 +510,7 @@ class AntigravityCliProvider(BaseProvider):
                 # A footer can paint one frame before a late feedback survey.
                 # Require the actual empty input widget too; otherwise keep the
                 # dialog watcher alive long enough to dismiss that survey.
-                if re.search(IDLE_FOOTER_PATTERN, clean) and re.search(
-                    IDLE_PROMPT_PATTERN,
-                    clean,
-                    re.MULTILINE,
-                ):
+                if _has_ready_input_surface(clean):
                     return
             time.sleep(1.0)
 
@@ -555,15 +578,17 @@ class AntigravityCliProvider(BaseProvider):
         timeout: float = 5.0,
         poll_interval: float = 0.5,
     ) -> bool:
-        """Require two identical rendered captures of Agy's interactive prompt.
+        """Require two consecutive ready captures of Agy's prompt panel.
 
         Agy can briefly report IDLE while the ``-i`` acknowledgement is still
         painting. Input sent in that gap is accepted by the PTY but dropped by
-        the TUI. A stable ready footer plus empty prompt proves the input widget
-        has finished mounting.
+        the TUI. The rendered prompt panel plus idle footer proves the input
+        widget has mounted. Two consecutive observations reject transient
+        frames without requiring byte-identical captures: model, credit, and
+        status chrome may repaint while the input surface remains ready.
         """
         deadline = time.monotonic() + timeout
-        previous: Optional[str] = None
+        consecutive_ready = 0
         capture_failures = 0
         while time.monotonic() < deadline:
             try:
@@ -577,7 +602,7 @@ class AntigravityCliProvider(BaseProvider):
             except Exception as exc:
                 capture_failures += 1
                 logger.warning("Antigravity input-ready capture failed: %s", exc)
-                previous = None
+                consecutive_ready = 0
                 if capture_failures >= 3:
                     logger.error(
                         "Antigravity input-ready capture failed %d consecutive times; "
@@ -591,14 +616,13 @@ class AntigravityCliProvider(BaseProvider):
 
             capture_failures = 0
             clean = strip_terminal_escapes(current or "")
-            ready = bool(
-                re.search(IDLE_FOOTER_PATTERN, clean)
-                and re.search(IDLE_PROMPT_PATTERN, clean, re.MULTILINE)
-            )
-            if ready and previous == clean:
+            if _has_ready_input_surface(clean):
+                consecutive_ready += 1
+            else:
+                consecutive_ready = 0
+            if consecutive_ready >= 2:
                 return True
 
-            previous = clean
             await asyncio.sleep(poll_interval)
 
         logger.warning(

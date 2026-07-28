@@ -12,7 +12,7 @@ Key characteristics:
 - User input: Displayed in a bordered box using box-drawing characters (╭│╰)
 - Auto-approve: ``--yolo`` flag bypasses all tool action confirmations
 - Agent profiles: launch options plus a guarded prompt prepended to the first task
-- MCP config: ``--mcp-config TEXT`` (JSON configuration, repeatable flag)
+- MCP config: project-local ``.kimi-code/mcp.json``
 - Exit commands: ``/exit``, ``exit``, ``quit``, or Ctrl-D
 - Status bar: ``HH:MM [yolo] agent (model, thinking) ctrl-x: toggle mode context: X.X%``
 
@@ -107,12 +107,13 @@ USER_INPUT_BOX_END_PATTERN = r"╰─"
 # across newlines (a bare ``💫`` followed by blank lines then status bar).
 PROMPT_WITH_INPUT_PATTERN = r"(?:\w+@[\w.-]+)?[✨💫][^\S\n]+\S"
 
-# Response/thinking bullet pattern: ``•`` (U+2022) at the start of a line.
+# Response/thinking bullet pattern: ``•`` (legacy) or ``●`` (Kimi Code 0.29)
+# at the start of a line.
 # Both thinking (internal monologue) and response (final answer) use this marker.
 # To distinguish them in extraction, check ANSI styling in raw output:
 # - Thinking: gray italic (\x1b[38;5;244m• ... \x1b[3m\x1b[38;5;244m)
 # - Response: plain ``•`` without ANSI color prefix
-RESPONSE_BULLET_PATTERN = r"^•\s"
+RESPONSE_BULLET_PATTERN = r"^[•●]\s"
 
 # Thinking bullet detection in raw (ANSI-preserved) output.
 # Thinking lines use gray color (38;5;244) before the bullet character.
@@ -161,11 +162,11 @@ def _is_live_turn_spinner_line(line: str) -> bool:
     )
 
 
-# A response/thinking bullet ("• …") at line start. Its presence means a turn
+# A response/thinking bullet ("• …" or "● …") at line start. Its presence means a turn
 # has produced output — used to latch "input received" on the new TUI (the
-# welcome banner / update nag contain no "•", so this won't false-trigger at
+# welcome banner / update nag contain no response marker, so this won't false-trigger at
 # init).
-ANY_BULLET_PATTERN = r"(?m)^\s*•"
+ANY_BULLET_PATTERN = r"(?m)^\s*[•●]\s"
 
 # Generic error patterns for detecting failure states in terminal output.
 ERROR_PATTERN = (
@@ -182,12 +183,6 @@ class KimiCliProvider(BaseProvider):
     Kimi uses its built-in default agent.
     """
 
-    # Class-level flag: ensures ~/.kimi/config.toml MCP timeout is set only once,
-    # even when multiple KimiCliProvider instances are created in parallel (e.g.,
-    # 3 data_analyst workers via assign). Without this, concurrent read/write to
-    # the config file causes race conditions and file corruption.
-    _mcp_timeout_configured = False
-
     # Class-level prompt regex shared between status detection
     # and ``extract_session_context``. Bounded quantifiers
     # (no unbounded ``*`` / ``+`` — defeats ReDoS on pathological pane bytes).
@@ -198,7 +193,7 @@ class KimiCliProvider(BaseProvider):
     _KIMI_PROMPT_RE = re.compile(r"(?:\w{1,32}@[\w.\-]{1,64})?[✨💫][^\S\n]{1,4}\S")
     # Response/thinking markers used to bound a user message line. Matches
     # the same ``• `` bullet the IDLE/PROCESSING path uses.
-    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^•\s")
+    _KIMI_RESPONSE_MARKER_RE = re.compile(r"^[•●]\s")
 
     def __init__(
         self,
@@ -339,7 +334,7 @@ class KimiCliProvider(BaseProvider):
         Uses shlex.join() for safe escaping of all arguments.
 
         Command structure:
-            cd <temp_dir> && TERM=xterm-256color kimi --yolo [--plan] [--mcp-config JSON]
+            cd <temp_dir> && TERM=xterm-256color kimi --yolo [--plan]
 
         The ``cd`` is required because Kimi CLI v1.20.0+ enforces a per-directory
         single-instance lock — only one kimi process can run in a given directory.
@@ -375,16 +370,11 @@ class KimiCliProvider(BaseProvider):
                 # first task delivered through terminal_service.send_input().
                 self._first_message_prefix = self._compose_first_message_prefix(profile)
 
-                # Add MCP server configuration if present in the agent profile.
-                # Kimi accepts --mcp-config as a JSON string (repeatable flag).
+                # Kimi Code 0.29 removed the legacy --mcp-config option. It
+                # discovers MCP servers from .kimi-code/mcp.json in the current
+                # project, so write the per-terminal config under the isolated
+                # temp working directory before launch.
                 if profile.mcpServers:
-                    # Set MCP tool call timeout to 600s by modifying ~/.kimi/config.toml
-                    # directly. We cannot use --config flag because it causes Kimi CLI
-                    # to bypass its default config file, which breaks OAuth authentication
-                    # (shows "model: not set" and /login says "restart without --config").
-                    # Class-level guard ensures this runs only once per process.
-                    self._ensure_mcp_timeout()
-
                     mcp_config = {}
                     for server_name, server_config in profile.mcpServers.items():
                         if isinstance(server_config, dict):
@@ -396,16 +386,29 @@ class KimiCliProvider(BaseProvider):
                         # PATH-independent invocation.
                         mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
 
+                        # CAO profiles use the cross-client ``type`` spelling.
+                        # Kimi Code infers stdio from ``command`` and HTTP from
+                        # ``url``; only legacy SSE requires ``transport``.
+                        server_type = mcp_config[server_name].pop("type", None)
+                        if server_type == "sse":
+                            mcp_config[server_name].setdefault("transport", "sse")
+                        mcp_config[server_name].setdefault("toolTimeoutMs", 600_000)
+
                         # Forward CAO_TERMINAL_ID so MCP servers (e.g. cao-mcp-server)
                         # can identify the current terminal for handoff/assign operations.
-                        # Kimi CLI does not automatically forward parent shell env vars
-                        # to MCP subprocesses, so we inject it explicitly via the env field.
-                        env = mcp_config[server_name].get("env", {})
-                        if "CAO_TERMINAL_ID" not in env:
-                            env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
+                        # The env field applies only to stdio child processes.
+                        if "command" in mcp_config[server_name]:
+                            env = mcp_config[server_name].get("env", {})
+                            if "CAO_TERMINAL_ID" not in env:
+                                env["CAO_TERMINAL_ID"] = self.terminal_id
+                                mcp_config[server_name]["env"] = env
 
-                    command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
+                    config_dir = Path(self._temp_dir) / ".kimi-code"
+                    config_dir.mkdir(exist_ok=True)
+                    (config_dir / "mcp.json").write_text(
+                        json.dumps({"mcpServers": mcp_config}, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
 
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
@@ -413,56 +416,6 @@ class KimiCliProvider(BaseProvider):
         # cd to unique temp dir (per-directory lock) + set TERM for tmux compatibility
         kimi_cmd = shlex.join(command_parts)
         return f"cd {shlex.quote(self._temp_dir)} && TERM=xterm-256color {kimi_cmd}"
-
-    @classmethod
-    def _ensure_mcp_timeout(cls) -> None:
-        """Ensure MCP tool call timeout is set to 600s in ~/.kimi/config.toml.
-
-        Called once per process (guarded by class-level flag). Kimi CLI defaults
-        to tool_call_timeout_ms=60000 (60s) for MCP tool calls, which is too short
-        for handoff operations. We modify the config file directly instead of using
-        ``--config`` CLI flag, because ``--config`` causes Kimi CLI to bypass the
-        default config file and breaks OAuth authentication.
-
-        The timeout is NOT restored on cleanup because:
-        1. Multiple Kimi instances may share the config file concurrently
-        2. 600s is a strictly better default for anyone using MCP tools
-        3. Restoring while other instances are running causes race conditions
-        """
-        if cls._mcp_timeout_configured:
-            return
-
-        config_path = Path.home() / ".kimi" / "config.toml"
-        if not config_path.exists():
-            logger.warning(f"Kimi config not found at {config_path}, skipping MCP timeout override")
-            cls._mcp_timeout_configured = True
-            return
-
-        try:
-            content = config_path.read_text()
-
-            # Match the existing timeout line under [mcp.client] section
-            # Format: tool_call_timeout_ms = 60000
-            pattern = r"(tool_call_timeout_ms\s*=\s*)(\d+)"
-            match = re.search(pattern, content)
-            if match:
-                current_value = int(match.group(2))
-                if current_value < 600000:
-                    new_content = re.sub(pattern, r"\g<1>600000", content)
-                    config_path.write_text(new_content)
-                    logger.info(
-                        f"Set MCP tool_call_timeout_ms to 600000 "
-                        f"(was {current_value}) in {config_path}"
-                    )
-            else:
-                logger.warning(
-                    f"tool_call_timeout_ms not found in {config_path}, "
-                    "MCP tool calls may time out during handoff"
-                )
-        except Exception as e:
-            logger.warning(f"Failed to set MCP timeout in {config_path}: {e}")
-
-        cls._mcp_timeout_configured = True
 
     def _handle_startup_dialog(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None
@@ -643,7 +596,7 @@ class KimiCliProvider(BaseProvider):
         # tokens") that is cleared on completion. Gate on the new-TUI markers so
         # legacy (emoji-prompt) builds keep the path below unchanged.
         if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
-            # A "•" bullet appears only once a turn produces output (thinking or
+            # A response bullet appears only once a turn produces output (thinking or
             # response); the welcome banner / update nag have none. Latch it so a
             # long response that scrolls the bullets out of the rolling buffer
             # still reads COMPLETED rather than IDLE. Crucially, nothing latches
@@ -667,7 +620,7 @@ class KimiCliProvider(BaseProvider):
             #   turn-finished repaint (input rule + ~12 blank box lines +
             #   separator + status bar + context footer) pushes stale frames
             #   beyond this window;
-            # - the last spinner glyph rendered AFTER the last "•" bullet —
+            # - the last spinner glyph rendered AFTER the last response bullet —
             #   catches chunk boundaries mid-repaint where streamed thinking
             #   text has temporarily pushed the spinner out of the tail
             #   window (a finished turn always ends with bullets as the
@@ -678,7 +631,7 @@ class KimiCliProvider(BaseProvider):
                 default=-1,
             )
             last_bullet = max(
-                (i for i, line in enumerate(lines) if re.match(r"\s*•", line)),
+                (i for i, line in enumerate(lines) if re.match(r"\s*[•●]\s", line)),
                 default=-1,
             )
             spinner_in_tail = last_spinner >= 0 and last_spinner >= len(lines) - 15
@@ -822,7 +775,7 @@ class KimiCliProvider(BaseProvider):
         if any(
             re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
             for ln in rows
-            if not re.match(r"\s*•", ln)
+            if not re.match(r"\s*[•●]\s", ln)
         ):
             return TerminalStatus.PROCESSING
 
@@ -888,6 +841,34 @@ class KimiCliProvider(BaseProvider):
         # Work line-by-line for reliable mapping between raw and clean output.
         raw_lines = script_output.split("\n")
         clean_lines = clean_output.split("\n")
+
+        # Kimi Code 0.29 renders both reasoning and final messages with ``●``.
+        # The completed frame then draws a fresh bordered input box below them;
+        # treating that box as the last user-input box anchors extraction after
+        # the response and returns footer chrome. Prefer the last non-italic
+        # circle marker and stop at the ready input box.
+        if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
+            circle_lines = [i for i, line in enumerate(clean_lines) if re.match(r"^\s*●\s+", line)]
+            if circle_lines:
+                response_lines = [i for i in circle_lines if "\x1b[3m" not in raw_lines[i]]
+                response_start = (response_lines or circle_lines)[-1]
+                response_end = len(clean_lines)
+                for i in range(response_start + 1, len(clean_lines)):
+                    if re.match(r"^\s*╭─{2,}", clean_lines[i]) or re.search(
+                        NEW_TUI_STATUS_PATTERN, clean_lines[i]
+                    ):
+                        response_end = i
+                        break
+                extracted = [
+                    clean_lines[i].strip()
+                    for i in range(response_start, response_end)
+                    if clean_lines[i].strip()
+                ]
+                if extracted:
+                    extracted[0] = re.sub(r"^●\s+", "", extracted[0])
+                    result = "\n".join(line for line in extracted if line).strip()
+                    if result:
+                        return result
 
         # Strategy 1: Find the last user input box end line (╰─) — pre-v1.20.0
         box_end_idx = None

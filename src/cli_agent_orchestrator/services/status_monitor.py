@@ -244,7 +244,13 @@ class StatusMonitor:
         if scr is None:
             import pyte
 
-            screen = pyte.Screen(PYTE_SCREEN_COLS, PYTE_SCREEN_ROWS)
+            class PrivateDsrCompatibleScreen(pyte.Screen):
+                """Accept private DSR dispatches that pyte 0.8.2 cannot."""
+
+                def report_device_status(self, mode: int, **_kwargs: bool) -> None:
+                    super().report_device_status(mode)
+
+            screen = PrivateDsrCompatibleScreen(PYTE_SCREEN_COLS, PYTE_SCREEN_ROWS)
             stream = pyte.Stream(screen)
             scr = (screen, stream)
             self._screens[terminal_id] = scr
