@@ -621,7 +621,10 @@ class AntigravityCliProvider(BaseProvider):
                 # A footer can paint one frame before a late feedback survey.
                 # Require the actual empty input widget too; otherwise keep the
                 # dialog watcher alive long enough to dismiss that survey.
-                if _has_ready_input_surface(clean):
+                if _has_ready_input_surface(clean) or (
+                    re.search(IDLE_FOOTER_PATTERN, clean)
+                    and re.search(IDLE_PROMPT_PATTERN, clean, re.MULTILINE)
+                ):
                     return
             time.sleep(1.0)
 
