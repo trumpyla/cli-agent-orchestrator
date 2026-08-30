@@ -64,54 +64,11 @@ class ServerConfig(BaseModel):
 
 
 class MemoryConfig(BaseModel):
-    """Validated memory policy while preserving extension-owned metadata."""
-
-    model_config = ConfigDict(extra="allow")
-
-    enabled: bool = Field(default=True, strict=True)
-    compile_mode: Literal["llm", "append"] = "llm"
-    flush_threshold: float = Field(
-        default=0.85,
-        strict=True,
-        gt=0.0,
-        le=1.0,
-        allow_inf_nan=False,
-    )
-    compile_timeout_s: float = Field(
-        default=120.0,
-        strict=True,
-        gt=0.0,
-        le=3600.0,
-        allow_inf_nan=False,
-    )
-
-
-class CleanupConfig(BaseModel):
-    """Conservative policy for irreversible completed-session deletion."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    completed_sessions_enabled: bool = Field(default=False, strict=True)
-    completed_session_grace_s: int = Field(default=900, strict=True, ge=60)
-    sweep_interval_s: int = Field(default=300, strict=True, ge=30)
-    max_sessions_per_sweep: int = Field(default=5, strict=True, ge=1, le=50)
-    preserve_patterns: List[str] = Field(default_factory=list)
-
-    @field_validator("preserve_patterns", mode="before")
-    @classmethod
-    def _validate_preserve_patterns(cls, value: Any) -> List[str]:
-        if not isinstance(value, list):
-            raise ValueError("preserve_patterns must be a list")
-        if len(value) > 100:
-            raise ValueError("preserve_patterns must contain at most 100 entries")
-        for pattern in value:
-            if not isinstance(pattern, str):
-                raise ValueError("preserve_patterns entries must be strings")
-            if len(pattern) > 128:
-                raise ValueError("preserve_patterns entries must be at most 128 characters")
-            if any(unicodedata.category(character) == "Cc" for character in pattern):
-                raise ValueError("preserve_patterns entries must not contain control characters")
-        return value
+    enabled: bool = True
+    compile_mode: str = "llm"
+    flush_threshold: float = 0.85
+    compile_timeout_s: float = 120.0
+    lint_enabled: bool = True
 
 
 class TerminalConfig(BaseModel):
@@ -134,13 +91,15 @@ class NetworkConfig(BaseModel):
     Rewiring them through ConfigService would require either mutating those
     lists after settings.json changes (no invalidation mechanism exists yet)
     or restructuring the middleware wiring — out of scope for this PR. Only
-    the ``CAO_ALLOWED_HOSTS``/``CAO_CORS_ORIGINS``/``CAO_WS_ALLOWED_CLIENTS``
-    env vars are read (in ``constants.py``, not through this schema).
+    the ``CAO_ALLOWED_HOSTS``/``CAO_CORS_ORIGINS``/``CAO_WS_ALLOWED_CLIENTS``/
+    ``CAO_WS_ALLOWED_ORIGINS`` env vars are read (in ``constants.py``, not
+    through this schema).
     """
 
     allowed_hosts: List[str] = Field(default_factory=list)
     cors_origins: List[str] = Field(default_factory=list)
     ws_allowed_clients: List[str] = Field(default_factory=list)
+    ws_allowed_origins: List[str] = Field(default_factory=list)
 
 
 class AuthConfig(BaseModel):
@@ -206,11 +165,7 @@ _OWNED_DEFAULTS: Dict[str, Any] = {
     "network.allowed_hosts": [],
     "network.cors_origins": [],
     "network.ws_allowed_clients": [],
-    "cleanup.completed_sessions_enabled": False,
-    "cleanup.completed_session_grace_s": 900,
-    "cleanup.sweep_interval_s": 300,
-    "cleanup.max_sessions_per_sweep": 5,
-    "cleanup.preserve_patterns": [],
+    "network.ws_allowed_origins": [],
 }
 
 # Env-var registry: every CAO_* var this schema recognizes, mapped to its
@@ -229,7 +184,9 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
     "CAO_ALLOWED_HOSTS": ("network.allowed_hosts", "list", []),
     "CAO_CORS_ORIGINS": ("network.cors_origins", "list", []),
     "CAO_WS_ALLOWED_CLIENTS": ("network.ws_allowed_clients", "list", []),
+    "CAO_WS_ALLOWED_ORIGINS": ("network.ws_allowed_origins", "list", []),
     "CAO_MEMORY_ENABLED": ("memory.enabled", "bool", True),
+    "CAO_MEMORY_LINT_ENABLED": ("memory.lint_enabled", "bool", True),
     "CAO_MEMORY_COMPILE_MODE": ("memory.compile_mode", "str", "llm"),
     "CAO_MEMORY_FLUSH_THRESHOLD": ("memory.flush_threshold", "float", 0.85),
     "CAO_MEMORY_COMPILE_TIMEOUT_S": ("memory.compile_timeout_s", "float", 120.0),
@@ -258,6 +215,7 @@ ENV_REGISTRY: Dict[str, Tuple[str, str, Any]] = {
         "int",
         20,
     ),
+    "CAO_STATE_BUFFER_MAX": ("server.state_buffer_max", "int", 32768),
 }
 
 # Reverse index: dotted path -> env var name, for get()'s env-precedence lookup.
@@ -431,6 +389,8 @@ def _get_owned_section(path: str, default: Any) -> Any:
     if section == "memory":
         if key == "enabled":
             return settings_service.is_memory_enabled()
+        if key == "lint_enabled":
+            return settings_service.is_memory_lint_enabled()
         if key == "compile_mode":
             return settings_service.get_compile_mode()
         if key == "compile_timeout_s":
@@ -461,6 +421,11 @@ def _get_value(path: str, default: Any = None, override: Optional[Any] = None) -
 
     if override is not None:
         return override
+
+    if path == "memory.lint_enabled":
+        from cli_agent_orchestrator.services import settings_service
+
+        return settings_service.is_memory_lint_enabled()
 
     env_name = _PATH_TO_ENV.get(path)
     if env_name is not None:
@@ -567,6 +532,7 @@ _ALL_PATHS = sorted(
         "server.provider_init_timeout",
         "server.startup_prompt_handler_timeout",
         "memory.enabled",
+        "memory.lint_enabled",
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
@@ -634,6 +600,7 @@ class ConfigService:
             ),
             memory=MemoryConfig(
                 enabled=_get_value("memory.enabled", default=True),
+                lint_enabled=_get_value("memory.lint_enabled", default=True),
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
                 compile_timeout_s=_get_value("memory.compile_timeout_s", default=120.0),

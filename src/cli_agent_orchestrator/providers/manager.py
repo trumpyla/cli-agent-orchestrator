@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
+from cli_agent_orchestrator.models.kiro_engine import KiroEngine, resolve_kiro_engine
 from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.antigravity_cli import AntigravityCliProvider
 from cli_agent_orchestrator.providers.base import BaseProvider
@@ -12,10 +13,14 @@ from cli_agent_orchestrator.providers.claude_code import ClaudeCodeProvider
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.cursor_cli import CursorCliProvider
+from cli_agent_orchestrator.providers.grok_cli import GrokCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
 from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.kiro_cli import KiroCliProvider
+from cli_agent_orchestrator.providers.minimax_code import MiniMaxCodeProvider
 from cli_agent_orchestrator.providers.mock_cli import MockCliProvider
+from cli_agent_orchestrator.providers.omp import OmpProvider
 from cli_agent_orchestrator.providers.opencode_cli import OpenCodeCliProvider
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.skills import build_skill_catalog
@@ -39,19 +44,31 @@ class ProviderManager:
         allowed_tools: Optional[List[str]] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        engine: Optional[KiroEngine] = None,
+        resume_session_id: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
             provider: BaseProvider
+            if resume_session_id and provider_type != ProviderType.CLAUDE_CODE.value:
+                raise ValueError(
+                    "resume_session_id is only supported by the claude_code provider "
+                    f"(got provider '{provider_type}')"
+                )
             if provider_type == ProviderType.KIRO_CLI.value:
                 if not agent_profile:
                     raise ValueError("Kiro CLI provider requires agent_profile parameter")
+                resolved_engine = resolve_kiro_engine(persisted=engine)
+                if resolved_engine == KiroEngine.KAS:
+                    raise KiroPhase0KASError(profile_has_v2_policy=False)
                 provider = KiroCliProvider(
                     terminal_id,
                     tmux_session,
                     tmux_window,
                     agent_profile,
                     allowed_tools,
+                    engine=resolved_engine,
+                    model=model,
                 )
             elif provider_type == ProviderType.CLAUDE_CODE.value:
                 provider = ClaudeCodeProvider(
@@ -61,6 +78,8 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    model=model,
+                    resume_session_id=resume_session_id,
                 )
             elif provider_type == ProviderType.CODEX.value:
                 provider = CodexProvider(
@@ -70,6 +89,7 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    model=model,
                 )
             elif provider_type == ProviderType.COPILOT_CLI.value:
                 provider = CopilotCliProvider(
@@ -88,6 +108,7 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    model=model,
                 )
             elif provider_type == ProviderType.OPENCODE_CLI.value:
                 provider = OpenCodeCliProvider(
@@ -98,6 +119,16 @@ class ProviderManager:
                     allowed_tools,
                     model=model,
                 )
+            elif provider_type == ProviderType.OMP.value:
+                provider = OmpProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
             elif provider_type == ProviderType.HERMES.value:
                 provider = HermesProvider(
                     terminal_id,
@@ -106,6 +137,7 @@ class ProviderManager:
                     agent_profile,
                     allowed_tools,
                     skill_prompt=skill_prompt,
+                    model=model,
                 )
             elif provider_type == ProviderType.CURSOR_CLI.value:
                 provider = CursorCliProvider(
@@ -126,6 +158,26 @@ class ProviderManager:
                     allowed_tools,
                     model=model,
                     skill_prompt=skill_prompt,
+                )
+            elif provider_type == ProviderType.GROK_CLI.value:
+                provider = GrokCliProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
+                )
+            elif provider_type == ProviderType.MINIMAX_CODE.value:
+                provider = MiniMaxCodeProvider(
+                    terminal_id,
+                    tmux_session,
+                    tmux_window,
+                    agent_profile,
+                    allowed_tools,
+                    skill_prompt=skill_prompt,
+                    model=model,
                 )
             # --- Credentials-free mock provider (test/CI infrastructure) ---
             elif provider_type == ProviderType.MOCK_CLI.value:
@@ -164,6 +216,11 @@ class ProviderManager:
         # Check if already exists
         provider = self._providers.get(terminal_id)
         if provider:
+            if (
+                isinstance(provider, KiroCliProvider)
+                and getattr(provider, "_engine", None) == KiroEngine.KAS
+            ):
+                raise KiroPhase0KASError(profile_has_v2_policy=False)
             return provider
 
         # Try to create on-demand from database metadata
@@ -171,21 +228,13 @@ class ProviderManager:
         if not metadata:
             raise ValueError(f"Terminal {terminal_id} not found in database")
 
-        skill_prompt: Optional[str] = None
-        working_directory = metadata.get("working_directory")
-        if metadata.get("agent_profile"):
-            try:
-                start = Path(working_directory) if working_directory else None
-                profile = load_agent_profile(metadata["agent_profile"], start=start)
-                skill_prompt = build_skill_catalog(
-                    profile.skills,
-                    start=start,
-                )
-            except Exception:
-                logger.warning(
-                    "Could not restore repository skill catalog for terminal %s",
-                    terminal_id,
-                )
+        persisted_engine = (
+            resolve_kiro_engine(persisted=metadata.get("engine"))
+            if metadata["provider"] == ProviderType.KIRO_CLI.value
+            else None
+        )
+        if persisted_engine == KiroEngine.KAS:
+            raise KiroPhase0KASError(profile_has_v2_policy=False)
 
         # Create provider on-demand
         provider = self.create_provider(
@@ -194,8 +243,7 @@ class ProviderManager:
             metadata["tmux_session"],
             metadata["tmux_window"],
             metadata["agent_profile"],
-            metadata.get("allowed_tools"),
-            skill_prompt=skill_prompt,
+            engine=persisted_engine,
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since
@@ -216,15 +264,58 @@ class ProviderManager:
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 
-    def cleanup_provider(self, terminal_id: str) -> None:
-        """Cleanup provider and remove from map (used when terminal is deleted)."""
+    def cleanup_provider(self, terminal_id: str) -> bool:
+        """Cleanup a provider, retaining retryable Grok state on failure.
+
+        Grok's private home can only be deleted after its escaped updater has
+        been positively stopped or ruled out.  A ``False`` return therefore
+        deliberately keeps the map entry (and lets the service keep DB
+        metadata) so a later lifecycle retry does not lose the only route to
+        that deterministic home.
+        """
         try:
-            provider = self._providers.pop(terminal_id, None)
+            provider = self._providers.get(terminal_id)
             if provider:
-                provider.cleanup()
+                cleanup_result = provider.cleanup()
+                if cleanup_result is False:
+                    logger.warning("Cleanup deferred for terminal: %s", terminal_id)
+                    return False
+                self._providers.pop(terminal_id, None)
                 logger.info(f"Cleaned up provider for terminal: {terminal_id}")
+                return True
+
+            # Provider instances are in-memory only.  After cao-server
+            # restarts terminal deletion still has database metadata, but no
+            # provider map entry.  Grok has a deterministic, private on-disk
+            # home containing generated MCP config, so instantiate the small
+            # cleanup-only adapter rather than leaking that directory.
+            metadata = get_terminal_metadata(terminal_id)
+            if metadata and metadata.get("provider") == ProviderType.GROK_CLI.value:
+                restored_grok_provider = GrokCliProvider(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                )
+                if restored_grok_provider.cleanup() is False:
+                    logger.warning("Cleanup deferred for restored Grok provider: %s", terminal_id)
+                    return False
+                logger.info("Cleaned up restored Grok provider for terminal: %s", terminal_id)
+            elif metadata and metadata.get("provider") == ProviderType.MINIMAX_CODE.value:
+                restored_minimax_provider = MiniMaxCodeProvider(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                )
+                restored_minimax_provider.cleanup()
+                logger.info(
+                    "Cleaned up restored MiniMax Code provider for terminal: %s", terminal_id
+                )
+            return True
         except Exception as e:
             logger.error(f"Failed to cleanup provider for terminal {terminal_id}: {e}")
+            return False
 
     def list_providers(self) -> Dict[str, str]:
         """List all active providers (for debugging)."""

@@ -94,8 +94,11 @@ class MockCliProvider(BaseProvider):
         if native is not None:
             return native
 
-        resolved_buffer = self._resolve_buffer(buffer)
-        if not resolved_buffer:
+        # Herdr does not feed the StatusMonitor pipe buffer. BaseProvider's
+        # resolver reads the live pane history when native status is unknown,
+        # so the mock provider follows the same backend contract as real CLIs.
+        buffer = self._resolve_buffer(buffer)
+        if not buffer:
             return TerminalStatus.UNKNOWN
 
         clean = re.sub(ANSI_CODE_PATTERN, "", resolved_buffer)
