@@ -101,7 +101,8 @@ def _antigravity_servers(terminal_id: str, mcp_servers: dict, tmp_path: Path) ->
         patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
     ):
         provider._build_agy_command()
-    return json.loads(cfg.read_text())["mcpServers"]
+    raw_servers = json.loads(cfg.read_text())["mcpServers"]
+    return {k.replace(f"-{terminal_id}", ""): v for k, v in raw_servers.items()}
 
 
 def _kimi_servers(terminal_id: str, mcp_servers: dict, tmp_path: Path) -> dict:

@@ -25,6 +25,7 @@ import threading
 import time
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.backends.registry import get_backend
@@ -40,11 +41,14 @@ from cli_agent_orchestrator.clients.database import (
     update_last_active,
     update_terminal_group,
     update_terminal_metadata,
+    update_terminal_profile_prompt_delivered,
+    update_terminal_provider_initialized,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.constants import (
     FIFO_DIR,
     PIPE_LIVENESS_TAIL_LINES,
+    SESSION_PREFIX,
     TERMINAL_LOG_DIR,
 )
 from cli_agent_orchestrator.models.agent_profile import AgentProfile
@@ -113,6 +117,32 @@ _memory_injected_lock = threading.Lock()
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
+
+
+def _persist_provider_initialized(terminal_id: str) -> None:
+    """Best-effort lifecycle persistence after successful provider startup."""
+    try:
+        if not update_terminal_provider_initialized(terminal_id):
+            logger.warning("Could not persist initialized state for terminal %s", terminal_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not persist initialized state for terminal %s: %r",
+            terminal_id,
+            exc,
+        )
+
+
+def _persist_profile_prompt_delivered(terminal_id: str) -> None:
+    """Best-effort persistence for the first-message profile delivery commit."""
+    try:
+        if not update_terminal_profile_prompt_delivered(terminal_id):
+            logger.warning("Could not persist profile delivery for terminal %s", terminal_id)
+    except Exception as exc:
+        logger.warning(
+            "Could not persist profile delivery for terminal %s: %r",
+            terminal_id,
+            exc,
+        )
 
 
 def inject_memory_context(
@@ -551,11 +581,17 @@ async def create_terminal(
 
         # Step 3: Build a runtime skill catalog only for providers that consume
         # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
-        skill_prompt = (
-            build_skill_catalog(profile.skills if profile else None)
-            if provider in RUNTIME_SKILL_PROMPT_PROVIDERS
-            else None
-        )
+        if provider in RUNTIME_SKILL_PROMPT_PROVIDERS:
+            skill_filter = profile.skills if profile else None
+            if working_directory or use_worktree:
+                skill_prompt = build_skill_catalog(
+                    skill_filter,
+                    start=Path(resolved_working_directory),
+                )
+            else:
+                skill_prompt = build_skill_catalog(skill_filter)
+        else:
+            skill_prompt = None
 
         # Step 3b: Soft-enforcement guard: kimi_cli/codex have NO native tool-blocking
         # mechanism (kimi runs --yolo; restrictions are prompt-level text
@@ -819,6 +855,7 @@ async def create_terminal(
             model=model or (profile.model if profile else None),
             engine=resolved_engine,
             resume_session_id=resume_session_id,
+            working_directory=resolved_working_directory,
         )
 
         # Deferred-init path: return fast so callers (e.g. MCP assign) do not
@@ -1212,12 +1249,13 @@ def redeliver_dropped_message(
         terminal_id,
         attempt,
     )
-    send_input(
+    _send_input_impl(
         terminal_id,
         message,
         registry=registry,
         sender_id=sender_id,
         orchestration_type=orchestration_type,
+        _commit_prepared_input=False,
     )
     return False
 
@@ -1328,12 +1366,13 @@ def _schedule_deferred_init(
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
                 await asyncio.to_thread(
-                    send_input,
+                    _send_input_impl,
                     terminal_id,
                     initial_message,
                     registry=registry,
                     sender_id=caller_id,
                     orchestration_type=effective_orchestration_type,
+                    _commit_prepared_input=False,
                 )
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
@@ -1568,18 +1607,43 @@ def send_input(
     orchestration_type: OrchestrationType | None = None,
     frozen_memory: str | None = None,
 ) -> bool:
-    """Send input to terminal via tmux paste buffer.
+    """Send input to a terminal using the public delivery contract.
+
+    ``frozen_memory`` is forwarded unchanged to the internal implementation.
+    Preparation and commit controls are intentionally private so the public
+    signature remains stable for positional callers and introspection users.
+    """
+    return _send_input_impl(
+        terminal_id,
+        message,
+        registry=registry,
+        sender_id=sender_id,
+        orchestration_type=orchestration_type,
+        frozen_memory=frozen_memory,
+    )
+
+
+def _send_input_impl(
+    terminal_id: str,
+    message: str,
+    registry: PluginRegistry | None = None,
+    sender_id: str | None = None,
+    orchestration_type: OrchestrationType | None = None,
+    frozen_memory: str | None = None,
+    *,
+    _commit_prepared_input: bool = True,
+    _prepare_provider_input: bool = True,
+) -> bool:
+    """Send input to a terminal via tmux paste buffer.
 
     Uses bracketed paste mode (-p) to bypass TUI hotkey handling. The number
     of Enter keys sent after pasting is determined by the provider's
     ``paste_enter_count`` property (e.g., some TUIs need 2 Enters because
     bracketed paste triggers multi-line mode).
 
-    ``frozen_memory`` is forwarded UNCHANGED to :func:`inject_memory_context` and
-    is otherwise none of this function's business — not inspected, not validated,
-    not logged. It is last and defaulted so existing positional callers (notably
-    ``agent_step.run_agent_step``, which passes exactly two arguments) are
-    unaffected.
+    ``frozen_memory`` is forwarded unchanged to :func:`inject_memory_context`.
+    The private preparation and commit controls are used by deferred delivery
+    and graceful provider exit paths.
     """
     try:
         metadata = get_terminal_metadata(terminal_id)
@@ -1638,6 +1702,8 @@ def send_input(
         # plugins/webhooks see what the caller sent — not the
         # internal <cao-memory> block that we paste into the TUI.
         original_message = message
+        if provider and _prepare_provider_input:
+            message = provider.prepare_input(message)
         message = inject_memory_context(message, terminal_id, frozen_memory)
 
         # Check how many Enter keys the provider needs after paste
@@ -1687,6 +1753,9 @@ def send_input(
             force_bracketed_paste=True,
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
+
+        if provider and _commit_prepared_input and provider.commit_prepared_input():
+            _persist_profile_prompt_delivered(terminal_id)
 
         update_last_active(terminal_id)
         logger.info(f"Sent input to terminal: {terminal_id}")
@@ -1785,7 +1854,7 @@ def exit_terminal_cli(terminal_id: str) -> None:
     if exit_command.startswith(("C-", "M-")):
         send_special_key(terminal_id, exit_command)
     else:
-        send_input(terminal_id, exit_command, _prepare_provider_input=False)
+        _send_input_impl(terminal_id, exit_command, _prepare_provider_input=False)
 
 
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
@@ -2191,11 +2260,10 @@ def dismantle_terminal_runtime(
     if metadata:
         if kill_window:
             # Kill the tmux window (this terminates the agent process)
-            if not backend_already_closed:
-                try:
-                    get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
-                except Exception as e:
-                    logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
+            try:
+                get_backend().kill_window(metadata["tmux_session"], metadata["tmux_window"])
+            except Exception as e:
+                logger.warning(f"Failed to kill tmux window for {terminal_id}: {e}")
 
         # issue #100 Phase 1: if this terminal was worktree-backed (its live
         # cwd matched the CAO-managed worktree path shape), remove the

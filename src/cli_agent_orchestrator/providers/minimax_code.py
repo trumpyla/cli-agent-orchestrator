@@ -373,8 +373,8 @@ class MiniMaxCodeProvider(BaseProvider):
             )
 
         data_dir, bootstrap = self._prepare_runtime()
-        if self._allowed_tools and "*" not in self._allowed_tools:
-            tools = ", ".join(self._allowed_tools)
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
+            tools = ", ".join(self._allowed_tools) if self._allowed_tools else "none"
             bootstrap = (
                 f"{SECURITY_PROMPT}\nYou only have access to these tools: {tools}\n\n"
                 f"{bootstrap}"

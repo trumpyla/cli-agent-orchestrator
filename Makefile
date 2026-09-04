@@ -19,8 +19,8 @@ check-ext-apps-skills:
 
 # Exercise every structural rule against its positive and negative fixtures.
 sg-test:
-	sg test
+	ast-grep test
 
 # Fail closed when a structural rule matches repository source or tests.
 sg-scan:
-	sg scan --error
+	ast-grep scan --error

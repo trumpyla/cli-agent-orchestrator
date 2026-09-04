@@ -284,12 +284,14 @@ def build_runtime_resource_cleanup(
     selected_backend = backend or get_backend()
 
     def teardown(label: str, workspace_id: str) -> None:
-        delete_session_automatically(
+        result = delete_session_automatically(
             label,
             expected_backend_id=workspace_id,
             registry=registry,  # type: ignore[arg-type]
             backend=selected_backend,  # type: ignore[arg-type]
         )
+        if result.get("errors"):
+            raise RuntimeError("automatic cleanup incomplete")
 
     return RuntimeResourceCleanup(
         backend=selected_backend,

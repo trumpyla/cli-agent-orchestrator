@@ -296,11 +296,13 @@ class KimiCliProvider(BaseProvider):
         allowed_tools: Optional[list] = None,
         skill_prompt: Optional[str] = None,
         model: Optional[str] = None,
+        working_directory: Optional[str] = None,
     ):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
         self._agent_profile = agent_profile
+        self._working_directory = working_directory
         # Explicit per-call override for profile.model, see initialize().
         self._model = model
         # Track temp directory for cleanup (created when agent profile needs temp files)
@@ -309,6 +311,7 @@ class KimiCliProvider(BaseProvider):
         # engine. CAO uses the interactive TUI, so profile instructions are
         # deferred and prepended to the first delivered task instead.
         self._first_message_prefix: Optional[str] = None
+        self._input_preparation_initialized = False
         self._input_preparation_error: Optional[str] = None
         # Latching flag: set True when user input box (╭─) is detected in ANY
         # get_status() call. Persists even after the box scrolls out of the
@@ -372,25 +375,43 @@ class KimiCliProvider(BaseProvider):
         if not self._skill_prompt and profile.skills:
             from cli_agent_orchestrator.utils.skills import build_skill_catalog
 
-            self._skill_prompt = build_skill_catalog(profile.skills)
+            self._skill_prompt = build_skill_catalog(
+                profile.skills,
+                start=Path(self._working_directory) if self._working_directory else None,
+            )
 
         system_prompt = profile.system_prompt if profile.system_prompt is not None else ""
         system_prompt = self._apply_skill_prompt(system_prompt)
 
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.constants import SECURITY_PROMPT
 
-            tools_list = ", ".join(self._allowed_tools)
+            tools_list = ", ".join(self._allowed_tools) if self._allowed_tools else "none"
             tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
             system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
         return system_prompt or None
 
-    def restore_input_preparation(self, delivered: Optional[bool]) -> None:
+    def restore_input_preparation(
+        self,
+        delivered: Optional[bool],
+        *,
+        profile: Optional[Any] = None,
+        working_directory: Optional[str] = None,
+    ) -> None:
         """Rebuild an undelivered profile prefix from persisted launch metadata."""
+        if working_directory and self._working_directory is None:
+            self._working_directory = working_directory
+        if delivered is None:
+            return
+        self._input_preparation_initialized = True
         if delivered is not False or self._agent_profile is None:
             return
         try:
-            profile = load_agent_profile(self._agent_profile)
+            if profile is None:
+                profile = load_agent_profile(
+                    self._agent_profile,
+                    start=Path(self._working_directory) if self._working_directory else None,
+                )
             self._first_message_prefix = self._compose_first_message_prefix(profile)
         except Exception as exc:
             logger.warning(
@@ -418,7 +439,10 @@ class KimiCliProvider(BaseProvider):
         if self._agent_profile is None:
             return None
         try:
-            return load_agent_profile(self._agent_profile)
+            return load_agent_profile(
+                self._agent_profile,
+                start=Path(self._working_directory) if self._working_directory else None,
+            )
         except Exception:
             return None
 
@@ -466,10 +490,6 @@ class KimiCliProvider(BaseProvider):
         historical non-interactive ``--yolo`` behavior.
         """
         command_parts = ["kimi"]
-        read_only = False
-        if self._allowed_tools is not None and "*" not in self._allowed_tools:
-            write_capabilities = {"fs_write", "fs_*", "execute_bash"}
-            read_only = write_capabilities.isdisjoint(self._allowed_tools)
 
         # Always create a temp directory for this instance.
         # Kimi CLI v1.20.0+ has a per-directory single-instance lock, so each
@@ -483,9 +503,29 @@ class KimiCliProvider(BaseProvider):
         profile = None
         if self._agent_profile is not None:
             try:
-                profile = load_agent_profile(self._agent_profile)
+                profile = load_agent_profile(
+                    self._agent_profile,
+                    start=Path(self._working_directory) if self._working_directory else None,
+                )
             except Exception as e:
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
+
+        if profile is not None and not self._input_preparation_initialized:
+            self._first_message_prefix = self._compose_first_message_prefix(profile)
+            self._input_preparation_initialized = True
+
+        # ``permissionMode`` is a provider-neutral profile field, but Kimi has
+        # only two interactive modes. An explicit plan is a safety floor; an
+        # explicit bypass is the opt-in required for unattended MCP callbacks.
+        # Otherwise infer the historical read-only mode from the CAO tool set.
+        permission_mode = getattr(profile, "permissionMode", None)
+        explicit_plan = permission_mode == "plan"
+        explicit_bypass = permission_mode == "bypassPermissions"
+        read_only = explicit_plan
+        if not explicit_plan and not explicit_bypass:
+            if self._allowed_tools is not None and "*" not in self._allowed_tools:
+                write_capabilities = {"fs_write", "fs_*", "execute_bash"}
+                read_only = write_capabilities.isdisjoint(self._allowed_tools)
 
         # self._model is an explicit per-call override (handoff/assign's own
         # `model` parameter) and wins over the profile's own static model

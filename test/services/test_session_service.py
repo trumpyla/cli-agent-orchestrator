@@ -14,6 +14,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from cli_agent_orchestrator.backends import registry as backend_registry
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend, HerdrWorkspace
 from cli_agent_orchestrator.backends.tmux_backend import TmuxBackend
 from cli_agent_orchestrator.clients import database as db_mod
 from cli_agent_orchestrator.clients.database import get_terminal_metadata
@@ -130,6 +131,193 @@ class TestCreateSession:
             )
 
         mock_create_terminal.assert_not_called()
+
+
+def test_automatic_herdr_cleanup_reuses_terminal_teardown_primitives():
+    """Completed Herdr cleanup closes the workspace before deleting CAO rows."""
+    backend = object.__new__(HerdrBackend)
+    backend.list_workspace_inventory = MagicMock(
+        return_value=[
+            HerdrWorkspace(
+                workspace_id="ws-review",
+                label="cao-review",
+                agent_status="done",
+                pane_count=1,
+                tab_count=1,
+                active_tab_id="ws-review:1",
+            )
+        ]
+    )
+    backend.close_workspace_by_id = MagicMock(return_value=True)
+    terminal_metadata = {
+        "id": "terminal-review",
+        "tmux_session": "cao-review",
+        "tmux_window": "reviewer",
+        "agent_profile": "reviewer",
+    }
+    snapshot = dict(terminal_metadata)
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.session_service.list_terminals_by_session",
+            return_value=[terminal_metadata],
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot",
+            return_value=snapshot,
+        ) as capture,
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime",
+            return_value=True,
+        ) as dismantle,
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.delete_terminal_row",
+            return_value=True,
+        ) as delete_row,
+        patch(
+            "cli_agent_orchestrator.services.session_service.delete_terminals_by_ids",
+            return_value=1,
+        ) as delete_rows,
+        patch("cli_agent_orchestrator.services.session_service.clear_session_env") as clear_env,
+        patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event"),
+    ):
+        result = delete_session_automatically(
+            "review",
+            expected_backend_id="ws-review",
+            backend=backend,
+        )
+
+    assert result == {"deleted": ["cao-review"], "errors": []}
+    backend.close_workspace_by_id.assert_called_once_with("ws-review")
+    capture.assert_called_once_with("terminal-review")
+    dismantle.assert_called_once_with("terminal-review", snapshot, kill_window=False)
+    delete_row.assert_called_once_with("terminal-review", snapshot, registry=None)
+    delete_rows.assert_called_once_with(["terminal-review"])
+    clear_env.assert_called_once_with("cao-review")
+
+
+def test_automatic_herdr_cleanup_retains_deferred_terminal_for_retry():
+    """Deferred provider cleanup keeps its registry row and reports failure."""
+    backend = object.__new__(HerdrBackend)
+    backend.list_workspace_inventory = MagicMock(
+        return_value=[
+            HerdrWorkspace(
+                workspace_id="ws-review",
+                label="cao-review",
+                agent_status="done",
+                pane_count=1,
+                tab_count=1,
+                active_tab_id="ws-review:1",
+            )
+        ]
+    )
+    backend.close_workspace_by_id = MagicMock(return_value=True)
+    terminal_metadata = {
+        "id": "terminal-review",
+        "tmux_session": "cao-review",
+        "tmux_window": "reviewer",
+        "agent_profile": "reviewer",
+    }
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.session_service.list_terminals_by_session",
+            return_value=[terminal_metadata],
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot",
+            return_value=terminal_metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime",
+            return_value=False,
+        ) as dismantle,
+        patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row") as delete_row,
+        patch(
+            "cli_agent_orchestrator.services.session_service.delete_terminals_by_ids",
+            return_value=0,
+        ) as delete_rows,
+        patch("cli_agent_orchestrator.services.session_service.clear_session_env") as clear_env,
+        patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event"),
+    ):
+        result = delete_session_automatically(
+            "review",
+            expected_backend_id="ws-review",
+            backend=backend,
+        )
+
+    assert result["deleted"] == []
+    assert result["errors"] == [
+        {
+            "terminal_id": "terminal-review",
+            "error": "cleanup deferred; retry automatic cleanup",
+        }
+    ]
+    dismantle.assert_called_once_with("terminal-review", terminal_metadata, kill_window=False)
+    delete_row.assert_not_called()
+    delete_rows.assert_called_once_with([])
+    clear_env.assert_called_once_with("cao-review")
+
+
+def test_automatic_herdr_cleanup_does_not_emit_terminal_event_for_missing_snapshot():
+    """A row-delete failure with no snapshot must not build a terminal event."""
+    backend = object.__new__(HerdrBackend)
+    backend.list_workspace_inventory = MagicMock(
+        return_value=[
+            HerdrWorkspace(
+                workspace_id="ws-review",
+                label="cao-review",
+                agent_status="done",
+                pane_count=1,
+                tab_count=1,
+                active_tab_id="ws-review:1",
+            )
+        ]
+    )
+    backend.close_workspace_by_id = MagicMock(return_value=True)
+
+    with (
+        patch(
+            "cli_agent_orchestrator.services.session_service.list_terminals_by_session",
+            return_value=[{"id": "terminal-review"}],
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot",
+            return_value=None,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime",
+            return_value=True,
+        ),
+        patch(
+            "cli_agent_orchestrator.services.terminal_service.delete_terminal_row",
+            side_effect=RuntimeError("row delete failed"),
+        ),
+        patch(
+            "cli_agent_orchestrator.services.session_service.delete_terminals_by_ids",
+            return_value=1,
+        ) as delete_rows,
+        patch("cli_agent_orchestrator.services.session_service.clear_session_env"),
+        patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event") as dispatch,
+    ):
+        result = delete_session_automatically(
+            "review",
+            expected_backend_id="ws-review",
+            backend=backend,
+        )
+
+    assert result == {
+        "deleted": ["cao-review"],
+        "errors": [
+            {
+                "terminal_id": "terminal-review",
+                "error": "registry cleanup failed: row delete failed",
+            }
+        ],
+    }
+    delete_rows.assert_called_once_with(["terminal-review"])
+    assert dispatch.call_count == 1
+    assert dispatch.call_args.args[1] == "post_kill_session"
 
 
 class TestListSessions:
@@ -579,7 +767,7 @@ class TestGetSession:
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_success(self, mock_get_backend, mock_list_terminals):
         """Test getting session successfully."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
         mock_get_backend.return_value.list_sessions.return_value = [
             {"id": "cao-test", "name": "Test Session"}
         ]
@@ -589,20 +777,20 @@ class TestGetSession:
 
         assert result["session"]["id"] == "cao-test"
         assert len(result["terminals"]) == 1
-        mock_get_backend.return_value.session_exists.assert_called_once_with("cao-test")
+        mock_get_backend.return_value.session_exists_strict.assert_called_once_with("cao-test")
 
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_normalizes_unprefixed_name(self, mock_get_backend, mock_list_terminals):
         """Public session lookup accepts an alias but resolves the canonical CAO name."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
         mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-review"}]
         mock_list_terminals.return_value = []
 
         result = get_session("review")
 
         assert result["session"]["id"] == "cao-review"
-        mock_get_backend.return_value.session_exists.assert_called_once_with("cao-review")
+        mock_get_backend.return_value.session_exists_strict.assert_called_once_with("cao-review")
         mock_list_terminals.assert_called_once_with("cao-review")
 
     @patch("cli_agent_orchestrator.services.status_monitor.status_monitor.get_status")
@@ -615,7 +803,7 @@ class TestGetSession:
         and the cao-ops-mcp get_session_info tool an external supervisor polls)."""
         from cli_agent_orchestrator.models.terminal import TerminalStatus
 
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
         mock_get_backend.return_value.list_sessions.return_value = [{"id": "cao-test"}]
         mock_list_terminals.return_value = [
             {"id": "term-a", "tmux_session": "cao-test"},
@@ -634,7 +822,7 @@ class TestGetSession:
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_not_found(self, mock_get_backend):
         """Test getting non-existent session."""
-        mock_get_backend.return_value.session_exists.return_value = False
+        mock_get_backend.return_value.session_exists_strict.return_value = False
 
         with pytest.raises(ValueError, match="Session 'cao-nonexistent' not found"):
             get_session("cao-nonexistent")
@@ -642,7 +830,7 @@ class TestGetSession:
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_not_in_list(self, mock_get_backend):
         """Test getting session that exists but not in list."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
         mock_get_backend.return_value.list_sessions.return_value = []
 
         with pytest.raises(ValueError, match="Session 'cao-test' not found"):
@@ -651,7 +839,7 @@ class TestGetSession:
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_get_session_error(self, mock_get_backend):
         """Test getting session with error."""
-        mock_get_backend.return_value.session_exists.side_effect = Exception("Tmux error")
+        mock_get_backend.return_value.session_exists_strict.side_effect = Exception("Tmux error")
 
         with pytest.raises(Exception, match="Tmux error"):
             get_session("cao-test")
@@ -725,37 +913,57 @@ class TestDeleteSession:
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_normalizes_unprefixed_name(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
     ):
         """Shutdown by the requested alias deletes the canonical backend session."""
-        mock_get_backend.return_value.session_exists.return_value = True
+        mock_get_backend.return_value.session_exists_strict.return_value = True
         mock_list_terminals.return_value = []
 
         result = delete_session("review")
 
         assert result == {"deleted": ["cao-review"], "errors": []}
-        mock_get_backend.return_value.session_exists.assert_called_once_with("cao-review")
+        mock_get_backend.return_value.session_exists_strict.assert_called_once_with("cao-review")
         mock_get_backend.return_value.kill_session.assert_called_once_with("cao-review")
         mock_list_terminals.assert_called_once_with("cao-review")
-        mock_delete_terminal.assert_not_called()
+        mock_dismantle.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
-    def test_delete_session_rejects_absent_session(
-        self, mock_get_backend, mock_list_terminals, mock_delete_terminal
+    def test_delete_session_accepts_absent_session(
+        self,
+        mock_get_backend,
+        mock_list_terminals,
+        mock_capture,
+        mock_dismantle,
+        mock_delete_row,
+        mock_delete_terminals_by_ids,
     ):
-        """A missing backend session with no persisted terminals is not a successful delete."""
-        mock_get_backend.return_value.session_exists.return_value = False
+        """A missing backend session with no persisted terminals is idempotent."""
+        mock_get_backend.return_value.session_exists_strict.return_value = False
         mock_list_terminals.return_value = []
 
-        with pytest.raises(ValueError, match="Session 'cao-missing' not found"):
-            delete_session("missing")
+        result = delete_session("missing")
 
+        assert result == {"deleted": ["cao-missing"], "errors": []}
+        mock_get_backend.return_value.session_exists_strict.assert_called_once_with("cao-missing")
         mock_get_backend.return_value.kill_session.assert_not_called()
-        mock_delete_terminal.assert_not_called()
+        mock_dismantle.assert_not_called()
+        mock_delete_terminals_by_ids.assert_called_once_with([])
 
-    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal")
+    @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
+    @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")
+    @patch("cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime")
+    @patch("cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot")
     @patch("cli_agent_orchestrator.services.session_service.list_terminals_by_session")
     @patch("cli_agent_orchestrator.services.session_service.get_backend")
     def test_delete_session_when_backend_session_already_gone(

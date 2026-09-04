@@ -9,6 +9,7 @@ from cli_agent_orchestrator.models.provider import ProviderType
 from cli_agent_orchestrator.providers.codex import CodexProvider
 from cli_agent_orchestrator.providers.copilot_cli import CopilotCliProvider
 from cli_agent_orchestrator.providers.hermes import HermesProvider
+from cli_agent_orchestrator.providers.kimi_cli import ProviderError
 from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASError
 from cli_agent_orchestrator.providers.manager import ProviderManager
 from cli_agent_orchestrator.providers.omp import OmpProvider
@@ -221,6 +222,10 @@ def test_get_provider_restores_undelivered_kimi_profile_prompt():
                 "provider_initialized": True,
                 "profile_prompt_delivered": False,
             },
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.load_agent_profile",
+            return_value=profile,
         ),
         patch(
             "cli_agent_orchestrator.providers.kimi_cli.load_agent_profile",
@@ -768,3 +773,58 @@ def test_create_provider_resume_session_id_rejected_for_other_providers():
             agent_profile=None,
             resume_session_id="11d55034-bb41-46ca-8686-59a9dbff16b5",
         )
+
+
+def test_create_provider_kimi_passes_working_directory():
+    from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+
+    manager = ProviderManager()
+    provider = manager.create_provider(
+        ProviderType.KIMI_CLI.value,
+        terminal_id="t-kimi",
+        tmux_session="s1",
+        tmux_window="w1",
+        working_directory="/path/to/workdir",
+    )
+
+    assert isinstance(provider, KimiCliProvider)
+    assert provider._working_directory == "/path/to/workdir"
+
+
+def test_get_provider_restores_repo_scoped_profile_and_working_directory():
+    manager = ProviderManager()
+    mock_metadata = {
+        "provider": ProviderType.KIMI_CLI.value,
+        "tmux_session": "s1",
+        "tmux_window": "w1",
+        "agent_profile": "custom-agent",
+        "working_directory": "/workspace/repo",
+        "allowed_tools": ["fs_read"],
+        "profile_prompt_delivered": False,
+        "provider_initialized": True,
+    }
+
+    mock_profile = MagicMock()
+    mock_profile.skills = ["test-skill"]
+    mock_profile.system_prompt = "Custom system prompt"
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.manager.get_terminal_metadata",
+            return_value=mock_metadata,
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.manager.load_agent_profile",
+            return_value=mock_profile,
+        ) as mock_load,
+        patch(
+            "cli_agent_orchestrator.providers.manager.build_skill_catalog",
+            return_value="Skill Catalog",
+        ) as mock_catalog,
+    ):
+        provider = manager.get_provider("t-kimi-restore")
+
+    mock_load.assert_called_once_with("custom-agent", start=Path("/workspace/repo"))
+    mock_catalog.assert_called_once_with(["test-skill"], start=Path("/workspace/repo"))
+    assert provider._working_directory == "/workspace/repo"
+    assert provider._first_message_prefix is not None

@@ -1318,7 +1318,8 @@ if ENABLE_WORKING_DIRECTORY:
             ),
         ),
     ) -> Dict[str, Any]:
-        return _assign_impl(
+        return await asyncio.to_thread(
+            _assign_impl,
             agent_profile,
             message,
             working_directory,
@@ -1351,7 +1352,8 @@ else:
             ),
         ),
     ) -> Dict[str, Any]:
-        return _assign_impl(
+        return await asyncio.to_thread(
+            _assign_impl,
             agent_profile,
             message,
             None,
@@ -2172,7 +2174,7 @@ async def report_outcome(
     )
 
     try:
-        terminal_context = _get_terminal_context_from_env()
+        terminal_context = await asyncio.to_thread(_get_terminal_context_from_env)
         if not terminal_context:
             return {
                 "success": False,
@@ -2234,7 +2236,7 @@ async def list_outcomes(
             # own session is REQUIRED. Proceeding with None would run an
             # unfiltered cross-session query, leaking other sessions'
             # friction notes on a transient context-lookup failure.
-            terminal_context = _get_terminal_context_from_env()
+            terminal_context = await asyncio.to_thread(_get_terminal_context_from_env)
             session_name = (terminal_context or {}).get("session_name")
             if not session_name:
                 return {
@@ -2309,7 +2311,7 @@ async def store_lesson(
         # Fail closed: a resolved caller identity is REQUIRED. Accepting a
         # missing context would let a context-free caller write permanent
         # feedback into any profile's scope.
-        terminal_context = _get_terminal_context_from_env()
+        terminal_context = await asyncio.to_thread(_get_terminal_context_from_env)
         if not terminal_context:
             return {
                 "success": False,
@@ -2573,7 +2575,8 @@ async def workflow_resume(
         # using the worst-case run timeout, NOT the short per-call _mcp_timeout().
         # ``json=None`` sends NO body, so a decision-free resume is byte-identical to
         # the pre-#583 request.
-        response = requests.post(
+        response = await asyncio.to_thread(
+            requests.post,
             f"{API_BASE_URL}/workflows/runs/{run_id}/resume",
             json={"decisions": dict(supplied)} if supplied else None,
             timeout=WORKFLOW_RUN_REQUEST_TIMEOUT,
@@ -2666,7 +2669,8 @@ async def workflow_start(
         payload["run_id"] = run_id
     try:
         # Async submit — the normal per-call timeout, NOT the long blocking one (TR-1).
-        response = requests.post(
+        response = await asyncio.to_thread(
+            requests.post,
             f"{API_BASE_URL}/workflows/runs:submit",
             json=payload,
             timeout=_mcp_timeout(),
@@ -2718,7 +2722,8 @@ async def workflow_plan_approval(
     Returns a structured envelope on EVERY path — never raises into the agent loop (EV-1).
     """
     try:
-        response = requests.get(
+        response = await asyncio.to_thread(
+            requests.get,
             f"{API_BASE_URL}/workflows/runs/{run_id}/plan",
             timeout=_mcp_timeout(),
         )
@@ -2752,7 +2757,8 @@ async def workflow_status(
     structured envelope on EVERY path — never raises into the agent loop (EV-1).
     """
     try:
-        response = requests.get(
+        response = await asyncio.to_thread(
+            requests.get,
             f"{API_BASE_URL}/workflows/runs/{run_id}",
             timeout=_mcp_timeout(),
         )
@@ -2792,7 +2798,8 @@ async def workflow_result(
     unaffected — read them from ``steps[].output``.
     """
     try:
-        response = requests.get(
+        response = await asyncio.to_thread(
+            requests.get,
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
             timeout=_mcp_timeout(),
         )
@@ -2823,7 +2830,8 @@ async def workflow_list(
     if isinstance(state, str):
         params["state"] = state
     try:
-        response = requests.get(
+        response = await asyncio.to_thread(
+            requests.get,
             f"{API_BASE_URL}/workflows/runs",
             params=params,
             timeout=_mcp_timeout(),
@@ -2859,7 +2867,8 @@ async def workflow_wait(
     deadline = time.monotonic() + WORKFLOW_RUN_REQUEST_TIMEOUT
     while True:
         try:
-            response = requests.get(
+            response = await asyncio.to_thread(
+                requests.get,
                 f"{API_BASE_URL}/workflows/runs/{run_id}",
                 timeout=_mcp_timeout(),
             )
@@ -2885,7 +2894,8 @@ async def workflow_wait(
 
     # Terminal — fetch the retained result for the full envelope (MR-2).
     try:
-        result_response = requests.get(
+        result_response = await asyncio.to_thread(
+            requests.get,
             f"{API_BASE_URL}/workflows/runs/{run_id}/result",
             timeout=_mcp_timeout(),
         )
@@ -3006,7 +3016,8 @@ async def workflow_events(
     state: Optional[str] = None
 
     try:
-        response = requests.get(
+        response = await asyncio.to_thread(
+            requests.get,
             f"{API_BASE_URL}/workflows/runs/{run_id}/events",
             params=params,
             headers=headers,

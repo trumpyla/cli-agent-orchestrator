@@ -57,6 +57,9 @@ work/
 .codex/
 .agents/
 .kiro/
+.grok/
+.mcp.json
+.acpxrc.json
 
 # Memory
 context/

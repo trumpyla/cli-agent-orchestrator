@@ -93,7 +93,7 @@ class TestClaudeCodeProviderInitialization:
         mock_wait_shell.return_value = True
         mock_wait_status.return_value = True
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
-        handler = MagicMock()
+        handler = AsyncMock()
         to_thread = AsyncMock(side_effect=lambda func, *args, **kwargs: func(*args, **kwargs))
 
         with (
@@ -103,8 +103,8 @@ class TestClaudeCodeProviderInitialization:
         ):
             assert await provider.initialize() is True
 
-        assert to_thread.await_count == 1
-        assert to_thread.await_args.args[0] == handler
+        handler.assert_awaited_once()
+        assert to_thread.await_count >= 2
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.claude_code.wait_for_shell")
@@ -3009,3 +3009,18 @@ class TestBlocksOrchestratedInputWhileWaitingUserAnswer:
     def test_blocks_orchestrated_input_while_waiting_user_answer(self):
         provider = ClaudeCodeProvider("test123", "test-session", "window-0")
         assert provider.blocks_orchestrated_input_while_waiting_user_answer is True
+
+
+class TestClaudeCodeEmptyAllowedTools:
+    """allowed_tools=[] must disallow all native tools rather than falling through to unrestricted."""
+
+    def test_empty_allowed_tools_disallows_all_native_tools(self):
+        from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
+
+        provider = ClaudeCodeProvider("t-empty", "sess", "win", allowed_tools=[])
+        with patch("shutil.which", return_value="/usr/local/bin/claude"):
+            cmd = provider._build_claude_command()
+            expected_disallowed = get_disallowed_tools("claude_code", [])
+            assert len(expected_disallowed) > 0
+            for tool in expected_disallowed:
+                assert f"--disallowedTools {tool}" in cmd

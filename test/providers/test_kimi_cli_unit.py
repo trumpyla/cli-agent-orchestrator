@@ -307,7 +307,8 @@ def test_startup_ready_predicate(output: str, expected: bool) -> None:
     assert _is_startup_output_ready(output) is expected
 
 
-def test_startup_dialog_dismisses_supported_upgrade_then_accepts_ready() -> None:
+@pytest.mark.asyncio
+async def test_startup_dialog_dismisses_supported_upgrade_then_accepts_ready() -> None:
     """The supported upgrade menu is answered once before ready is accepted."""
     backend = MagicMock()
     backend.get_history.side_effect = [
@@ -319,12 +320,12 @@ def test_startup_dialog_dismisses_supported_upgrade_then_accepts_ready() -> None
     with (
         patch("cli_agent_orchestrator.providers.kimi_cli.get_backend", return_value=backend),
         patch("cli_agent_orchestrator.providers.kimi_cli.time.monotonic", return_value=0.0),
-        patch("cli_agent_orchestrator.providers.kimi_cli.time.sleep"),
+        patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep"),
         patch(
             "cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent"
         ) as notify_input_sent,
     ):
-        provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=10.0)
+        await provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=10.0)
 
     backend.send_keys.assert_called_once_with(
         "session-1",
@@ -335,7 +336,8 @@ def test_startup_dialog_dismisses_supported_upgrade_then_accepts_ready() -> None
     notify_input_sent.assert_called_once_with("term-1")
 
 
-def test_startup_dialog_does_not_answer_unsupported_dialog() -> None:
+@pytest.mark.asyncio
+async def test_startup_dialog_does_not_answer_unsupported_dialog() -> None:
     """Unknown startup dialogs fail closed without sending guessed input."""
     backend = MagicMock()
     backend.get_history.return_value = "Kimi needs input from an unsupported startup dialog"
@@ -347,9 +349,9 @@ def test_startup_dialog_does_not_answer_unsupported_dialog() -> None:
             "cli_agent_orchestrator.providers.kimi_cli.time.monotonic",
             side_effect=[0.0, 0.0, 0.0, 2.0],
         ),
-        patch("cli_agent_orchestrator.providers.kimi_cli.time.sleep"),
+        patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep"),
     ):
-        provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=1.0)
+        await provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=1.0)
 
     backend.send_keys.assert_not_called()
 
@@ -883,6 +885,30 @@ class TestKimiCliProviderBuildCommand:
 
         assert "--plan" in command
         assert "--yolo" not in command
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_explicit_bypass_mode_allows_unattended_mcp_callbacks(self, mock_load):
+        """Explicit bypass mode must override inferred read-only capabilities."""
+        mock_profile = MagicMock()
+        mock_profile.model = "kimi-code/k3"
+        mock_profile.system_prompt = "Callback worker."
+        mock_profile.mcpServers = None
+        mock_profile.permissionMode = "bypassPermissions"
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider(
+            "term-1",
+            "session-1",
+            "window-1",
+            agent_profile="reviewer",
+            allowed_tools=["fs_read", "fs_list", "@cao-mcp-server"],
+        )
+
+        command = provider._build_kimi_command()
+
+        assert "--yolo" in command
+        assert "--plan" not in command
+        provider.cleanup()
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_with_pydantic_mcp_config(self, mock_load, tmp_path):
@@ -1608,3 +1634,94 @@ class TestKimiScreenDetection:
     def test_torn_down_shell_is_unknown(self):
         screen = ["Bye!", "rkram@host:/tmp/x$"]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
+
+class TestKimiCliProfileRestoration:
+    """Tests for Kimi profile restoration and working_directory resolution."""
+
+    def test_init_accepts_and_stores_working_directory(self):
+        provider = KimiCliProvider(
+            "term-1", "session-1", "window-1", working_directory="/custom/repo"
+        )
+        assert provider._working_directory == "/custom/repo"
+
+    def test_restore_input_preparation_stores_working_directory_if_unset(self):
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        assert provider._working_directory is None
+        provider.restore_input_preparation(None, working_directory="/new/repo")
+        assert provider._working_directory == "/new/repo"
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_restore_input_preparation_calls_load_agent_profile_with_start(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.skills = []
+        mock_profile.system_prompt = "Hello"
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider(
+            "term-1",
+            "session-1",
+            "window-1",
+            agent_profile="coder",
+            working_directory="/my/repo",
+        )
+        provider.restore_input_preparation(False)
+
+        mock_load.assert_called_once_with("coder", start=Path("/my/repo"))
+        assert provider._first_message_prefix == "Hello"
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_restore_input_preparation_uses_provided_profile(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.skills = []
+        mock_profile.system_prompt = "Provided system prompt"
+
+        provider = KimiCliProvider(
+            "term-1",
+            "session-1",
+            "window-1",
+            agent_profile="coder",
+            working_directory="/my/repo",
+        )
+        provider.restore_input_preparation(False, profile=mock_profile)
+
+        mock_load.assert_not_called()
+        assert provider._first_message_prefix == "Provided system prompt"
+
+    @patch("cli_agent_orchestrator.utils.skills.build_skill_catalog")
+    def test_compose_first_message_prefix_passes_start_to_build_skill_catalog(
+        self, mock_build_skills
+    ):
+        mock_build_skills.return_value = "\n## Skills\n- skillA"
+        mock_profile = MagicMock()
+        mock_profile.skills = ["skillA"]
+        mock_profile.system_prompt = "Base prompt"
+
+        provider = KimiCliProvider(
+            "term-1", "session-1", "window-1", working_directory="/my/repo"
+        )
+        prefix = provider._compose_first_message_prefix(mock_profile)
+
+        mock_build_skills.assert_called_once_with(["skillA"], start=Path("/my/repo"))
+        assert "skillA" in prefix
+
+    @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
+    def test_build_kimi_command_passes_start_to_load_agent_profile(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.skills = []
+        mock_profile.system_prompt = "Custom system prompt"
+        mock_profile.model = None
+        mock_profile.permissionMode = "plan"
+        mock_load.return_value = mock_profile
+
+        provider = KimiCliProvider(
+            "term-1",
+            "session-1",
+            "window-1",
+            agent_profile="reviewer",
+            working_directory="/my/repo",
+        )
+        cmd = provider._build_kimi_command()
+
+        mock_load.assert_called_once_with("reviewer", start=Path("/my/repo"))
+        assert "--plan" in cmd

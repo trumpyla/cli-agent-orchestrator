@@ -128,6 +128,12 @@ The Codex provider automatically adds these flags for tmux compatibility:
 
 By default, CAO also passes `--yolo` (alias for `--dangerously-bypass-approvals-and-sandbox`) because CAO agents run in non-interactive tmux sessions where approval prompts block handoff/assign flows. Profiles can opt out via `codexProfile`; see [Custom Codex Profile](#custom-codex-profile). Any unrestricted allowed-tools configuration (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) forces `--yolo` regardless of the profile setting.
 
+An explicit profile `permissionMode: bypassPermissions` also selects `--yolo`,
+including when `codexProfile` is present or the CAO allowed-tools list is
+restricted. This is the unattended policy for workers that must complete MCP
+callbacks. `permissionMode: plan` and `permissionMode: acceptEdits` retain
+their corresponding sandboxed, non-interactive Codex modes.
+
 ### Custom Codex Profile
 
 The `codexProfile` field on an agent profile names a `[profiles.<name>]` block in your `~/.codex/config.toml`. When set, CAO drops `--yolo` and passes `--profile <name>` instead, letting the user's named profile govern sandbox and approval behavior. Unrestricted allowed tools (`allowedTools: ["*"]`, `--allowed-tools '*'`, or `cao launch --yolo`) override this field and always force `--yolo`.

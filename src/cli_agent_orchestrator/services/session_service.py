@@ -23,9 +23,11 @@ lock in ``services/session_lock.py`` — see ``delete_session`` for why.
 """
 
 import logging
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from cli_agent_orchestrator.backends.base import TerminalBackend
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
     delete_terminals_by_ids,
@@ -205,7 +207,7 @@ def get_session(session_name: str) -> Dict:
     """Get session with terminals."""
     session_name = normalize_session_name(session_name)
     try:
-        if not get_backend().session_exists(session_name):
+        if not get_backend().session_exists_strict(session_name):
             raise ValueError(f"Session '{session_name}' not found")
 
         tmux_sessions = get_backend().list_sessions()
@@ -324,6 +326,7 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
     Returns:
         Dict with 'deleted' (list of deleted session names) and 'errors' (list of error dicts).
     """
+    session_name = normalize_session_name(session_name)
     result: Dict = {"deleted": [], "errors": []}
     # Terminals whose row was actually dropped, with the metadata their
     # post_kill_terminal payload needs. Collected under the lock, dispatched
@@ -544,53 +547,124 @@ def delete_session_automatically(
 ) -> Dict:
     """Close one captured Herdr identity before releasing persisted state.
 
-    This ordering is intentionally limited to the automatic completed-session
-    policy. Manual deletion retains its existing compatibility behavior.
+    The backend close is the destructive boundary. Terminal snapshots are
+    captured before that boundary, runtime state is dismantled only after the
+    close succeeds (or the workspace is authoritatively absent), and registry
+    rows are removed only when their runtime cleanup is complete. The lifecycle
+    lock covers inventory, close, runtime teardown, and row reconciliation so a
+    concurrent create or cleanup cannot interleave with this operation.
     """
     session_name = normalize_session_name(session_name)
     selected_backend = backend or get_backend()
     if not isinstance(selected_backend, HerdrBackend):
-        raise RuntimeError("automatic cleanup requires Herdr backend")
+        raise TypeError("automatic cleanup requires Herdr backend")
 
-    inventory = selected_backend.list_workspace_inventory()
-    label_matches = [workspace for workspace in inventory if workspace.label == session_name]
-    id_matches = [
-        workspace for workspace in inventory if workspace.workspace_id == expected_backend_id
-    ]
-    if len(label_matches) > 1 or len(id_matches) > 1:
-        raise RuntimeError("backend identity ambiguous")
     from cli_agent_orchestrator.services import terminal_service
 
-    terminals = list_terminals_by_session(session_name)
-    backend_was_present = bool(label_matches)
-    if label_matches:
-        workspace = label_matches[0]
-        if workspace.workspace_id != expected_backend_id:
+    result: Dict = {"deleted": [], "errors": []}
+    torn_down: List[Tuple[str, Dict]] = []
+    with session_lifecycle_lock(session_name):
+        inventory = selected_backend.list_workspace_inventory()
+        label_matches = [workspace for workspace in inventory if workspace.label == session_name]
+        id_matches = [
+            workspace for workspace in inventory if workspace.workspace_id == expected_backend_id
+        ]
+        if len(label_matches) > 1 or len(id_matches) > 1:
+            raise RuntimeError("backend identity ambiguous")
+
+        terminals = list_terminals_by_session(session_name)
+        incarnation_ids = [terminal["id"] for terminal in terminals]
+        captured = [
+            (terminal["id"], terminal_service.capture_terminal_snapshot(terminal["id"]))
+            for terminal in terminals
+        ]
+
+        if label_matches:
+            workspace = label_matches[0]
+            if workspace.workspace_id != expected_backend_id:
+                raise RuntimeError("backend identity changed")
+            if workspace.agent_status != "done":
+                raise RuntimeError("backend state changed")
+            if not selected_backend.close_workspace_by_id(expected_backend_id):
+                raise RuntimeError("backend close failed")
+        elif id_matches:
+            # The captured stable identity still exists under a different label.
             raise RuntimeError("backend identity changed")
-        if workspace.agent_status != "done":
-            raise RuntimeError("backend state changed")
-        for terminal in terminals:
-            terminal_service.prepare_terminal_for_backend_close(terminal["id"])
-        if not selected_backend.close_workspace_by_id(expected_backend_id):
-            raise RuntimeError("backend close failed")
-    elif id_matches:
-        # The captured stable identity still exists under a different label.
-        raise RuntimeError("backend identity changed")
-    # No label or ID match is an authoritative already-absent backend. Continue
-    # persistence cleanup so a close/crash boundary resumes idempotently.
+        # No label or ID match is an authoritative already-absent backend. Continue
+        # persistence cleanup so a close/crash boundary resumes idempotently.
 
-    for terminal in terminals:
-        terminal_service.delete_terminal(
-            terminal["id"],
-            registry=registry,
-            backend_already_closed=True,
-            prepared=backend_was_present,
-        )
+        deferred_ids: List[str] = []
+        row_delete_failed: List[Tuple[str, Dict]] = []
+        for terminal_id, metadata in captured:
+            try:
+                runtime_released = terminal_service.dismantle_terminal_runtime(
+                    terminal_id,
+                    metadata,
+                    kill_window=False,
+                )
+            except Exception as exc:
+                deferred_ids.append(terminal_id)
+                result["errors"].append(
+                    {"terminal_id": terminal_id, "error": f"runtime cleanup failed: {exc}"}
+                )
+                continue
+            if runtime_released is False:
+                deferred_ids.append(terminal_id)
+                result["errors"].append(
+                    {
+                        "terminal_id": terminal_id,
+                        "error": "cleanup deferred; retry automatic cleanup",
+                    }
+                )
+                continue
+            try:
+                if terminal_service.delete_terminal_row(terminal_id, metadata, registry=None):
+                    if isinstance(metadata, dict):
+                        torn_down.append((terminal_id, metadata))
+            except Exception as exc:
+                if isinstance(metadata, dict):
+                    row_delete_failed.append((terminal_id, metadata))
+                result["errors"].append(
+                    {"terminal_id": terminal_id, "error": f"registry cleanup failed: {exc}"}
+                )
 
-    clear_session_env(session_name)
+        try:
+            delete_terminals_by_ids(
+                [terminal_id for terminal_id in incarnation_ids if terminal_id not in deferred_ids]
+            )
+        except Exception as exc:
+            result["errors"].append(
+                {"session": session_name, "step": "delete_terminals_by_ids", "error": str(exc)}
+            )
+        else:
+            torn_down.extend(row_delete_failed)
+
+        try:
+            clear_session_env(session_name)
+        except Exception as exc:
+            result["errors"].append(
+                {"session": session_name, "step": "clear_session_env", "error": str(exc)}
+            )
+
+        if not deferred_ids:
+            result["deleted"].append(session_name)
+
+    for terminal_id, metadata in torn_down:
+        try:
+            dispatch_plugin_event(
+                registry,
+                "post_kill_terminal",
+                PostKillTerminalEvent(
+                    session_id=metadata["tmux_session"],
+                    terminal_id=terminal_id,
+                    agent_name=metadata.get("agent_profile"),
+                ),
+            )
+        except Exception as exc:
+            logger.warning("Failed to emit post_kill_terminal for %s: %s", terminal_id, exc)
     dispatch_plugin_event(
         registry,
         "post_kill_session",
         PostKillSessionEvent(session_id=session_name, session_name=session_name),
     )
-    return {"deleted": [session_name], "errors": []}
+    return result

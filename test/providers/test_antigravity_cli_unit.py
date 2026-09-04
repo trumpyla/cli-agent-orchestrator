@@ -1,6 +1,7 @@
 """Unit tests for the Antigravity CLI (``agy``) provider."""
 
 import json
+import stat
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
@@ -58,7 +59,8 @@ def make_provider(
     )
 
 
-def test_handle_startup_dialog_accepts_plan_mode_ready_surface(monkeypatch):
+@pytest.mark.asyncio
+async def test_handle_startup_dialog_accepts_plan_mode_ready_surface(monkeypatch):
     """A ready plan prompt must end startup watching without burning the timeout."""
     provider = make_provider()
     calls = 0
@@ -75,19 +77,18 @@ def test_handle_startup_dialog_accepts_plan_mode_ready_surface(monkeypatch):
             calls += 1
             return ready
 
-    monotonic_values = iter([0.0, 0.0, 0.0, 0.5, 1.0])
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.antigravity_cli.time.monotonic",
-        lambda: next(monotonic_values),
+        lambda: 0.0,
     )
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.antigravity_cli.time.sleep", lambda _: None
     )
 
-    _REAL_HANDLE_STARTUP_DIALOG(provider, idle_gap=0.25, outer_timeout=1.0)
+    await _REAL_HANDLE_STARTUP_DIALOG(provider, idle_gap=0.25, outer_timeout=1.0)
 
     assert calls == 1
 
@@ -385,6 +386,106 @@ def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
         assert entry["args"] == []
 
 
+def test_mcp_registration_tracks_and_cleans_third_party_ownership(tmp_path):
+    """Third-party entries stay identity-free but are still CAO-owned."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    profile = AgentProfile(
+        name="developer_gemini",
+        description="Developer",
+        mcpServers={"github": {"command": "github-mcp", "args": ["serve"]}},
+    )
+    p = make_provider(agent_profile="developer_gemini")
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+    ):
+        p._build_agy_command()
+
+        data = json.loads(cfg.read_text())
+        entry = data["mcpServers"]["github-test-tid"]
+        assert "CAO_TERMINAL_ID" not in entry.get("env", {})
+
+        ownership = json.loads(Path(f"{cfg}.cao-ownership").read_text())
+        assert ownership == {"version": 1, "owners": {"github-test-tid": "test-tid"}}
+        assert stat.S_IMODE(Path(f"{cfg}.cao-ownership").stat().st_mode) == 0o600
+
+        p.cleanup()
+
+    assert "github-test-tid" not in json.loads(cfg.read_text())["mcpServers"]
+    assert json.loads(Path(f"{cfg}.cao-ownership").read_text()) == {
+        "version": 1,
+        "owners": {},
+    }
+
+
+def test_stale_prune_uses_sidecar_ownership_for_identity_free_entries(tmp_path):
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(json.dumps({"mcpServers": {"github-old": {"command": "github-mcp"}}}))
+    Path(f"{cfg}.cao-ownership").write_text(
+        json.dumps({"version": 1, "owners": {"github-old": "dead-terminal"}})
+    )
+    servers = json.loads(cfg.read_text())["mcpServers"]
+    provider = make_provider()
+
+    with (
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            return_value=None,
+        ),
+    ):
+        _real_prune_stale_mcp_entries(provider, servers)
+
+    assert servers == {}
+    assert json.loads(Path(f"{cfg}.cao-ownership").read_text()) == {
+        "version": 1,
+        "owners": {},
+    }
+
+
+def test_malformed_ownership_sidecar_does_not_delete_user_entry(tmp_path):
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(json.dumps({"mcpServers": {"user-server": {"command": "keep"}}}))
+    Path(f"{cfg}.cao-ownership").write_text("not-json")
+    servers = json.loads(cfg.read_text())["mcpServers"]
+    provider = make_provider()
+
+    with (
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+        patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata",
+            side_effect=AssertionError("unowned user entry was checked"),
+        ),
+    ):
+        _real_prune_stale_mcp_entries(provider, servers)
+
+    assert servers == {"user-server": {"command": "keep"}}
+
+
+def test_mcp_cleanup_rehydrates_sidecar_owned_entry_after_restart(tmp_path):
+    """A provider restored after restart can clean up without in-memory names."""
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(json.dumps({"mcpServers": {"github-old": {"command": "github-mcp"}}}))
+    Path(f"{cfg}.cao-ownership").write_text(
+        json.dumps({"version": 1, "owners": {"github-old": "test-tid"}})
+    )
+    provider = make_provider()
+
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        provider._unregister_mcp_servers()
+
+    assert json.loads(cfg.read_text()) == {"mcpServers": {}}
+    assert json.loads(Path(f"{cfg}.cao-ownership").read_text()) == {
+        "version": 1,
+        "owners": {},
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Misc lifecycle
 # --------------------------------------------------------------------------- #
@@ -555,7 +656,7 @@ def test_mcp_registration_preserves_profile_entry_fields(tmp_path):
     ):
         p._build_agy_command()
 
-    entry = json.loads(cfg.read_text())["mcpServers"]["cao-mcp-server"]
+    entry = json.loads(cfg.read_text())["mcpServers"]["cao-mcp-server-test-tid"]
     assert entry["type"] == "stdio"
     assert entry["timeout"] == 120_000
 
@@ -654,10 +755,13 @@ def test_mcp_registration_replaces_non_dict_mcpservers(tmp_path):
     assert "cao-mcp-server-test-tid" in data["mcpServers"]
 
 
-def test_unregister_noop_when_nothing_registered():
+def test_unregister_noop_when_nothing_registered(tmp_path):
     # No servers registered -> cleanup is a no-op, never touches the filesystem.
+    cfg = tmp_path / "mcp_config.json"
     p = make_provider()
-    p.cleanup()  # must not raise
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        p.cleanup()  # must not raise
+        assert not cfg.exists()
     assert p._mcp_server_names == []
 
 
@@ -920,8 +1024,9 @@ async def test_initialize_success(monkeypatch):
     assert p._initialized is True
     assert p.is_input_ready is True
     assert sent["command"].startswith("agy --dangerously-skip-permissions")
-    assert to_thread.await_count == 1
-    assert to_thread.await_args.args[0] == p._handle_startup_dialog
+    assert to_thread.await_count == 2
+    assert to_thread.await_args_list[0].args[0] == p._build_agy_command
+    assert to_thread.await_args_list[1].args[0].__name__ == "send_keys"
 
 
 @pytest.mark.asyncio
@@ -1218,6 +1323,64 @@ def test_prune_stale_mcp_entries_on_register(tmp_path):
     # New entry added
     assert "cao-mcp-server-new-tid" in servers
     assert servers["cao-mcp-server-new-tid"]["env"]["CAO_TERMINAL_ID"] == "new-tid"
+
+
+def test_unreadable_mcp_config_preserves_existing_ownership_records(tmp_path):
+    """When mcp_config.json cannot be parsed or read cleanly, _register_mcp_servers
+    does NOT prune stale entries against an empty server dict, preserving the
+    existing ownership records in the sidecar."""
+    from cli_agent_orchestrator.models.agent_profile import AgentProfile
+
+    cfg = tmp_path / "mcp_config.json"
+    # Write invalid JSON simulating a concurrent write corruption or transient read error
+    cfg.write_text("{corrupt-json-")
+
+    # Set up pre-existing ownership sidecar
+    sidecar = AntigravityCliProvider._mcp_ownership_path(cfg)
+    sidecar.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "owners": {
+                    "cao-mcp-server-existing-tid": "existing-tid",
+                },
+            }
+        )
+    )
+
+    profile = AgentProfile(
+        name="dev_gemini",
+        description="Dev",
+        system_prompt="You develop.",
+        mcpServers={"cao-mcp-server": {"command": "uvx", "args": ["cao-mcp-server"]}},
+    )
+    p = make_provider(terminal_id="new-tid", agent_profile="dev_gemini")
+
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.shutil.which",
+            return_value="/usr/local/bin/agy",
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.antigravity_cli.load_agent_profile",
+            return_value=profile,
+        ),
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+        patch.object(
+            AntigravityCliProvider,
+            "_prune_stale_mcp_entries",
+            side_effect=_real_prune_stale_mcp_entries,
+        ) as mock_prune,
+    ):
+        p._build_agy_command()
+
+    # Verify _prune_stale_mcp_entries was NOT called because config was not loaded cleanly
+    mock_prune.assert_not_called()
+
+    # Verify the existing ownership record was preserved and the new one was added
+    owners_data = json.loads(sidecar.read_text())
+    assert owners_data["owners"]["cao-mcp-server-existing-tid"] == "existing-tid"
+    assert owners_data["owners"]["cao-mcp-server-new-tid"] == "new-tid"
 
 
 # --------------------------------------------------------------------------- #

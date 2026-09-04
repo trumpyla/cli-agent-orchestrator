@@ -49,19 +49,32 @@
       "type": "object",
       "description": "MCP server configurations. Each entry is exactly one command-launched stdio server or one HTTP server.",
       "additionalProperties": {
-        "type": "object",
-        "description": "One MCP server. A command-launched server sets 'command'; a remote server sets 'url', with 'type' naming its transport (for example 'http' or 'sse'). At least one of the two is required.",
-        "properties": {
-          "type": {"type": "string"},
-          "command": {"type": "string"},
-          "args": {"type": "array", "items": {"type": "string"}},
-          "env": {"type": "object", "additionalProperties": {"type": "string"}},
-          "timeout": {"type": "integer"},
-          "url": {"type": "string"}
-        },
-        "anyOf": [
-          {"required": ["command"]},
-          {"required": ["url"]}
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "Command-launched stdio MCP server.",
+            "properties": {
+              "type": {"type": "string", "enum": ["stdio"]},
+              "command": {"type": "string", "minLength": 1},
+              "args": {"type": "array", "items": {"type": "string"}},
+              "env": {"type": "object", "additionalProperties": {"type": "string"}},
+              "timeout": {"type": "integer"}
+            },
+            "required": ["command"],
+            "not": {
+              "required": ["url"]
+            }
+          },
+          {
+            "type": "object",
+            "description": "Streamable-HTTP MCP server.",
+            "properties": {
+              "type": {"type": "string", "const": "http"},
+              "url": {"type": "string"}
+            },
+            "required": ["type", "url"],
+            "additionalProperties": false
+          }
         ]
       }
     },

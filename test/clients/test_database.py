@@ -38,6 +38,8 @@ from cli_agent_orchestrator.clients.database import (
     update_message_status,
     update_terminal_group,
     update_terminal_metadata,
+    update_terminal_profile_prompt_delivered,
+    update_terminal_provider_initialized,
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.models.inbox import MessageStatus
@@ -143,6 +145,67 @@ class TestTerminalOperations:
         assert result["group"] is None
         assert result["metadata"] is None
         assert result["working_directory"] == "/workspace/project"
+
+    @patch("cli_agent_orchestrator.clients.database.SessionLocal")
+    def test_get_terminal_metadata_preserves_explicit_empty_allowlist(
+        self, mock_session_class
+    ):
+        """An empty allowlist stored as '[]' in DB must be deserialized to []."""
+        mock_session = MagicMock()
+        mock_session.__enter__ = MagicMock(return_value=mock_session)
+        mock_session.__exit__ = MagicMock(return_value=False)
+
+        mock_terminal = MagicMock()
+        mock_terminal.id = "test123"
+        mock_terminal.tmux_session = "cao-session"
+        mock_terminal.tmux_window = "window-0"
+        mock_terminal.provider = "kiro_cli"
+        mock_terminal.agent_profile = "developer"
+        mock_terminal.working_directory = "/workspace/project"
+        mock_terminal.allowed_tools = "[]"
+        mock_terminal.shell_command = None
+        mock_terminal.provider_initialized = True
+        mock_terminal.profile_prompt_delivered = True
+        mock_terminal.caller_id = None
+        mock_terminal.engine = "v2"
+        mock_terminal.group = None
+        mock_terminal.metadata_json = None
+        mock_terminal.last_active = datetime.now()
+
+        mock_query = MagicMock()
+        mock_query.filter.return_value.first.return_value = mock_terminal
+        mock_session.query.return_value = mock_query
+        mock_session_class.return_value = mock_session
+
+        result = get_terminal_metadata("test123")
+        assert result is not None
+        assert result["allowed_tools"] == []
+        assert result["working_directory"] == "/workspace/project"
+
+    def test_database_terminal_dict_no_duplicate_keys(self):
+        """create_terminal and get_terminal_metadata return dicts must not define duplicate keys."""
+        import ast
+        import inspect
+        from cli_agent_orchestrator.clients import database
+
+        source = inspect.getsource(database)
+        tree = ast.parse(source)
+
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name in (
+                "create_terminal",
+                "get_terminal_metadata",
+            ):
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Dict):
+                        keys = [
+                            k.value
+                            for k in sub.keys
+                            if isinstance(k, ast.Constant) and isinstance(k.value, str)
+                        ]
+                        assert len(keys) == len(set(keys)), (
+                            f"Duplicate keys found in {node.name} return dict: {keys}"
+                        )
 
     @patch("cli_agent_orchestrator.clients.database.SessionLocal")
     def test_get_terminal_metadata_not_found(self, mock_session_class):
@@ -1824,9 +1887,8 @@ class TestTerminalMetadataRoundTrip:
         from cli_agent_orchestrator.clients import database as db_mod
 
         engine = create_engine(f"sqlite:///{tmp_path / 'rt.db'}")
-        try:
-            Base.metadata.create_all(bind=engine)
-            monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
         created = create_terminal(
             "abc12345",
@@ -1853,9 +1915,8 @@ class TestTerminalMetadataRoundTrip:
         from cli_agent_orchestrator.clients import database as db_mod
 
         engine = create_engine(f"sqlite:///{tmp_path / 'rt2.db'}")
-        try:
-            Base.metadata.create_all(bind=engine)
-            monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
+        Base.metadata.create_all(bind=engine)
+        monkeypatch.setattr(db_mod, "SessionLocal", sessionmaker(bind=engine))
 
         created = create_terminal("abc12345", "cao-s", "w-0", "kiro_cli")
         assert created["caller_id"] is None

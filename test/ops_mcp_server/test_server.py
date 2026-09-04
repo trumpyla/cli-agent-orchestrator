@@ -1,7 +1,7 @@
 """Tests for the CAO operations MCP server."""
 
 from typing import TypedDict
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import requests
@@ -15,7 +15,10 @@ from cli_agent_orchestrator.ops_mcp_server.models import (
     TerminalControlResult,
 )
 from cli_agent_orchestrator.ops_mcp_server.server import (
+    CLIENT_DEFAULT_TIMEOUT,
+    _active_backend,
     _launch_session_impl,
+    _serialize_allowed_tools,
     get_profile_details,
     get_session_info,
     get_terminal_output,
@@ -282,6 +285,36 @@ class TestProfileTools:
 class TestSessionLifecycleTools:
     """Tests for session lifecycle tools."""
 
+    async def test_launch_session_uses_active_async_backend(self) -> None:
+        """Embedded MCP calls must not fall back to synchronous HTTP."""
+        backend = MagicMock()
+        backend.request_json = AsyncMock(
+            return_value=({"id": "term-async", "session_name": "cao-async"}, None)
+        )
+        token = _active_backend.set(backend)
+        try:
+            with patch(
+                "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+                side_effect=AssertionError("synchronous transport used"),
+            ):
+                result = await _launch_session_impl(
+                    agent_profile="developer",
+                    session_name="cao-async",
+                )
+        finally:
+            _active_backend.reset(token)
+
+        assert result.success is True
+        assert result.terminal_id == "term-async"
+        backend.request_json.assert_awaited_once_with(
+            "post",
+            "/sessions",
+            params={"agent_profile": "developer", "session_name": "cao-async"},
+            json=None,
+            operation="Launch session",
+            timeout=CLIENT_DEFAULT_TIMEOUT,
+        )
+
     async def test_launch_session_omits_provider_when_not_explicit(self) -> None:
         """Omitted provider should let the session API resolve the profile provider."""
         with (
@@ -353,12 +386,46 @@ class TestSessionLifecycleTools:
             json=None,
         )
 
+    async def test_serialize_allowed_tools(self) -> None:
+        """_serialize_allowed_tools returns None for None, "" for empty list, and comma-separated string for populated list."""
+        assert _serialize_allowed_tools(None) is None
+        assert _serialize_allowed_tools([]) == ""
+        assert _serialize_allowed_tools(["fs_read", "fs_write"]) == "fs_read,fs_write"
+
+    async def test_launch_session_passes_empty_allowed_tools(self) -> None:
+        """An explicit empty list of allowed_tools must serialize as empty string and be included in params."""
+        with patch(
+            "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
+            return_value=_response(
+                json_data={"id": "term-123", "session_name": "restricted-session"}
+            ),
+        ) as mock_request:
+            result = await launch_session(
+                agent_profile="developer",
+                provider="codex",
+                session_name="restricted-session",
+                allowed_tools=[],
+            )
+
+        assert result.success is True
+        mock_request.assert_called_once_with(
+            "post",
+            "http://127.0.0.1:9889/sessions",
+            params={
+                "provider": "codex",
+                "agent_profile": "developer",
+                "session_name": "restricted-session",
+                "allowed_tools": "",
+            },
+            json=None,
+        )
+
     async def test_launch_session_passes_model_and_initial_message(self) -> None:
         """The model stays in routing params and the first task stays in JSON."""
         initial_message = "Review the current change"
         with patch(
             "cli_agent_orchestrator.ops_mcp_server.server.requests.request",
-            return_value=_response(json_data={"id": "term-789"}),
+            return_value=_response(json_data={"id": "term-789", "session_name": "model-session"}),
         ) as mock_request:
             result = await launch_session(
                 agent_profile="developer",

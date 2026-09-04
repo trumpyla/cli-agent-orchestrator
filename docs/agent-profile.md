@@ -63,7 +63,10 @@ portable and make profile listings useful.
 - `engine` (string): Kiro CLI engine selection, either `v2` (the default) or
   `kas`. Valid only for the `kiro_cli` provider; an explicit `--engine` at
   launch must agree with this value. See [Kiro CLI](kiro-cli.md).
-- `permissionMode` (string): Claude Code permission mode.
+- `permissionMode` (string): provider permission policy. `plan` preserves a
+  read-only/native planning boundary where supported; `bypassPermissions`
+  enables unattended tool and MCP callbacks. Other values are passed to the
+  provider that supports them.
 - `native_agent` (string): Claude Code native-agent name.
 - `codexProfile` (string): named Codex configuration profile.
 - `codexConfig` (object): inline Codex configuration overrides.

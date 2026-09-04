@@ -8,7 +8,6 @@ import pytest
 from click.testing import CliRunner
 
 from cli_agent_orchestrator.cli.commands.profile import (
-    _load_schema,
     _validate_frontmatter,
     profile,
 )

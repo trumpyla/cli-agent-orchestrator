@@ -45,7 +45,6 @@ class TerminalModel(Base):
     agent_profile = Column(String)  # "developer", "reviewer" (optional)
     working_directory = Column(String, nullable=True)  # launch-time cwd (optional)
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
-    working_directory = Column(String, nullable=True)  # assigned launch repository context
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     # NULL identifies rows created before lifecycle persistence was introduced.
     # New rows start False and flip True only after provider.initialize() succeeds.
@@ -1209,6 +1208,14 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN working_directory TEXT")
             conn.commit()
             logger.info("Migration: added working_directory column to terminals table")
+        if "provider_initialized" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN provider_initialized BOOLEAN")
+            conn.commit()
+            logger.info("Migration: added provider_initialized column to terminals table")
+        if "profile_prompt_delivered" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN profile_prompt_delivered BOOLEAN")
+            conn.commit()
+            logger.info("Migration: added profile_prompt_delivered column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -1239,7 +1246,7 @@ def create_terminal(
             provider=provider,
             agent_profile=agent_profile,
             working_directory=working_directory,
-            allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
+            allowed_tools=_json.dumps(allowed_tools) if allowed_tools is not None else None,
             shell_command=shell_command,
             provider_initialized=False,
             profile_prompt_delivered=False,
@@ -1258,7 +1265,6 @@ def create_terminal(
             "agent_profile": terminal.agent_profile,
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
-            "working_directory": terminal.working_directory,
             "shell_command": terminal.shell_command,
             "provider_initialized": terminal.provider_initialized,
             "profile_prompt_delivered": terminal.profile_prompt_delivered,
@@ -1356,7 +1362,6 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "agent_profile": terminal.agent_profile,
             "working_directory": terminal.working_directory,
             "allowed_tools": allowed_tools,
-            "working_directory": terminal.working_directory,
             "shell_command": terminal.shell_command,
             "provider_initialized": terminal.provider_initialized,
             "profile_prompt_delivered": terminal.profile_prompt_delivered,

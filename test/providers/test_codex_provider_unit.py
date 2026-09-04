@@ -539,6 +539,26 @@ class TestCodexBuildCommandExtra:
         assert "NEVER" in instructions  # "NEVER read/output: ~/.aws/credentials..."
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_security_prompt_prepended_when_tools_empty_list(self, mock_load, tmp_path):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = "Original system prompt."
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = None
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider(
+            "tid", "sess", "win", "agent", allowed_tools=[]
+        )
+        with patch("cli_agent_orchestrator.providers.codex.CAO_HOME_DIR", tmp_path):
+            command = provider._build_codex_command()
+
+        instructions = read_developer_instructions_file(command)
+        assert "You only have access to these tools: none" in instructions
+        assert "Original system prompt." in instructions
+        assert "NEVER" in instructions
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_long_system_prompt_keeps_launch_line_short(self, mock_load, tmp_path):
         """Regression test for the real, live-reproduced failure: a large system_prompt
         (harness-control's own injected operating instructions + skill list commonly produce
@@ -776,6 +796,29 @@ class TestCodexProviderPermissionMode:
         ]
         assert "--yolo" not in argv
         assert "--dangerously-bypass-approvals-and-sandbox" not in argv
+
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_bypass_permissions_uses_yolo_for_unattended_mcp_callbacks(self, mock_load):
+        mock_profile = MagicMock()
+        mock_profile.model = None
+        mock_profile.system_prompt = None
+        mock_profile.mcpServers = None
+        mock_profile.codexProfile = "cao_reviewer"
+        mock_profile.codexConfig = None
+        mock_profile.permissionMode = "bypassPermissions"
+        mock_load.return_value = mock_profile
+
+        provider = CodexProvider(
+            "tid",
+            "sess",
+            "win",
+            "reviewer",
+            allowed_tools=["fs_read", "fs_list", "@cao-mcp-server"],
+        )
+        argv = shlex.split(provider._build_codex_command())
+
+        assert argv[:2] == ["codex", "--yolo"]
+        assert "--profile" not in argv
 
 
 class TestTomlScalar:

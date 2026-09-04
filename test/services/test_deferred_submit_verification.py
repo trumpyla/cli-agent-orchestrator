@@ -84,7 +84,7 @@ class TestRedeliverDroppedMessageHelper:
             patch.object(ts, "_worker_is_started_direct", return_value=False),
             patch.object(ts, "_message_visible_in_box", return_value=False),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "_send_input_impl") as send,
         ):
             started = ts.redeliver_dropped_message(
                 "t1", "Analyze the logs", 1, provider, full_resend_requires_probe=True
@@ -102,7 +102,7 @@ class TestRedeliverDroppedMessageHelper:
             patch.object(ts, "_worker_is_started_direct") as probe,
             patch.object(ts, "_message_visible_in_box", return_value=False),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "_send_input_impl") as send,
         ):
             started = ts.redeliver_dropped_message(
                 "t1", "Analyze the logs", 1, provider, full_resend_requires_probe=True
@@ -136,7 +136,7 @@ class TestRedeliverDroppedMessageHelper:
         with (
             patch.object(ts, "_message_visible_in_box", return_value=False),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "_send_input_impl") as send,
         ):
             started = ts.redeliver_dropped_message("t1", "Analyze the logs", 1, provider)
         assert started is False
@@ -181,7 +181,7 @@ class TestConfirmWorkerStartedOrResubmit:
             patch.object(ts, "wait_until_status", new=AsyncMock(side_effect=[False, True])),
             patch.object(ts, "_message_visible_in_box", return_value=False),
             patch.object(ts, "send_special_key") as key,
-            patch.object(ts, "send_input") as send,
+            patch.object(ts, "_send_input_impl") as send,
         ):
             ok = await ts._confirm_worker_started_or_resubmit(
                 "t1", "Analyze the logs", "reg", "sup", None

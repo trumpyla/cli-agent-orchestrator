@@ -746,18 +746,18 @@ class TestHerdrInboxServiceStartupDbCleanup:
 
         mock_delete.assert_not_called()
 
-    @patch("cli_agent_orchestrator.services.herdr_inbox_service.subprocess.run")
     @patch("cli_agent_orchestrator.clients.database.delete_terminal")
-    @patch("cli_agent_orchestrator.clients.database.list_all_terminals")
-    def test_startup_cleanup_preserves_peer_terminal(self, mock_list, mock_delete, mock_run):
+    @patch("cli_agent_orchestrator.clients.database.list_terminals_by_session")
+    @patch.object(HerdrInboxService, "_fetch_snapshot")
+    def test_startup_cleanup_preserves_peer_terminal(self, mock_snap, mock_list, mock_delete):
         """Pane-less peer records are not ghosts and must survive startup cleanup."""
         service = HerdrInboxService(socket_path="/tmp/test.sock")
 
-        ws_response = json.dumps(
-            {"result": {"workspaces": [self._workspace("ws-abc", "cao-test")]}}
-        )
-        tab_response = json.dumps({"result": {"tabs": []}})
-        mock_run.side_effect = self._make_subprocess_side_effect(ws_response, tab_response)
+        mock_snap.return_value = {
+            "panes": [],
+            "workspaces": [{"workspace_id": "ws-abc", "label": "cao-test"}],
+            "tabs": [],
+        }
         mock_list.return_value = [
             {
                 "id": "peer-keep",

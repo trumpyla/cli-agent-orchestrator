@@ -47,6 +47,7 @@ import re
 import shlex
 import shutil
 import stat
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -64,6 +65,7 @@ from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.mcp_translation import render_http_entry
 from cli_agent_orchestrator.services.settings_service import get_server_settings
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.atomic_write import atomic_write_text
 from cli_agent_orchestrator.utils.mcp_launch import (
     apply_terminal_identity,
     is_identity_bearing_command,
@@ -341,6 +343,46 @@ class AntigravityCliProvider(BaseProvider):
         """Path to agy's MCP config file (shared ~/.gemini/config/mcp_config.json)."""
         return Path.home() / ".gemini" / "config" / "mcp_config.json"
 
+    @staticmethod
+    def _mcp_ownership_path(path: Path) -> Path:
+        """Path to CAO's private ownership sidecar for an agy MCP config."""
+        return Path(f"{path}.cao-ownership")
+
+    def _load_mcp_ownership(self, path: Path) -> dict[str, str]:
+        """Read valid CAO MCP ownership without trusting malformed sidecars."""
+        ownership_path = self._mcp_ownership_path(path)
+        if not ownership_path.exists():
+            return {}
+        try:
+            with open(ownership_path, encoding="utf-8") as file_object:
+                payload = json.load(file_object)
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("Could not read MCP ownership sidecar %s: %s", ownership_path, exc)
+            return {}
+        if not isinstance(payload, dict) or payload.get("version") != 1:
+            logger.warning("Ignoring invalid MCP ownership sidecar %s", ownership_path)
+            return {}
+        owners = payload.get("owners")
+        if not isinstance(owners, dict):
+            logger.warning("Ignoring invalid MCP ownership map %s", ownership_path)
+            return {}
+        valid = {
+            key: terminal_id
+            for key, terminal_id in owners.items()
+            if isinstance(key, str) and isinstance(terminal_id, str) and key and terminal_id
+        }
+        if len(valid) != len(owners):
+            logger.warning("Ignoring invalid entries in MCP ownership sidecar %s", ownership_path)
+        return valid
+
+    def _write_mcp_ownership(self, path: Path, owners: dict[str, str]) -> None:
+        """Atomically persist the owner-only CAO MCP ownership sidecar."""
+        ownership_path = self._mcp_ownership_path(path)
+        atomic_write_text(
+            ownership_path,
+            json.dumps({"version": 1, "owners": dict(sorted(owners.items()))}, indent=2),
+        )
+
     def _resolve_native_mode(self, profile: Optional["object"]) -> Optional[str]:
         """Map a profile ``permissionMode`` to a validated native ``agy --mode``.
 
@@ -410,7 +452,7 @@ class AntigravityCliProvider(BaseProvider):
             # Soft tool restriction: when the profile is not allowed every tool
             # (e.g. the read-only reviewer), append the security prompt. agy
             # honors a clear instruction not to use disallowed tools.
-            if self._allowed_tools and "*" not in self._allowed_tools:
+            if self._allowed_tools is not None and "*" not in self._allowed_tools:
                 system_prompt = (
                     f"{system_prompt}\n\n{SECURITY_PROMPT}" if system_prompt else SECURITY_PROMPT
                 )
@@ -435,8 +477,9 @@ class AntigravityCliProvider(BaseProvider):
 
         agy reads MCP servers from this fixed file under the top-level
         ``mcpServers`` key. We merge our entries in (preserving any existing,
-        non-CAO servers), forwarding ``CAO_TERMINAL_ID`` into each server's env
-        so cao-mcp-server can resolve the current terminal for handoff / assign.
+        non-CAO servers). Identity-bearing CAO entries receive
+        ``CAO_TERMINAL_ID``; third-party entries remain identity-free and are
+        tracked in the private ownership sidecar for cleanup.
 
         Each entry is keyed as ``{server_name}-{terminal_id}`` so concurrent
         inits write to distinct keys and an earlier terminal's entry cannot be
@@ -454,6 +497,7 @@ class AntigravityCliProvider(BaseProvider):
         """
         path = self._mcp_config_path()
         with _MCP_CONFIG_WRITE_LOCK:
+            config_loaded_cleanly = True
             try:
                 if path.exists() and path.stat().st_size > 0:
                     with open(path) as f:
@@ -464,6 +508,7 @@ class AntigravityCliProvider(BaseProvider):
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("Could not read %s, starting fresh: %s", path, exc)
                 config = {}
+                config_loaded_cleanly = False
 
             # The file is shared with the user's own agy config; tolerate a
             # valid-but-unexpected shape (e.g. a JSON list/string) instead of
@@ -489,32 +534,67 @@ class AntigravityCliProvider(BaseProvider):
             # GC: prune entries left by terminals that crashed/were killed
             # without a graceful cleanup(). We're already holding the lock and
             # about to write — cheap to check liveness now.
-            self._prune_stale_mcp_entries(servers)
+            if config_loaded_cleanly:
+                self._prune_stale_mcp_entries(servers)
+            owners = self._load_mcp_ownership(path)
+            env_snapshot = snapshot_process_env()
+            requires_private_config = False
 
             for server_name, server_config in mcp_servers.items():
-                if isinstance(server_config, dict):
-                    cfg = dict(server_config)
+                parsed = parse_mcp_server_entry(server_config, server_name=server_name)
+                if isinstance(parsed, HttpMcpServer):
+                    url = resolve_http_url(parsed.url, env_snapshot, server_name=server_name)
+                    entry = render_http_entry("antigravity_cli", url, env=env_snapshot)
+                    requires_private_config = requires_private_config or bool(
+                        (entry.get("headers") or {}).get("Authorization")
+                    )
                 else:
-                    cfg = server_config.model_dump(exclude_none=True)
-                # Resolve the bundled cao-mcp-server console script to a
-                # PATH-independent invocation. persisted=True: this command is
-                # written to mcp_config.json and read by agy at later launches,
-                # so prefer the stable PATH launcher over the versioned venv path.
-                command, args = resolve_cao_mcp_command(
-                    cfg.get("command", ""), cfg.get("args", []) or [], persisted=True
-                )
-                entry: dict = {
-                    "command": command,
-                    "args": args,
-                }
-                env = dict(cfg.get("env", {}))
-                env["CAO_TERMINAL_ID"] = self.terminal_id
-                entry["env"] = env
+                    cfg = parsed.model_dump(exclude_none=True)
+                    cfg_command = cfg.get("command", "")
+                    cfg_args = cfg.get("args", []) or []
+                    identity_bearing = is_identity_bearing_command(cfg_command, cfg_args)
+                    command, args = resolve_cao_mcp_command(cfg_command, cfg_args, persisted=True)
+                    # Preserve provider-supported profile options while
+                    # replacing only the command and arguments resolved here.
+                    entry = dict(cfg)
+                    entry["command"] = command
+                    entry["args"] = args
+                    entry = apply_terminal_identity(
+                        entry,
+                        terminal_id=self.terminal_id,
+                        identity_bearing=identity_bearing,
+                    )
                 # Use a per-terminal key so concurrent inits don't overwrite
                 # each other's entry before agy reads the config at startup.
                 unique_key = f"{server_name}-{self.terminal_id}"
                 servers[unique_key] = entry
                 self._mcp_server_names.append(unique_key)
+                owners[unique_key] = self.terminal_id
+
+            # Agy has no documented header environment expansion, so an
+            # authenticated local CAO Ops entry contains a literal bearer.
+            # Establish and verify private permissions before writing that
+            # token to the shared config.
+            if requires_private_config:
+                created_probe = not path.exists()
+                try:
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    if created_probe:
+                        path.touch(mode=0o600)
+                    path.chmod(0o600)
+                    if stat.S_IMODE(path.stat().st_mode) != 0o600:
+                        raise OSError("private mode not enforced")
+                except OSError as exc:
+                    if created_probe:
+                        try:
+                            if path.exists() and path.stat().st_size == 0:
+                                path.unlink()
+                        except OSError:
+                            pass
+                    raise McpConfigError(
+                        "could not establish private Antigravity MCP config; "
+                        "refusing to write local bearer"
+                    ) from exc
 
             tmp_path = path.with_suffix(".json.tmp")
             with open(tmp_path, "w") as f:
@@ -522,6 +602,7 @@ class AntigravityCliProvider(BaseProvider):
             if path.exists():
                 os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
             os.replace(tmp_path, path)
+            self._write_mcp_ownership(path, owners)
 
     def _unregister_mcp_servers(self) -> None:
         """Remove the MCP servers this provider registered.
@@ -533,39 +614,60 @@ class AntigravityCliProvider(BaseProvider):
         terminal's concurrent registration and corrupt the shared
         ``mcp_config.json`` read-modify-write.
 
-        An ownership check ensures only entries whose
+        An ownership check ensures only entries whose sidecar owner or
         ``env.CAO_TERMINAL_ID`` matches this instance's terminal_id are
-        removed — entries belonging to a newer terminal that re-registered
-        under the same server name are left intact, making fire-and-forget
-        scheduling safe regardless of executor ordering.
+        removed. Rehydrate names from the sidecar and legacy env fields so a
+        provider reconstructed after a daemon restart can still clean up.
+        Entries belonging to a newer terminal are left intact, making
+        fire-and-forget scheduling safe regardless of executor ordering.
         """
-        if not self._mcp_server_names:
-            return
         path = self._mcp_config_path()
-        if not path.exists():
-            self._mcp_server_names = []
-            return
         with _MCP_CONFIG_WRITE_LOCK:
+            owners = self._load_mcp_ownership(path)
+            names = set(self._mcp_server_names)
+            names.update(
+                name for name, terminal_id in owners.items() if terminal_id == self.terminal_id
+            )
             try:
+                if not path.exists():
+                    removed_sidecar = False
+                    for name in names:
+                        if owners.get(name) == self.terminal_id:
+                            owners.pop(name, None)
+                            removed_sidecar = True
+                    if removed_sidecar:
+                        self._write_mcp_ownership(path, owners)
+                    return
                 with open(path) as f:
                     config = json.load(f)
                 servers = config.get("mcpServers") if isinstance(config, dict) else None
                 if isinstance(servers, dict):
-                    for name in self._mcp_server_names:
+                    for name, entry in servers.items():
+                        env = entry.get("env", {}) if isinstance(entry, dict) else {}
+                        if isinstance(env, dict) and env.get("CAO_TERMINAL_ID") == self.terminal_id:
+                            names.add(name)
+                    removed_any = False
+                    for name in list(names):
                         entry = servers.get(name)
                         env = entry.get("env", {}) if isinstance(entry, dict) else {}
+                        env_terminal_id = (
+                            env.get("CAO_TERMINAL_ID") if isinstance(env, dict) else None
+                        )
                         if (
-                            isinstance(entry, dict)
-                            and isinstance(env, dict)
-                            and env.get("CAO_TERMINAL_ID") != self.terminal_id
+                            owners.get(name) != self.terminal_id
+                            and env_terminal_id != self.terminal_id
                         ):
                             continue  # belongs to a different terminal — leave it
                         servers.pop(name, None)
-                    tmp_path = path.with_suffix(".json.tmp")
-                    with open(tmp_path, "w") as f:
-                        json.dump(config, f, indent=2)
-                    os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
-                    os.replace(tmp_path, path)
+                        owners.pop(name, None)
+                        removed_any = True
+                    if removed_any:
+                        tmp_path = path.with_suffix(".json.tmp")
+                        with open(tmp_path, "w") as f:
+                            json.dump(config, f, indent=2)
+                        os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
+                        os.replace(tmp_path, path)
+                        self._write_mcp_ownership(path, owners)
             except (json.JSONDecodeError, OSError) as exc:
                 logger.warning("Failed to unregister MCP servers from %s: %s", path, exc)
             finally:
@@ -573,26 +675,34 @@ class AntigravityCliProvider(BaseProvider):
                 # stale names behind and block terminal teardown.
                 self._mcp_server_names = []
 
-    def _prune_stale_mcp_entries(self, servers: dict) -> None:
-        """Remove entries whose CAO_TERMINAL_ID no longer maps to a live terminal.
+    def _prune_stale_mcp_entries(self, servers: dict) -> dict[str, str]:
+        """Remove entries whose CAO owner no longer maps to a live terminal.
 
         Called inside _register_mcp_servers while holding _MCP_CONFIG_WRITE_LOCK.
         Uses the database client directly (sync, safe — we're on a worker thread).
         """
         from cli_agent_orchestrator.clients import database as _db
 
+        path = self._mcp_config_path()
+        owners = self._load_mcp_ownership(path)
+        owners = {key: terminal_id for key, terminal_id in owners.items() if key in servers}
         stale_keys: list[str] = []
         for key, entry in servers.items():
             env = entry.get("env", {}) if isinstance(entry, dict) else {}
-            tid = env.get("CAO_TERMINAL_ID") if isinstance(env, dict) else None
+            tid = owners.get(key)
+            if tid is None:
+                tid = env.get("CAO_TERMINAL_ID") if isinstance(env, dict) else None
             if tid is None:
                 continue  # not a CAO-managed entry — leave it
             if _db.get_terminal_metadata(tid) is None:
                 stale_keys.append(key)
         for key in stale_keys:
             del servers[key]
+            owners.pop(key, None)
         if stale_keys:
             logger.info("Pruned %d stale MCP config entries: %s", len(stale_keys), stale_keys)
+        self._write_mcp_ownership(path, owners)
+        return owners
 
     async def _handle_startup_dialog(
         self, idle_gap: Optional[float] = None, outer_timeout: Optional[float] = None

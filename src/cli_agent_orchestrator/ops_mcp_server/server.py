@@ -386,8 +386,10 @@ async def _request_from_active_backend(
 
 def _serialize_allowed_tools(allowed_tools: Optional[List[str]]) -> Optional[str]:
     """Serialize allowed tools for the session creation API."""
-    if not allowed_tools:
+    if allowed_tools is None:
         return None
+    if len(allowed_tools) == 0:
+        return ""
     return ",".join(allowed_tools)
 
 
@@ -414,11 +416,11 @@ async def _launch_session_impl(
         params["model"] = model
 
     serialized_allowed_tools = _serialize_allowed_tools(allowed_tools)
-    if serialized_allowed_tools:
+    if serialized_allowed_tools is not None:
         params["allowed_tools"] = serialized_allowed_tools
 
     body = {"initial_message": initial_message} if initial_message is not None else None
-    session_data, error = _request_json(
+    session_data, error = await _request_from_active_backend(
         "post", "/sessions", params=params, json=body, operation="Launch session"
     )
     if error:
@@ -442,15 +444,16 @@ async def _launch_session_impl(
         )
 
     terminal_id = str(session_data["id"])
+    canonical_session_name = str(session_data.get("session_name") or resolved_session_name)
     message = (
-        f"Session '{resolved_session_name}' launched; initial message delivery is in progress"
+        f"Session '{canonical_session_name}' launched; initial message delivery is in progress"
         if initial_message is not None
-        else f"Session '{resolved_session_name}' launched successfully"
+        else f"Session '{canonical_session_name}' launched successfully"
     )
     return LaunchResult(
         success=True,
         message=message,
-        session_name=resolved_session_name,
+        session_name=canonical_session_name,
         terminal_id=terminal_id,
     )
 

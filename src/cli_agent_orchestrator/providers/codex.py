@@ -11,6 +11,10 @@ from typing import Any, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.mcp_server import (
+    HttpMcpServer,
+    parse_mcp_server_entry,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.mcp_translation import render_http_entry
@@ -890,6 +894,12 @@ class CodexProvider(BaseProvider):
                 "--ask-for-approval",
                 "never",
             ]
+        elif permission_mode == "bypassPermissions":
+            # Explicit unattended orchestration policy. MCP callbacks are tool
+            # calls, so Codex must not use ``approval_policy = never`` (which
+            # rejects them) or an interactive prompt (which parks headless
+            # workers).
+            command_parts = ["codex", "--yolo"]
         elif profile and profile.codexProfile and not yolo:
             command_parts = ["codex", "--profile", profile.codexProfile]
         else:
@@ -915,10 +925,10 @@ class CodexProvider(BaseProvider):
             # Prepend security constraints for soft enforcement (Codex has no
             # native tool restriction mechanism). Only applied when tool
             # restrictions are active (not unrestricted "*").
-            if self._allowed_tools and "*" not in self._allowed_tools:
+            if self._allowed_tools is not None and "*" not in self._allowed_tools:
                 from cli_agent_orchestrator.constants import SECURITY_PROMPT
 
-                tools_list = ", ".join(self._allowed_tools)
+                tools_list = ", ".join(self._allowed_tools) if self._allowed_tools else "none"
                 tool_constraint = f"\nYou only have access to these tools: {tools_list}\n"
                 system_prompt = SECURITY_PROMPT + tool_constraint + system_prompt
 

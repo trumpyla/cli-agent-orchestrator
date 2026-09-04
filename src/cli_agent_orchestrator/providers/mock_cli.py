@@ -101,7 +101,7 @@ class MockCliProvider(BaseProvider):
         if not buffer:
             return TerminalStatus.UNKNOWN
 
-        clean = re.sub(ANSI_CODE_PATTERN, "", resolved_buffer)
+        clean = re.sub(ANSI_CODE_PATTERN, "", buffer)
 
         if ERROR_INDICATOR in clean:
             return TerminalStatus.ERROR

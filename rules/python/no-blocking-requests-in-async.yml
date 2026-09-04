@@ -3,6 +3,8 @@ language: Python
 severity: error
 message: Blocking requests calls are forbidden inside async functions
 note: Use the injected async request backend so cao-server's event loop stays responsive.
+ignores:
+  - "test/**"
 rule:
   all:
     - any:

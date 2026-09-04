@@ -332,7 +332,7 @@ class TestAntigravityHttpMapping:
         ):
             provider._build_agy_command()
 
-        entry = json.loads(cfg.read_text())["mcpServers"]["cao-ops"]
+        entry = json.loads(cfg.read_text())["mcpServers"]["cao-ops-test-tid"]
         assert entry == {"serverUrl": _OPS_URL}
         # ``serverUrl`` is Antigravity's documented canonical field. ``url`` is
         # accepted only as a compatibility alias and ``httpUrl`` is Gemini CLI.
@@ -365,9 +365,9 @@ class TestAntigravityHttpMapping:
             provider._build_agy_command()
 
         servers = json.loads(cfg.read_text())["mcpServers"]
-        assert servers["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
-        assert servers["cao-ops"] == {"serverUrl": _OPS_URL}
-        assert "env" not in servers["cao-ops"]
+        assert servers["cao-mcp-server-test-tid"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+        assert servers["cao-ops-test-tid"] == {"serverUrl": _OPS_URL}
+        assert "env" not in servers["cao-ops-test-tid"]
 
     def test_antigravity_authenticated_ops_uses_private_literal_header(
         self, tmp_path, monkeypatch
@@ -395,7 +395,7 @@ class TestAntigravityHttpMapping:
         ):
             command = provider._build_agy_command()
 
-        entry = json.loads(cfg.read_text())["mcpServers"]["cao-ops"]
+        entry = json.loads(cfg.read_text())["mcpServers"]["cao-ops-test-tid"]
         assert entry == {
             "serverUrl": _OPS_URL,
             "headers": {"Authorization": "Bearer fake-machine-token"},

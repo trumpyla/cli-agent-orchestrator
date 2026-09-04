@@ -370,6 +370,56 @@ class TestCreateSession:
             metadata=None,
         )
 
+    def test_create_session_preserves_empty_allowed_tools(self, client):
+        """allowed_tools="" parameter must parse to empty list [] instead of None."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+            allowed_tools=[],
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "allowed_tools": "",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["allowed_tools"] == []
+
+    def test_create_session_parses_comma_separated_allowed_tools(self, client):
+        """allowed_tools="bash, fs_read" must parse to ['bash', 'fs_read']."""
+        mock_terminal = Terminal(
+            id="abcd1234",
+            name="test-window",
+            session_name="test-session",
+            provider="kiro_cli",
+            agent_profile="developer",
+            allowed_tools=["bash", "fs_read"],
+        )
+        with patch("cli_agent_orchestrator.api.main.session_service") as mock_svc:
+            mock_svc.create_session = AsyncMock(return_value=mock_terminal)
+
+            response = client.post(
+                "/sessions",
+                params={
+                    "provider": "kiro_cli",
+                    "agent_profile": "developer",
+                    "allowed_tools": "bash, fs_read",
+                },
+            )
+
+        assert response.status_code == 201
+        assert mock_svc.create_session.call_args.kwargs["allowed_tools"] == ["bash", "fs_read"]
+
     def test_create_session_passes_explicit_kiro_engine(self, client):
         """An explicit engine reaches the session service and the response."""
         mock_terminal = Terminal(

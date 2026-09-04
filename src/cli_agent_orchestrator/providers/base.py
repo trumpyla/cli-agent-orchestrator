@@ -239,7 +239,13 @@ class BaseProvider(ABC):
         """Remember the successfully pasted payload for provider-aware parsing."""
         self._last_input_message = message
 
-    def restore_input_preparation(self, delivered: Optional[bool]) -> None:
+    def restore_input_preparation(
+        self,
+        delivered: Optional[bool],
+        *,
+        profile: Optional[Any] = None,
+        working_directory: Optional[str] = None,
+    ) -> None:
         """Restore durable one-shot input state after a daemon restart."""
 
     @property

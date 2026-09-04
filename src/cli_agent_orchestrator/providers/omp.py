@@ -163,8 +163,8 @@ class OmpProvider(BaseProvider):
         if profile is not None:
             context = profile.system_prompt or profile.prompt or ""
         context = self._apply_skill_prompt(context)
-        if self._allowed_tools and "*" not in self._allowed_tools:
-            tools_list = ", ".join(self._allowed_tools)
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
+            tools_list = ", ".join(self._allowed_tools) if self._allowed_tools else "none"
             context = (
                 SECURITY_PROMPT + f"\nYou only have access to these tools: {tools_list}\n" + context
             )

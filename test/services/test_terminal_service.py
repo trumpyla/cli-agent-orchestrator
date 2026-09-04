@@ -245,11 +245,11 @@ class TestExitTerminalCli:
     """Tests for exit_terminal_cli — the graceful CLI shutdown helper shared by
     the exit endpoint and run_agent_step teardown (issue #312 review fix #4)."""
 
-    @patch(f"{_TS}.send_input")
+    @patch(f"{_TS}._send_input_impl")
     @patch(f"{_TS}.send_special_key")
     @patch(f"{_TS}.provider_manager")
     def test_text_command_uses_send_input(self, mock_pm, mock_special, mock_input):
-        """A text exit command (e.g. /exit) is sent via send_input."""
+        """A text exit command (e.g. /exit) uses the private delivery controls."""
         provider = MagicMock()
         provider.exit_cli.return_value = "/exit"
         mock_pm.get_provider.return_value = provider

@@ -76,13 +76,15 @@ Both thinking and response lines use the `•` (bullet) prefix. The provider dis
 
 Agent profiles are **optional** for Kimi CLI. If provided, the provider:
 
-1. Applies the profile's model and MCP launch options
+1. Applies the profile's model, permission policy, and MCP launch options
 2. Prepends the system, skill, and tool-restriction instructions to the first task
 3. Uses Kimi's native `--plan` mode without `--yolo` when the profile explicitly
    selects plan mode or the resolved tool set is read-only. Explicit plan mode
    is a safety floor, including for an empty allowed-tools list; capability
-   inference cannot widen it. Writable profiles retain the historical `--yolo`
-   launch mode
+   inference cannot widen it. `permissionMode: bypassPermissions` explicitly
+   selects unattended `--yolo` mode for MCP callback workers, even when the CAO
+   tool list is otherwise restricted. Writable profiles without an explicit
+   plan retain the historical `--yolo` launch mode
 
 Kimi 0.29 restricts `--agent` and `--agent-file` to its v2 non-interactive
 engine. CAO operates the interactive TUI, so passing those flags prevents the

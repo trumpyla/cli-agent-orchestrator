@@ -95,8 +95,9 @@ async def embedded_stack() -> AsyncIterator[EmbeddedStack]:
                 {"detail": "Forbidden: requires one of ['cao:write', 'cao:admin']"},
                 status_code=403,
             )
+        requested_name = request.query_params.get("session_name") or "cao-write"
         return JSONResponse(
-            {"id": "deadbeef", "session_name": "cao-write"},
+            {"id": f"terminal-{requested_name}", "session_name": requested_name},
             status_code=201,
         )
 
@@ -586,6 +587,77 @@ async def test_current_refresh_header_reaches_rest_and_read_scope_stays_authorit
         assert body["result"]["structuredContent"]["success"] is False
         assert "Forbidden" in body["result"]["structuredContent"]["message"]
         assert stack.rest_authorizations == ["Bearer fresh-read-token"]
+
+
+@pytest.mark.asyncio
+async def test_concurrent_launch_calls_use_embedded_async_backend_and_forward_auth(
+    stack_factory: Callable[[], AbstractAsyncContextManager[EmbeddedStack]],
+    enable_fake_auth: Callable[[dict[str, TokenIdentity]], None],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Three concurrent MCP launches must share the active embedded backend."""
+    enable_fake_auth(
+        {
+            "launch-token": TokenIdentity(
+                scopes=["cao:write"],
+                issuer="https://issuer-a.test/",
+                subject="subject-a",
+                client_id="client-a",
+            )
+        }
+    )
+    monkeypatch.setattr(
+        ops_server,
+        "get_local_bearer",
+        lambda: (_ for _ in ()).throw(AssertionError("machine token was consulted")),
+    )
+
+    async with stack_factory() as stack:
+        initialized, session_id = await _initialize(stack.client, token="launch-token")
+        assert initialized.status_code == 200
+        assert session_id is not None
+        assert (
+            await _notify_initialized(stack.client, session_id, "launch-token")
+        ).status_code in {200, 202}
+
+        async def launch(worker_number: int) -> dict[str, Any]:
+            worker_name = f"cao-worker-{worker_number}"
+            response = await stack.client.post(
+                "/mcp/ops",
+                headers=_mcp_headers("launch-token", session_id),
+                json={
+                    "jsonrpc": "2.0",
+                    "id": worker_number,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "launch_session",
+                        "arguments": {
+                            "agent_profile": "developer",
+                            "provider": "mock_cli",
+                            "session_name": worker_name,
+                        },
+                    },
+                },
+            )
+            assert response.status_code == 200
+            result = _jsonrpc_body(response)["result"]["structuredContent"]
+            assert result["success"] is True
+            assert result["session_name"] == worker_name
+            assert result["terminal_id"] == f"terminal-{worker_name}"
+            return result
+
+        results = await asyncio.wait_for(
+            asyncio.gather(*(launch(worker_number) for worker_number in range(3))),
+            timeout=2,
+        )
+
+        assert [result["session_name"] for result in results] == [
+            "cao-worker-0",
+            "cao-worker-1",
+            "cao-worker-2",
+        ]
+        assert len({result["terminal_id"] for result in results}) == 3
+        assert stack.rest_authorizations == ["Bearer launch-token"] * 3
 
 
 @pytest.mark.asyncio

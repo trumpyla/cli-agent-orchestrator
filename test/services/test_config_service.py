@@ -135,6 +135,34 @@ class TestGetConfig:
         assert cfg.apps.enabled is False
         assert cfg.logging.level == "INFO"
 
+    def test_exposes_all_configured_memory_fields(self, _isolated_settings):
+        _isolated_settings["settings"].write_text(
+            json.dumps(
+                {
+                    "memory": {
+                        "learning_enabled": True,
+                        "instruction_promotion_enabled": True,
+                        "workflow_journal_capture_output": True,
+                        "workflow_journal_output_cap_bytes": 123,
+                        "workflow_journal_retention_days": 7,
+                        "workflow_journal_retention_count": 9,
+                    }
+                }
+            )
+        )
+
+        cfg = ConfigService.get_config()
+        listed = ConfigService.list_all()
+
+        assert cfg.memory.learning_enabled is True
+        assert cfg.memory.instruction_promotion_enabled is True
+        assert cfg.memory.workflow_journal_capture_output is True
+        assert cfg.memory.workflow_journal_output_cap_bytes == 123
+        assert cfg.memory.workflow_journal_retention_days == 7
+        assert cfg.memory.workflow_journal_retention_count == 9
+        assert listed["memory.learning_enabled"] is True
+        assert listed["memory.workflow_journal_output_cap_bytes"] == 123
+
 
 class TestSetAndPath:
     def test_set_persists_and_get_reads_it_back(self, _isolated_settings):

@@ -18,7 +18,11 @@ if TYPE_CHECKING:
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
-from cli_agent_orchestrator.models.terminal import TerminalInputBlockedError, TerminalStatus
+from cli_agent_orchestrator.models.mcp_server import (
+    HttpMcpServer,
+    parse_mcp_server_entry,
+)
+from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
 from cli_agent_orchestrator.providers.mcp_translation import render_http_entry
 from cli_agent_orchestrator.services.settings_service import get_server_settings
@@ -524,7 +528,7 @@ class ClaudeCodeProvider(BaseProvider):
         # Apply tool restrictions via --disallowedTools flags.
         # --dangerously-skip-permissions bypasses prompts but --disallowedTools
         # still prevents the agent from using the blocked tools entirely.
-        if self._allowed_tools and "*" not in self._allowed_tools:
+        if self._allowed_tools is not None and "*" not in self._allowed_tools:
             from cli_agent_orchestrator.utils.tool_mapping import get_disallowed_tools
 
             disallowed = get_disallowed_tools("claude_code", self._allowed_tools)
@@ -1298,6 +1302,11 @@ class ClaudeCodeProvider(BaseProvider):
         # message sits unsubmitted in the prompt box (observed on Claude Code with
         # the "/effort" + shift+tab bypass UI). 2.0s is conservative.
         return 2.0
+
+    @property
+    def is_input_ready(self) -> bool:
+        """Do not deliver durable input before Claude's startup completes."""
+        return self._initialized
 
     @property
     def accepts_input_while_processing(self) -> bool:

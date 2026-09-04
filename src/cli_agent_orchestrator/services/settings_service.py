@@ -311,6 +311,8 @@ def get_memory_settings() -> Dict[str, Any]:
         "enabled": True,
         "flush_threshold": 0.85,
         "lint_enabled": True,
+        "compile_mode": "llm",
+        "compile_timeout_s": 120.0,
         "learning_enabled": False,
         "instruction_promotion_enabled": False,
     }
@@ -647,6 +649,23 @@ def set_memory_setting(key: str, value: Any) -> Dict[str, Any]:
         if value < min_value:
             raise ValueError(f"{key} must be >= {min_value}, got {value}")
         memory[key] = value
+    elif key == "compile_mode":
+        if value not in ("llm", "append"):
+            raise ValueError(f"compile_mode must be 'llm' or 'append', got {value!r}")
+        memory[key] = value
+    elif key == "compile_timeout_s":
+        try:
+            timeout = float(value)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("compile_timeout_s must be a positive float <= 3600") from exc
+        if (
+            isinstance(value, bool)
+            or not (0.0 < timeout <= 3600.0)
+            or timeout != timeout
+            or timeout == float("inf")
+        ):
+            raise ValueError(f"compile_timeout_s must be between 0.0 and 3600.0, got {timeout}")
+        memory[key] = timeout
     else:
         raise ValueError(f"Unknown memory setting: {key}")
 

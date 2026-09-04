@@ -48,6 +48,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from fastapi.responses import JSONResponse, Response
+from fastmcp.server.dependencies import get_http_headers
+from fastmcp.utilities.lifespan import combine_lifespans
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.types import ASGIApp, Receive, Scope, Send
 
@@ -108,6 +110,8 @@ from cli_agent_orchestrator.models.memory import (
 )
 from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
 from cli_agent_orchestrator.models.workflow import RecoveryPolicy
+from cli_agent_orchestrator.ops_mcp_server.backend import AsgiRequestBackend
+from cli_agent_orchestrator.ops_mcp_server.server import CaoTokenVerifier, create_ops_mcp
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.providers.base import OutputExtractionError
 from cli_agent_orchestrator.providers.kiro_capabilities import (
@@ -157,6 +161,10 @@ from cli_agent_orchestrator.services.install_service import InstallResult, insta
 from cli_agent_orchestrator.services.log_writer import log_writer
 from cli_agent_orchestrator.services.profile_search import (
     DEFAULT_LIMIT as PROFILE_SEARCH_DEFAULT_LIMIT,
+)
+from cli_agent_orchestrator.services.runtime_cleanup_daemon import RuntimeCleanupDaemon
+from cli_agent_orchestrator.services.runtime_resource_cleanup import (
+    build_runtime_resource_cleanup,
 )
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
@@ -2925,6 +2933,7 @@ async def set_skill_dirs_endpoint(
 @app.get("/skills/{name}", response_model=SkillContentResponse)
 async def get_skill_content(
     name: str,
+    terminal_id: Optional[TerminalId] = Query(default=None),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> SkillContentResponse:
     """Return the full Markdown body for an installed skill."""
@@ -3054,7 +3063,11 @@ async def create_session(
                     f"{body.initial_message_orchestration_type!r}"
                 )
         # Parse comma-separated allowed_tools string into list
-        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
+        allowed_tools_list = (
+            [t.strip() for t in allowed_tools.split(",") if t.strip()]
+            if allowed_tools.strip()
+            else []
+        ) if allowed_tools is not None else None
 
         result = await session_service.create_session(
             provider=provider,
@@ -3254,7 +3267,11 @@ async def create_terminal_in_session(
             resolved_provider = provider
 
         # Parse comma-separated allowed_tools string into list
-        allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
+        allowed_tools_list = (
+            [t.strip() for t in allowed_tools.split(",") if t.strip()]
+            if allowed_tools.strip()
+            else []
+        ) if allowed_tools is not None else None
 
         initial_message = body.initial_message if body else None
 
@@ -6604,6 +6621,17 @@ async def get_inbox_messages_endpoint(
     limit: int = Query(default=10, le=100, description="Maximum number of messages to retrieve"),
     status_param: Optional[str] = Query(
         default=None, alias="status", description="Filter by message status"
+    ),
+    wait: float = Query(
+        default=0.0,
+        ge=0.0,
+        le=120.0,
+        description="Long-poll seconds: block until a new pending message arrives (0 = immediate)",
+    ),
+    after_id: Optional[int] = Query(
+        default=None,
+        ge=0,
+        description="Exclusive message-id cursor; returns only pending rows with id > after_id",
     ),
     _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> List[Dict]:

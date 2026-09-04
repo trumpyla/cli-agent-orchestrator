@@ -46,6 +46,7 @@ class ProviderManager:
         model: Optional[str] = None,
         engine: Optional[KiroEngine] = None,
         resume_session_id: Optional[str] = None,
+        working_directory: Optional[str] = None,
     ) -> BaseProvider:
         """Create and store provider instance."""
         try:
@@ -109,6 +110,7 @@ class ProviderManager:
                     allowed_tools,
                     skill_prompt=skill_prompt,
                     model=model,
+                    working_directory=working_directory,
                 )
             elif provider_type == ProviderType.OPENCODE_CLI.value:
                 provider = OpenCodeCliProvider(
@@ -236,14 +238,44 @@ class ProviderManager:
         if persisted_engine == KiroEngine.KAS:
             raise KiroPhase0KASError(profile_has_v2_policy=False)
 
+        # Restore the launch context needed by providers that defer prompt or
+        # skill preparation until after the daemon restarts. The working
+        # directory is part of the terminal row because repository-local
+        # profiles and skills must be resolved from the worker's checkout, not
+        # from cao-server's process cwd.
+        allowed_tools = metadata.get("allowed_tools")
+        skill_prompt = None
+        agent_profile = metadata.get("agent_profile")
+        working_directory = metadata.get("working_directory")
+        start = Path(working_directory) if isinstance(working_directory, str) else None
+        profile = None
+        if agent_profile:
+            try:
+                profile = load_agent_profile(agent_profile, start=start)
+                if profile.skills:
+                    skill_prompt = build_skill_catalog(profile.skills, start=start)
+            except Exception as exc:
+                # Provider-specific restoration remains authoritative. In
+                # particular Kimi records a quarantined preparation error when
+                # its undelivered profile cannot be rebuilt.
+                logger.warning(
+                    "Could not restore profile context for terminal %s: %s",
+                    terminal_id,
+                    exc,
+                )
+
         # Create provider on-demand
         provider = self.create_provider(
             metadata["provider"],
             terminal_id,
             metadata["tmux_session"],
             metadata["tmux_window"],
-            metadata["agent_profile"],
+            agent_profile,
+            allowed_tools=allowed_tools,
+            skill_prompt=skill_prompt,
+            model=metadata.get("model"),
             engine=persisted_engine,
+            working_directory=working_directory,
         )
         # Restore shell_command baseline from DB so get_status() can detect kiro exit.
         # The terminal already exists in the DB, so its CLI has long since
@@ -260,7 +292,11 @@ class ProviderManager:
         initialized = metadata.get("provider_initialized")
         if hasattr(provider, "_initialized") and initialized is not False:
             provider._initialized = True
-        provider.restore_input_preparation(metadata.get("profile_prompt_delivered"))
+        provider.restore_input_preparation(
+            metadata.get("profile_prompt_delivered"),
+            profile=profile,
+            working_directory=working_directory,
+        )
         logger.info(f"Created provider on-demand for terminal {terminal_id}")
         return provider
 

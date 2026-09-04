@@ -469,6 +469,7 @@ class TestCreateTerminal:
         mock_fifo_manager,
         mock_status_monitor,
         mock_delete_terminals_by_session,
+        tmp_path,
     ):
         """Providers that consume runtime prompts should receive the global skill catalog."""
         mock_gen_id.return_value = "test1234"
@@ -496,11 +497,13 @@ class TestCreateTerminal:
         mock_log_dir.__truediv__.return_value = mock_log_path
         mock_fifo_dir.__truediv__ = MagicMock(return_value="fake.fifo")
 
+        working_directory = tmp_path / "assigned-repo"
+        working_directory.mkdir()
         await create_terminal(
             "codex",
             "developer",
             new_session=True,
-            working_directory="/projects/assigned-repo",
+            working_directory=str(working_directory),
         )
 
         skill_prompt = mock_provider_manager.create_provider.call_args.kwargs["skill_prompt"]
@@ -515,13 +518,13 @@ class TestCreateTerminal:
         )
         mock_build_skill_catalog.assert_called_once_with(
             None,
-            start=Path("/projects/assigned-repo"),
+            start=working_directory,
         )
         mock_load_profile.assert_called_once_with(
             "developer",
-            start=Path("/projects/assigned-repo"),
+            start=working_directory,
         )
-        assert mock_db_create.call_args.kwargs["working_directory"] == ("/projects/assigned-repo")
+        assert mock_db_create.call_args.kwargs["working_directory"] == str(working_directory)
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")
@@ -1443,6 +1446,8 @@ class TestSendInput:
             "tmux_window": "developer-abcd",
         }
         mock_provider = mock_pm.get_provider.return_value
+        mock_provider.prepare_input.side_effect = lambda value: value
+        mock_provider.commit_prepared_input.return_value = False
         mock_provider.paste_enter_count = 2
         mock_provider.paste_submit_delay = 0.3
 
@@ -1472,10 +1477,12 @@ class TestSendInput:
         mock_provider_manager,
         mock_update,
         mock_status_monitor,
+        mock_memory_service,
     ):
         """Kimi's deferred profile prompt is prepended to the first delivered task."""
         from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 
+        mock_memory_service.return_value.get_curated_memory_context.return_value = ""
         mock_get_metadata.return_value = {
             "tmux_session": "cao-session",
             "tmux_window": "reviewer-abcd",
@@ -1550,6 +1557,7 @@ class TestSendInput:
         with pytest.raises(TerminalInputBlockedError, match="not ready"):
             send_input("test1234", "Inspect PR #1")
 
+    @patch("cli_agent_orchestrator.services.terminal_service.MemoryService")
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
     @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
@@ -1584,6 +1592,8 @@ class TestSendInput:
             "tmux_window": "developer-abcd",
         }
         mock_provider = mock_pm.get_provider.return_value
+        mock_provider.prepare_input.side_effect = lambda value: value
+        mock_provider.commit_prepared_input.return_value = False
         mock_provider.paste_enter_count = 2
         mock_provider.paste_submit_delay = 1.0
         mock_status_monitor.get_status.return_value = TerminalStatus.IDLE
@@ -1636,6 +1646,8 @@ class TestSendInput:
             "tmux_window": "developer-abcd",
         }
         mock_provider = mock_pm.get_provider.return_value
+        mock_provider.prepare_input.side_effect = lambda value: value
+        mock_provider.commit_prepared_input.return_value = False
         mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
         mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
 
@@ -1659,6 +1671,8 @@ class TestSendInput:
             "tmux_window": "developer-abcd",
         }
         mock_provider = mock_pm.get_provider.return_value
+        mock_provider.prepare_input.side_effect = lambda value: value
+        mock_provider.commit_prepared_input.return_value = False
         mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
         mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
 
@@ -1692,6 +1706,8 @@ class TestSendInput:
             "tmux_window": "developer-abcd",
         }
         mock_provider = mock_pm.get_provider.return_value
+        mock_provider.prepare_input.side_effect = lambda value: value
+        mock_provider.commit_prepared_input.return_value = False
         mock_provider.blocks_orchestrated_input_while_waiting_user_answer = True
         mock_status_monitor.get_status.return_value = TerminalStatus.WAITING_USER_ANSWER
         mock_provider.paste_enter_count = 1

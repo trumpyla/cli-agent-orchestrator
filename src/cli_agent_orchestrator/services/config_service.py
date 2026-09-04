@@ -64,11 +64,61 @@ class ServerConfig(BaseModel):
 
 
 class MemoryConfig(BaseModel):
-    enabled: bool = True
-    compile_mode: str = "llm"
-    flush_threshold: float = 0.85
-    compile_timeout_s: float = 120.0
-    lint_enabled: bool = True
+    """Validated memory policy while preserving extension-owned metadata."""
+
+    model_config = ConfigDict(extra="allow")
+
+    enabled: bool = Field(default=True, strict=True)
+    compile_mode: Literal["llm", "append"] = "llm"
+    flush_threshold: float = Field(
+        default=0.85,
+        strict=True,
+        gt=0.0,
+        le=1.0,
+        allow_inf_nan=False,
+    )
+    compile_timeout_s: float = Field(
+        default=120.0,
+        strict=True,
+        gt=0.0,
+        le=3600.0,
+        allow_inf_nan=False,
+    )
+    lint_enabled: bool = Field(default=True, strict=True)
+    learning_enabled: bool = Field(default=False, strict=True)
+    instruction_promotion_enabled: bool = Field(default=False, strict=True)
+    workflow_journal_capture_output: bool = Field(default=False, strict=True)
+    workflow_journal_output_cap_bytes: int = Field(default=8192, strict=True, gt=0)
+    workflow_journal_retention_days: int = Field(default=30, strict=True, ge=0)
+    workflow_journal_retention_count: int = Field(default=100, strict=True, ge=0)
+
+
+class CleanupConfig(BaseModel):
+    """Conservative policy for irreversible completed-session deletion."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    completed_sessions_enabled: bool = Field(default=False, strict=True)
+    completed_session_grace_s: int = Field(default=900, strict=True, ge=60)
+    sweep_interval_s: int = Field(default=300, strict=True, ge=30)
+    max_sessions_per_sweep: int = Field(default=5, strict=True, ge=1, le=50)
+    preserve_patterns: List[str] = Field(default_factory=list)
+
+    @field_validator("preserve_patterns", mode="before")
+    @classmethod
+    def _validate_preserve_patterns(cls, value: Any) -> List[str]:
+        if not isinstance(value, list):
+            raise ValueError("preserve_patterns must be a list")
+        if len(value) > 100:
+            raise ValueError("preserve_patterns must contain at most 100 entries")
+        for pattern in value:
+            if not isinstance(pattern, str):
+                raise ValueError("preserve_patterns entries must be strings")
+            if len(pattern) > 128:
+                raise ValueError("preserve_patterns entries must be at most 128 characters")
+            if any(unicodedata.category(character) == "Cc" for character in pattern):
+                raise ValueError("preserve_patterns entries must not contain control characters")
+        return value
 
 
 class TerminalConfig(BaseModel):
@@ -536,6 +586,12 @@ _ALL_PATHS = sorted(
         "memory.compile_mode",
         "memory.flush_threshold",
         "memory.compile_timeout_s",
+        "memory.learning_enabled",
+        "memory.instruction_promotion_enabled",
+        "memory.workflow_journal_capture_output",
+        "memory.workflow_journal_output_cap_bytes",
+        "memory.workflow_journal_retention_days",
+        "memory.workflow_journal_retention_count",
         "cleanup.completed_sessions_enabled",
         "cleanup.completed_session_grace_s",
         "cleanup.sweep_interval_s",
@@ -604,6 +660,22 @@ class ConfigService:
                 compile_mode=_get_value("memory.compile_mode", default="llm"),
                 flush_threshold=_get_value("memory.flush_threshold", default=0.85),
                 compile_timeout_s=_get_value("memory.compile_timeout_s", default=120.0),
+                learning_enabled=_get_value("memory.learning_enabled", default=False),
+                instruction_promotion_enabled=_get_value(
+                    "memory.instruction_promotion_enabled", default=False
+                ),
+                workflow_journal_capture_output=_get_value(
+                    "memory.workflow_journal_capture_output", default=False
+                ),
+                workflow_journal_output_cap_bytes=_get_value(
+                    "memory.workflow_journal_output_cap_bytes", default=8192
+                ),
+                workflow_journal_retention_days=_get_value(
+                    "memory.workflow_journal_retention_days", default=30
+                ),
+                workflow_journal_retention_count=_get_value(
+                    "memory.workflow_journal_retention_count", default=100
+                ),
             ),
             cleanup=_resolved_cleanup_config(),
             terminal=TerminalConfig(
