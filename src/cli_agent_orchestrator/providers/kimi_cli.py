@@ -152,6 +152,15 @@ WELCOME_BANNER_PATTERN = r"Welcome to Kimi Code CLI!"
 # (persisted, so it does not recur until the next release).
 UPGRADE_PROMPT_PATTERN = r"Skip reminders for version|Upgrade now"
 
+# Workspace trust dialog (Kimi 0.41.0+). When Kimi starts in a new directory
+# with project-level MCP servers, it prompts:
+#   Trust this folder?
+#   ↑↓ navigate · Enter select · Esc exit
+#    ❯ Trust this folder
+# Selecting "Trust this folder" (default option, answered by sending Enter)
+# enables project MCP servers and unblocks the REPL.
+TRUST_FOLDER_PATTERN = r"Trust this folder\?|Enable project MCP servers"
+
 # User input box boundaries (pre-v1.20.0). Kimi displayed user messages in a bordered box:
 #   ╭──────────────────────────────╮
 #   │ user message text             │
@@ -242,8 +251,18 @@ def _is_startup_output_ready(output: str) -> bool:
     if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
         return False
 
+    if re.search(TRUST_FOLDER_PATTERN, clean_output):
+        return False
+
+    lines = clean_output.splitlines()
+    if any(
+        re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
+        for ln in lines
+        if not re.match(r"\s*[•●]\s", ln)
+    ):
+        return False
+
     if re.search(NEW_TUI_STATUS_PATTERN, clean_output):
-        lines = clean_output.splitlines()
         last_spinner = max(
             (index for index, line in enumerate(lines) if _is_live_turn_spinner_line(line)),
             default=-1,
@@ -334,8 +353,13 @@ class KimiCliProvider(BaseProvider):
 
     @property
     def paste_enter_count(self) -> int:
-        """Kimi CLI's prompt_toolkit submits on single Enter after bracketed paste."""
-        return 1
+        """Kimi CLI's prompt_toolkit requires double Enter after bracketed paste to submit."""
+        return 2
+
+    @property
+    def paste_submit_delay(self) -> float:
+        """Kimi CLI needs time to settle bracketed paste before Enter is sent."""
+        return 1.5
 
     @property
     def is_input_ready(self) -> bool:
@@ -641,7 +665,9 @@ class KimiCliProvider(BaseProvider):
             if cls._mcp_timeout_configured:
                 return
 
-            config_path = Path.home() / ".kimi" / "config.toml"
+            config_path = kimi_mcp_home() / "config.toml"
+            if not config_path.exists():
+                config_path = Path.home() / ".kimi" / "config.toml"
             if not config_path.exists():
                 logger.warning(
                     f"Kimi config not found at {config_path}, skipping MCP timeout override"
@@ -732,6 +758,7 @@ class KimiCliProvider(BaseProvider):
         last_prompt_time = time.monotonic()
         any_prompt_handled = False
         upgrade_dismissed = False
+        trust_handled = False
         while True:
             now = time.monotonic()
             if now >= outer_deadline:
@@ -744,6 +771,25 @@ class KimiCliProvider(BaseProvider):
             )
             if output:
                 clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
+                # Answer the trust-folder dialog once; default option is "Trust this folder".
+                if not trust_handled and re.search(TRUST_FOLDER_PATTERN, clean_output):
+                    from cli_agent_orchestrator.services.status_monitor import status_monitor
+
+                    logger.info("Kimi trust-folder dialog detected, selecting Trust this folder")
+                    status_monitor.notify_input_sent(self.terminal_id)
+                    await asyncio.to_thread(
+                        get_backend().send_keys,
+                        self.session_name,
+                        self.window_name,
+                        "",
+                        enter_count=1,
+                    )
+                    trust_handled = True
+                    any_prompt_handled = True
+                    last_prompt_time = time.monotonic()
+                    await asyncio.sleep(1.0)
+                    continue
+
                 # Answer the upgrade dialog once; its text lingers in the buffer
                 # after dismissal, so the flag stops a re-answer on later polls.
                 if not upgrade_dismissed and re.search(UPGRADE_PROMPT_PATTERN, clean_output):
@@ -835,8 +881,61 @@ class KimiCliProvider(BaseProvider):
         ):
             raise TimeoutError(f"Kimi CLI initialization timed out after {ready_timeout} seconds")
 
+        await self.wait_until_input_ready(timeout=ready_timeout)
+
         self._initialized = True
         return True
+
+    async def wait_until_input_ready(
+        self,
+        timeout: float = 10.0,
+        poll_interval: float = 0.5,
+    ) -> bool:
+        """Wait until Kimi's input widget is mounted and MCP connections have settled.
+
+        Kimi renders the status bar before MCP servers finish connecting.
+        Input sent during "(connecting)" is silently absorbed by the TUI.
+        Require two consecutive captures without "(connecting)" or "connecting to mcp servers"
+        before declaring input readiness.
+        """
+        deadline = time.monotonic() + timeout
+        consecutive_ready = 0
+        while time.monotonic() < deadline:
+            try:
+                backend = get_backend()
+                current = await asyncio.to_thread(
+                    backend.get_history,
+                    self.session_name,
+                    self.window_name,
+                    tail_lines=40,
+                )
+            except Exception as exc:
+                logger.warning("Kimi input-ready capture failed: %s", exc)
+                consecutive_ready = 0
+                await asyncio.sleep(poll_interval)
+                continue
+
+            if not isinstance(current, str):
+                return True
+
+            clean = strip_terminal_escapes(current)
+            lines = clean.splitlines()
+            connecting = any(
+                re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
+                for ln in lines
+                if not re.match(r"\s*[•●]\s", ln)
+            )
+            has_status = bool(
+                re.search(NEW_TUI_STATUS_PATTERN, clean) or re.search(IDLE_PROMPT_PATTERN, clean)
+            )
+            if has_status and not connecting:
+                consecutive_ready += 1
+                if consecutive_ready >= 2:
+                    return True
+            else:
+                consecutive_ready = 0
+            await asyncio.sleep(poll_interval)
+        return False
 
     def get_status(self, output: str) -> TerminalStatus:
         """Get Kimi CLI status by analyzing terminal output.
@@ -881,6 +980,20 @@ class KimiCliProvider(BaseProvider):
         # not just SGR colour codes, so the bottom-anchored prompt/processing
         # checks see clean, line-oriented text on the raw stream.
         clean_output = strip_terminal_escapes(output)
+
+        lines = clean_output.splitlines()
+
+        if re.search(TRUST_FOLDER_PATTERN, clean_output):
+            return TerminalStatus.PROCESSING
+
+        # Boot gate: while MCP servers are connecting, treat as PROCESSING
+        # so init and the inbox wait for a real ready prompt.
+        if any(
+            re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
+            for ln in lines
+            if not re.match(r"\s*[•●]\s", ln)
+        ):
+            return TerminalStatus.PROCESSING
 
         # --- Newest "Kimi Code" TUI (redesigned CLI) ---
         # This build has no bare ✨/💫 prompt; readiness is the bottom status bar
@@ -1065,6 +1178,9 @@ class KimiCliProvider(BaseProvider):
         # since the boot gate precedes the ready check and re-fires on every
         # settled frame, the inbox (delivers only on IDLE/COMPLETED) would then
         # never deliver to that terminal.
+        if re.search(TRUST_FOLDER_PATTERN, joined):
+            return TerminalStatus.PROCESSING
+
         if any(
             re.search(r"connecting to mcp servers|\(connecting\)", ln, re.IGNORECASE)
             for ln in rows

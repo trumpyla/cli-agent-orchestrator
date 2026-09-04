@@ -950,6 +950,14 @@ class HerdrBackend(TerminalBackend):
         from cli_agent_orchestrator.clients.tmux import TmuxClient
 
         env: Dict[str, str] = {}
+        for k, v in os.environ.items():
+            if (
+                k.startswith(("CAO_", "KIRO_", "MISE_", "AWS_"))
+                and not TmuxClient._is_blocked_env_key(k)
+                and len(v.encode("utf-8")) < TmuxClient._MAX_ENV_VALUE_BYTES
+                and bool(_SAFE_ARG_RE.match(f"{k}={v}"))
+            ):
+                env[k] = v
         for key, value in (extra_env or {}).items():
             if TmuxClient._is_blocked_env_key(key):
                 logger.warning("Dropping forwarded env var with blocked prefix: %s", key)

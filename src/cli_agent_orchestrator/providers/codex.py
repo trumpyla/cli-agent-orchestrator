@@ -1035,6 +1035,9 @@ class CodexProvider(BaseProvider):
                         command_parts.extend(
                             ["-c", f"{prefix}.tool_timeout_sec={fields['tool_timeout_sec']}"]
                         )
+                        command_parts.extend(
+                            ["-c", f"{prefix}.default_tools_approval_mode=\"approve\""]
+                        )
                         bearer_env = fields.get("bearer_token_env_var")
                         if bearer_env:
                             command_parts.extend(
@@ -1099,6 +1102,9 @@ class CodexProvider(BaseProvider):
                     # is silently rejected and falls back to the 60s default.
                     if "tool_timeout_sec" not in cfg:
                         command_parts.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
+                    command_parts.extend(
+                        ["-c", f"{prefix}.default_tools_approval_mode=\"approve\""]
+                    )
 
             # Inline Codex config overrides (-c key=value). Lets a profile set
             # per-agent Codex knobs — reasoning effort, service tier, fast mode,

@@ -932,9 +932,10 @@ class AntigravityCliProvider(BaseProvider):
             await asyncio.sleep(poll_interval)
 
         logger.warning(
-            "Antigravity input surface did not settle within %.1fs for %s",
+            "Antigravity input surface did not settle within %.1fs for %s; last capture: %r",
             timeout,
             self.terminal_id,
+            clean if "clean" in locals() else None,
         )
         return False
 
