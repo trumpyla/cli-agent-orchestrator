@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+
+import pytest
+from pydantic import ValidationError
+
 from test.harness.live_supervisor_matrix import (
     LIVE_PROVIDER_LANES,
     PREFLIGHT_MARKER,
@@ -11,9 +15,6 @@ from test.harness.live_supervisor_matrix import (
     LiveProviderLane,
     run_live_preflight,
 )
-
-import pytest
-from pydantic import ValidationError
 
 
 def _environment() -> dict[str, str]:
@@ -169,3 +170,23 @@ def test_live_lane_rejects_model_alias() -> None:
 
     with pytest.raises(ValidationError, match="exact model identifier"):
         LiveProviderLane.model_validate(template)
+
+
+def test_preflight_filters_lanes_by_env_variable(tmp_path: Path) -> None:
+    commands: list[tuple[str, ...]] = []
+    env = _environment()
+    env["CAO_LIVE_LANES"] = "grok"
+
+    report = run_live_preflight(
+        tmp_path,
+        environ=env,
+        which=lambda _binary: "/bin/fake",
+        disk_usage=_disk,
+        runner=lambda cmd, cwd, timeout: commands.append(cmd) or _success_runner(cmd, cwd, timeout),
+    )
+
+    assert report.ready is True
+    assert len(commands) == 2  # herdr version + grok probe
+    assert commands[0] == ("herdr", "--version")
+    assert commands[1][0] == "grok"
+

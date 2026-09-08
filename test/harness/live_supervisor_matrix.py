@@ -31,9 +31,9 @@ class LiveProviderLane(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True, frozen=True)
 
-    name: Literal["codex", "claude", "antigravity", "kimi"]
-    provider: Literal["codex", "claude_code", "antigravity_cli", "kimi_cli"]
-    binary: Literal["codex", "claude", "agy", "kimi"]
+    name: Literal["codex", "claude", "antigravity", "kimi", "grok"]
+    provider: Literal["codex", "claude_code", "antigravity_cli", "kimi_cli", "grok_cli"]
+    binary: Literal["codex", "claude", "agy", "kimi", "grok"]
     model: str = Field(min_length=1)
     supervisor_profile: str = Field(min_length=1)
     worker_profile: str = Field(min_length=1)
@@ -126,6 +126,21 @@ LIVE_PROVIDER_LANES: tuple[LiveProviderLane, ...] = (
         ),
         catalog_probe=("kimi", "provider", "list"),
         catalog_model_token="kimi-code/k3",
+    ),
+    LiveProviderLane(
+        name="grok",
+        provider="grok_cli",
+        binary="grok",
+        model="grok-4.6",
+        supervisor_profile="cao_grok_supervisor",
+        worker_profile="cao_grok_worker",
+        auth_model_probe=(
+            "grok",
+            "--model",
+            "grok-4.6",
+            "-p",
+            f"Reply exactly: {PREFLIGHT_MARKER}",
+        ),
     ),
 )
 
@@ -241,8 +256,21 @@ def run_live_preflight(
         "CAO_SERENA_MCP_URL must be a loopback HTTP URL without userinfo",
     )
 
+    selected_lanes = env.get("CAO_LIVE_LANES")
+    if selected_lanes:
+        allowed = {x.strip() for x in selected_lanes.split(",") if x.strip()}
+        target_lanes = tuple(lane for lane in lanes if lane.name in allowed)
+    else:
+        target_lanes = lanes
+
+    record(
+        "lanes",
+        bool(target_lanes),
+        "no matching provider lanes found for preflight",
+    )
+
     record("herdr", which("herdr") is not None, "herdr binary is missing")
-    for lane in lanes:
+    for lane in target_lanes:
         record(
             f"{lane.name}.binary",
             which(lane.binary) is not None,
@@ -255,7 +283,7 @@ def run_live_preflight(
     herdr_result = runner(("herdr", "--version"), repo_root, command_timeout_s)
     record("herdr.version", herdr_result.returncode == 0, "version probe failed")
 
-    for lane in lanes:
+    for lane in target_lanes:
         if lane.catalog_probe is not None:
             catalog = runner(lane.catalog_probe, repo_root, command_timeout_s)
             catalog_ok = (

@@ -11,6 +11,10 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+
+import pytest
+import requests
+
 from test.fixtures.cao_server import (
     CaoServer,
     _pick_free_port,
@@ -21,9 +25,6 @@ from test.harness.live_supervisor_matrix import (
     LiveProviderLane,
     run_live_preflight,
 )
-
-import pytest
-import requests
 
 READY_STATES = {"idle", "completed"}
 LANE_TIMEOUT_S = 900
@@ -143,6 +144,16 @@ def _link_provider_configs(home_dir: Path) -> None:
         for name in ("auth.json", "version.json"):
             s = codex_src / name
             t = codex_tgt / name
+            if s.exists() and not t.exists():
+                with contextlib.suppress(Exception):
+                    t.symlink_to(s)
+    grok_src = real_home / ".grok"
+    grok_tgt = home_dir / ".grok"
+    if grok_src.exists():
+        grok_tgt.mkdir(parents=True, exist_ok=True)
+        for name in ("auth.json", "version.json", "trusted_folders.toml"):
+            s = grok_src / name
+            t = grok_tgt / name
             if s.exists() and not t.exists():
                 with contextlib.suppress(Exception):
                     t.symlink_to(s)

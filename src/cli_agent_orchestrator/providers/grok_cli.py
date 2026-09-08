@@ -403,6 +403,13 @@ class GrokCliProvider(BaseProvider):
         if auth_source.is_file() and not auth_link.exists():
             auth_link.symlink_to(auth_source)
 
+        trusted_source = (
+            Path(configured_home).expanduser() if configured_home else Path.home() / ".grok"
+        ) / "trusted_folders.toml"
+        trusted_link = home / "trusted_folders.toml"
+        if trusted_source.is_file() and not trusted_link.exists():
+            trusted_link.symlink_to(trusted_source)
+
         self._atomic_write_private(home / "config.toml", self._render_mcp_config(mcp_servers))
         self._grok_home = home
         self._grok_home_root = home.parent
@@ -523,7 +530,7 @@ class GrokCliProvider(BaseProvider):
 
         deadline = asyncio.get_running_loop().time() + timeout
         while asyncio.get_running_loop().time() < deadline:
-            output = status_monitor.get_buffer(self.terminal_id)
+            output = self._resolve_buffer(status_monitor.get_buffer(self.terminal_id))
             if DIRECTORY_TRUST_PATTERN.search(strip_terminal_escapes(output)):
                 raise ProviderError(
                     "Grok Build is waiting for directory trust. CAO does not automatically "
