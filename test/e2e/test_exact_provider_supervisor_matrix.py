@@ -15,15 +15,16 @@ from pathlib import Path
 import pytest
 import requests
 
+from cli_agent_orchestrator.utils.atomic_write import atomic_write_text
 from test.fixtures.cao_server import (
     CaoServer,
     _pick_free_port,
     _start_cao_server,
 )
 from test.harness.live_supervisor_matrix import (
-    LIVE_PROVIDER_LANES,
     LiveProviderLane,
     run_live_preflight,
+    select_live_lanes,
 )
 
 READY_STATES = {"idle", "completed"}
@@ -62,11 +63,7 @@ def _profile_text(lane: LiveProviderLane, *, supervisor: bool, port: int | None 
         )
     mcp_env = ""
     if port is not None:
-        mcp_env = (
-            "    env:\n"
-            f'      CAO_API_PORT: "{port}"\n'
-            '      CAO_API_HOST: "127.0.0.1"\n'
-        )
+        mcp_env = "    env:\n" f'      CAO_API_PORT: "{port}"\n' '      CAO_API_HOST: "127.0.0.1"\n'
     return (
         "---\n"
         f"name: {name}\n"
@@ -87,108 +84,30 @@ def _profile_text(lane: LiveProviderLane, *, supervisor: bool, port: int | None 
     )
 
 
-def _link_provider_configs(home_dir: Path) -> None:
+def _copy_provider_auth(home_dir: Path, lanes: tuple[LiveProviderLane, ...]) -> None:
+    """Copy only explicit login state; never alias mutable operator config."""
     real_home = Path.home()
-    for name in (".claude.json", ".claude", ".local"):
-        source = real_home / name
-        target = home_dir / name
-        if source.exists() and not target.exists():
-            with contextlib.suppress(Exception):
-                target.symlink_to(source)
-    gemini_src = real_home / ".gemini"
-    gemini_tgt = home_dir / ".gemini"
-    if gemini_src.exists():
-        gemini_tgt.mkdir(parents=True, exist_ok=True)
-        for item in gemini_src.iterdir():
-            if item.name == "config":
-                cfg_t = gemini_tgt / "config"
-                cfg_t.mkdir(parents=True, exist_ok=True)
-                for c_item in item.iterdir():
-                    if c_item.name in {"mcp_config.json", "mcp_config.json.cao-ownership"}:
-                        continue
-                    t = cfg_t / c_item.name
-                    if not t.exists():
-                        with contextlib.suppress(Exception):
-                            t.symlink_to(c_item)
-                continue
-            if item.name == "antigravity-cli":
-                cli_t = gemini_tgt / "antigravity-cli"
-                cli_t.mkdir(parents=True, exist_ok=True)
-                for a_item in item.iterdir():
-                    if a_item.name in {"mcp_config.json", "mcp_config.json.cao-ownership"}:
-                        continue
-                    t = cli_t / a_item.name
-                    if not t.exists():
-                        with contextlib.suppress(Exception):
-                            t.symlink_to(a_item)
-                continue
-            t = gemini_tgt / item.name
-            if not t.exists():
-                with contextlib.suppress(Exception):
-                    t.symlink_to(item)
-    kimi_src = real_home / ".kimi-code"
-    kimi_tgt = home_dir / ".kimi-code"
-    if kimi_src.exists():
-        kimi_tgt.mkdir(parents=True, exist_ok=True)
-        for item in kimi_src.iterdir():
-            if item.name in {"mcp.json", "mcp.json.bak"}:
-                continue
-            t = kimi_tgt / item.name
-            if not t.exists():
-                with contextlib.suppress(Exception):
-                    t.symlink_to(item)
-    codex_src = real_home / ".codex"
-    codex_tgt = home_dir / ".codex"
-    if codex_src.exists():
-        codex_tgt.mkdir(parents=True, exist_ok=True)
+    provider_dirs = {"codex": ".codex", "grok_cli": ".grok"}
+    for provider_dir in sorted(
+        {provider_dirs[lane.provider] for lane in lanes if lane.provider in provider_dirs}
+    ):
+        source_dir = real_home / provider_dir
+        target_dir = home_dir / provider_dir
         for name in ("auth.json", "version.json"):
-            s = codex_src / name
-            t = codex_tgt / name
-            if s.exists() and not t.exists():
-                with contextlib.suppress(Exception):
-                    t.symlink_to(s)
-    grok_src = real_home / ".grok"
-    grok_tgt = home_dir / ".grok"
-    if grok_src.exists():
-        grok_tgt.mkdir(parents=True, exist_ok=True)
-        for name in ("auth.json", "version.json", "trusted_folders.toml"):
-            s = grok_src / name
-            t = grok_tgt / name
-            if s.exists() and not t.exists():
-                with contextlib.suppress(Exception):
-                    t.symlink_to(s)
-    cfg_dir = home_dir / ".config"
-    cfg_dir.mkdir(parents=True, exist_ok=True)
-    real_cfg = real_home / ".config"
-    if real_cfg.exists():
-        for name in ("gemini", "codex", ".claude", "agents"):
-            source = real_cfg / name
-            target = cfg_dir / name
-            if source.exists() and not target.exists():
-                with contextlib.suppress(Exception):
-                    target.symlink_to(source)
-    lib_dir = home_dir / "Library"
-    lib_dir.mkdir(parents=True, exist_ok=True)
-    for sub in ("Application Support", "Keychains", "Preferences"):
-        src = real_home / "Library" / sub
-        tgt = lib_dir / sub
-        if sub == "Application Support":
-            tgt.mkdir(parents=True, exist_ok=True)
-            claude_src = src / "Claude"
-            claude_tgt = tgt / "Claude"
-            if claude_src.exists() and not claude_tgt.exists():
-                with contextlib.suppress(Exception):
-                    claude_tgt.symlink_to(claude_src)
-        elif src.exists() and not tgt.exists():
-            with contextlib.suppress(Exception):
-                tgt.symlink_to(src)
+            source = source_dir / name
+            target = target_dir / name
+            if source.is_file() and not target.exists():
+                target_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+                atomic_write_text(target, source.read_text(encoding="utf-8"))
 
 
-def _seed_exact_profiles(home_dir: Path, port: int | None = None) -> None:
-    _link_provider_configs(home_dir)
+def _seed_exact_profiles(
+    home_dir: Path, lanes: tuple[LiveProviderLane, ...], port: int | None = None
+) -> None:
+    _copy_provider_auth(home_dir, lanes)
     profile_dir = home_dir / ".aws" / "cli-agent-orchestrator" / "agent-store"
     profile_dir.mkdir(parents=True, exist_ok=True)
-    for lane in LIVE_PROVIDER_LANES:
+    for lane in lanes:
         (profile_dir / f"{lane.supervisor_profile}.md").write_text(
             _profile_text(lane, supervisor=True, port=port),
             encoding="utf-8",
@@ -254,6 +173,19 @@ def _stop_isolated_herdr(home_dir: Path, session_name: str) -> None:
             )
 
 
+def _remove_private_home(base_tmp: Path) -> None:
+    """Retry a transient removal failure and never hide retained auth copies."""
+    for attempt in range(2):
+        try:
+            shutil.rmtree(base_tmp)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt:
+                raise RuntimeError(f"private matrix home cleanup failed: {base_tmp}") from None
+
+
 def _run_lane(server: CaoServer, lane: LiveProviderLane) -> LaneEvidence:
     session_name = f"cao-live-{lane.name}-{uuid.uuid4().hex[:8]}"
     supervisor_id: str | None = None
@@ -274,14 +206,21 @@ def _run_lane(server: CaoServer, lane: LiveProviderLane) -> LaneEvidence:
             timeout=300,
         )
         if create.status_code not in {200, 201}:
-            print(f"[{lane.name}] launch failed: {create.status_code} {create.text}", flush=True)
+            print(
+                f"[{lane.name}] launch failed: status={create.status_code} "
+                f"body_len={len(create.content)}",
+                flush=True,
+            )
             return LaneEvidence(
                 lane=lane.name,
                 passed=False,
-                reason=f"supervisor_launch_failed_{create.status_code}_{create.text}",
+                reason=f"supervisor_launch_failed_{create.status_code}",
             )
         supervisor_id = str(create.json()["id"])
-        print(f"[{lane.name}] supervisor launched as terminal {supervisor_id}, awaiting idle...", flush=True)
+        print(
+            f"[{lane.name}] supervisor launched as terminal {supervisor_id}, awaiting idle...",
+            flush=True,
+        )
 
         deadline = time.monotonic() + LANE_TIMEOUT_S
         while time.monotonic() < deadline:
@@ -318,21 +257,26 @@ def _run_lane(server: CaoServer, lane: LiveProviderLane) -> LaneEvidence:
         if sent.status_code != 200:
             print(f"[{lane.name}] task delivery failed: {sent.status_code}", flush=True)
             return LaneEvidence(lane=lane.name, passed=False, reason="task_delivery_failed")
+        delivered_at = time.monotonic()
 
-        print(f"[{lane.name}] task delivered, awaiting worker assignment and callback...", flush=True)
+        print(
+            f"[{lane.name}] task delivered, awaiting worker assignment and callback...", flush=True
+        )
         seen_worker_ids: set[str] = set()
         callback_seen = False
         last_progress_log = time.monotonic()
         while time.monotonic() < deadline:
             now = time.monotonic()
-            elapsed = int(now - (deadline - LANE_TIMEOUT_S))
+            elapsed = int(time.monotonic() - delivered_at)
             if now - last_progress_log >= 15:
                 sup_st = _terminal_status(server, supervisor_id)
-                workers_st = {wid: _terminal_status(server, wid) for wid in seen_worker_ids}
-                tail = _full_output(server, supervisor_id)[-400:].replace("\n", " ")
+                workers_st = sorted(_terminal_status(server, wid) for wid in seen_worker_ids)
+                output_len = len(_full_output(server, supervisor_id))
+                callback_count = len(_delivered_callbacks(server, supervisor_id))
                 print(
-                    f"[{lane.name}] t+{elapsed}s supervisor={sup_st} workers={workers_st} "
-                    f"callback_seen={callback_seen} tail={tail!r}",
+                    f"[{lane.name}] t+{elapsed}s sup_st={sup_st} workers_st={workers_st} "
+                    f"callback_seen={callback_seen} output_len={output_len} "
+                    f"callback_count={callback_count}",
                     flush=True,
                 )
                 last_progress_log = now
@@ -354,7 +298,10 @@ def _run_lane(server: CaoServer, lane: LiveProviderLane) -> LaneEvidence:
                 server, supervisor_id
             ) in READY_STATES and FINAL_MARKER in _full_output(server, supervisor_id)
             if callback_seen and worker_deleted and supervisor_done:
-                print(f"[{lane.name}] PASSED! (callback seen, worker deleted, supervisor finished)", flush=True)
+                print(
+                    f"[{lane.name}] PASSED! (callback seen, worker deleted, supervisor finished)",
+                    flush=True,
+                )
                 return LaneEvidence(lane=lane.name, passed=True, reason="passed")
             if _terminal_status(server, supervisor_id) == "error":
                 print(f"[{lane.name}] supervisor runtime error", flush=True)
@@ -376,8 +323,10 @@ def _run_lane(server: CaoServer, lane: LiveProviderLane) -> LaneEvidence:
             reason = "fan_in_or_cleanup_timeout"
         return LaneEvidence(lane=lane.name, passed=False, reason=reason)
     except (requests.RequestException, KeyError, TypeError, ValueError) as exc:
-        print(f"[{lane.name}] harness boundary failure: {type(exc).__name__}: {exc}", flush=True)
-        return LaneEvidence(lane=lane.name, passed=False, reason=f"harness_boundary_failure_{type(exc).__name__}")
+        print(f"[{lane.name}] harness boundary failure: {type(exc).__name__}", flush=True)
+        return LaneEvidence(
+            lane=lane.name, passed=False, reason=f"harness_boundary_failure_{type(exc).__name__}"
+        )
     finally:
         with contextlib.suppress(Exception):
             requests.delete(f"{server.url}/sessions/{session_name}", timeout=30)
@@ -401,51 +350,51 @@ def test_exact_provider_supervisor_matrix(
         environ=preflight_env,
     )
     report.require_ready()
+    lanes = select_live_lanes(preflight_env.get("CAO_LIVE_LANES"))
 
     base_tmp = Path(tempfile.mkdtemp(prefix="cao-h-", dir="/tmp"))
     home_dir = base_tmp / "lh"
-    home_dir.mkdir(parents=True, exist_ok=True)
     herdr_session = f"c-m-{uuid.uuid4().hex[:6]}"
-    _seed_exact_profiles(home_dir, port=port)
-    server = _start_cao_server(
-        home_dir,
-        port,
-        extra_env={
-            "CAO_TERMINAL_BACKEND": "herdr",
-            "CAO_HERDR_SESSION": herdr_session,
-            "XDG_CONFIG_HOME": str(home_dir / ".config"),
-            "CAO_OPS_MCP_URL": f"http://127.0.0.1:{port}/mcp/ops",
-            "CAO_API_PORT": str(port),
-            "CAO_API_HOST": "127.0.0.1",
-        },
-        deadline=30,
-    )
-    monkeypatch.setenv("CAO_OPS_MCP_URL", f"{server.url}/mcp/ops")
-
+    server = None
     try:
+        home_dir.mkdir(parents=True, exist_ok=True)
+        _seed_exact_profiles(home_dir, lanes, port=port)
+        server = _start_cao_server(
+            home_dir,
+            port,
+            extra_env={
+                "CAO_TERMINAL_BACKEND": "herdr",
+                "CAO_HERDR_SESSION": herdr_session,
+                "XDG_CONFIG_HOME": str(home_dir / ".config"),
+                "CAO_OPS_MCP_URL": f"http://127.0.0.1:{port}/mcp/ops",
+                "CAO_API_PORT": str(port),
+                "CAO_API_HOST": "127.0.0.1",
+            },
+            deadline=30,
+        )
+        monkeypatch.setenv("CAO_OPS_MCP_URL", f"{server.url}/mcp/ops")
         health = requests.get(f"{server.url}/health", timeout=5)
         assert health.status_code == 200
         assert health.json()["terminal_backend"] == "herdr"
 
-        selected_lanes = os.environ.get("CAO_LIVE_LANES")
-        lanes = [
-            lane
-            for lane in LIVE_PROVIDER_LANES
-            if not selected_lanes or lane.name in {x.strip() for x in selected_lanes.split(",")}
-        ]
         evidence = [_run_lane(server, lane) for lane in lanes]
     finally:
-        server.stop()
-        _stop_isolated_herdr(home_dir, herdr_session)
-        if "evidence" in locals() and any(not item.passed for item in evidence):
-            srv_log = home_dir / "server.log"
-            if srv_log.exists():
+        try:
+            try:
+                if server is not None:
+                    server.stop()
+            finally:
+                _stop_isolated_herdr(home_dir, herdr_session)
+            if "evidence" in locals() and any(not item.passed for item in evidence):
+                srv_log = home_dir / "server.log"
+                server_log_len = srv_log.stat().st_size if srv_log.exists() else 0
                 print(
-                    f"\n--- SERVER LOG TAIL ---\n{srv_log.read_text(encoding='utf-8')[-3000:]}\n--- END SERVER LOG ---\n",
+                    f"matrix_failed=True server_log_present={srv_log.exists()} "
+                    f"server_log_len={server_log_len}",
                     flush=True,
                 )
-        else:
-            shutil.rmtree(base_tmp, ignore_errors=True)
+        finally:
+            _remove_private_home(base_tmp)
 
     failures = [item for item in evidence if not item.passed]
     assert not failures, "exact provider matrix failed: " + ", ".join(

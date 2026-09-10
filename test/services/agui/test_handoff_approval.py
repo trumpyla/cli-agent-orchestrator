@@ -545,6 +545,28 @@ class TestDeliveryFailureRetryable:
     """A delivery failure leaves the interrupt unresolved and retryable (P1)."""
 
     @pytest.mark.asyncio
+    async def test_uncertain_dispatch_is_not_replayed_by_resume(self):
+        from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
+        from cli_agent_orchestrator.services.terminal_service import InputAcceptanceUnconfirmedError
+
+        delivery = MockAnswerDelivery()
+
+        def uncertain_send(*args, **kwargs):
+            delivery.calls.append(("dispatched",))
+            raise InputAcceptanceUnconfirmedError("already dispatched")
+
+        delivery.send_input = uncertain_send
+        construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=delivery)
+        interrupt = construct.on_provider_waiting("t-1", "kimi_cli", "approval")
+        for decision in [ApprovalDecision.APPROVE, ApprovalDecision.DENY]:
+            with pytest.raises(DeliveryError) as caught:
+                await construct.resume(interrupt.id, decision)
+            assert caught.value.retryable is False
+        assert len(delivery.calls) == 1
+        assert not interrupt.resolved
+        assert interrupt.metadata["delivery_status"] == "dispatched_unconfirmed"
+
+    @pytest.mark.asyncio
     async def test_failure_raises_and_leaves_unresolved(self):
         from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
 

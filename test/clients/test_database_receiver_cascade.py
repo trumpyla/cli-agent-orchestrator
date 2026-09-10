@@ -98,6 +98,56 @@ def test_session_delete_cascades_every_receiver(
         assert connection.get(database.InboxModel, preserved.id) is not None
 
 
+def test_id_list_delete_cascades_only_selected_receivers(
+    sqlite_database: sessionmaker[Session],
+) -> None:
+    _terminal("delete01", "cao-delete")
+    _terminal("delete02", "cao-delete")
+    _terminal("live0001", "cao-live")
+    first = database.create_inbox_message("live0001", "delete01", "one")
+    second = database.create_inbox_message("live0001", "delete02", "two")
+    preserved = database.create_inbox_message("delete01", "live0001", "three")
+
+    assert database.delete_terminals_by_ids(["delete01", "delete02"]) == 2
+
+    with sqlite_database() as connection:
+        assert connection.get(database.TerminalModel, "delete01") is None
+        assert connection.get(database.TerminalModel, "delete02") is None
+        assert connection.get(database.TerminalModel, "live0001") is not None
+        assert connection.get(database.InboxModel, first.id) is None
+        assert connection.get(database.InboxModel, second.id) is None
+        assert connection.get(database.InboxModel, preserved.id) is not None
+
+
+def test_id_list_delete_rolls_back_receiver_rows_on_terminal_failure(
+    sqlite_database: sessionmaker[Session],
+) -> None:
+    _terminal("receiver")
+    message = database.create_inbox_message("sender01", "receiver", "preserve")
+    engine = sqlite_database.kw["bind"]
+    delete_order: list[str] = []
+
+    def fail_terminal_delete(_conn, _cursor, statement, _parameters, _context, _many):
+        normalized = statement.lstrip().upper()
+        if normalized.startswith("DELETE FROM INBOX"):
+            delete_order.append("inbox")
+        if normalized.startswith("DELETE FROM TERMINALS"):
+            delete_order.append("terminals")
+            raise RuntimeError("injected terminal delete failure")
+
+    event.listen(engine, "before_cursor_execute", fail_terminal_delete)
+    try:
+        with pytest.raises(RuntimeError, match="injected terminal delete failure"):
+            database.delete_terminals_by_ids(["receiver"])
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_terminal_delete)
+
+    assert delete_order == ["inbox", "terminals"]
+    with sqlite_database() as connection:
+        assert connection.get(database.TerminalModel, "receiver") is not None
+        assert connection.get(database.InboxModel, message.id) is not None
+
+
 def test_terminal_delete_rolls_back_receiver_rows_on_terminal_failure(
     sqlite_database: sessionmaker[Session],
 ) -> None:

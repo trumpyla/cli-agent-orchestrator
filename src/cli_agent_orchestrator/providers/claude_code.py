@@ -482,7 +482,7 @@ class ClaudeCodeProvider(BaseProvider):
                     if isinstance(entry, HttpMcpServer):
                         url = resolve_http_url(entry.url, env_snapshot, server_name=server_name)
                         mcp_config[server_name] = render_http_entry(
-                            "claude_code", url, env=env_snapshot
+                            "claude_code", url, transport=entry.type, env=env_snapshot
                         )
                         continue
 
@@ -1586,9 +1586,9 @@ class ClaudeCodeProvider(BaseProvider):
         """Get the command to exit Claude Code."""
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> bool:
         """Clean up Claude Code provider."""
-        self._initialized = False
+        complete = True
         # Remove temp files created during initialization
         tmp_dir = CAO_HOME_DIR / "tmp"
         for suffix in (".prompt", ".mcp.json"):
@@ -1596,4 +1596,7 @@ class ClaudeCodeProvider(BaseProvider):
             try:
                 tmp_file.unlink(missing_ok=True)
             except OSError:
-                pass
+                complete = False
+        if complete:
+            self._initialized = False
+        return complete

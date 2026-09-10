@@ -133,7 +133,7 @@ class TestCreateSession:
         mock_create_terminal.assert_not_called()
 
 
-def test_automatic_herdr_cleanup_reuses_terminal_teardown_primitives():
+def test_automatic_herdr_cleanup_reuses_terminal_teardown_primitives(isolated_memory_db):
     """Completed Herdr cleanup closes the workspace before deleting CAO rows."""
     backend = object.__new__(HerdrBackend)
     backend.list_workspace_inventory = MagicMock(
@@ -196,7 +196,7 @@ def test_automatic_herdr_cleanup_reuses_terminal_teardown_primitives():
     clear_env.assert_called_once_with("cao-review")
 
 
-def test_automatic_herdr_cleanup_retains_deferred_terminal_for_retry():
+def test_automatic_herdr_cleanup_retains_deferred_terminal_for_retry(isolated_memory_db):
     """Deferred provider cleanup keeps its registry row and reports failure."""
     backend = object.__new__(HerdrBackend)
     backend.list_workspace_inventory = MagicMock(
@@ -238,7 +238,7 @@ def test_automatic_herdr_cleanup_retains_deferred_terminal_for_retry():
             return_value=0,
         ) as delete_rows,
         patch("cli_agent_orchestrator.services.session_service.clear_session_env") as clear_env,
-        patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event"),
+        patch("cli_agent_orchestrator.services.session_service.dispatch_plugin_event") as dispatch,
     ):
         result = delete_session_automatically(
             "review",
@@ -257,9 +257,12 @@ def test_automatic_herdr_cleanup_retains_deferred_terminal_for_retry():
     delete_row.assert_not_called()
     delete_rows.assert_called_once_with([])
     clear_env.assert_called_once_with("cao-review")
+    dispatch.assert_not_called()
 
 
-def test_automatic_herdr_cleanup_does_not_emit_terminal_event_for_missing_snapshot():
+def test_automatic_herdr_cleanup_does_not_emit_terminal_event_for_missing_snapshot(
+    isolated_memory_db,
+):
     """A row-delete failure with no snapshot must not build a terminal event."""
     backend = object.__new__(HerdrBackend)
     backend.list_workspace_inventory = MagicMock(
@@ -1121,6 +1124,61 @@ class TestDeleteSession:
         # The retry handle survives both row-deletion paths.
         mock_delete_row.assert_not_called()
         mock_delete_terminals_by_ids.assert_called_once_with([])
+
+    def test_delete_session_defers_dismantle_exception_and_skips_session_event(self):
+        """A raised runtime teardown keeps the row and suppresses session completion."""
+        backend = MagicMock()
+        backend.session_exists_strict.return_value = True
+        backend.kill_session.return_value = True
+        metadata = {
+            "tmux_session": "cao-runtime-error",
+            "tmux_window": "developer-error",
+            "agent_profile": "developer",
+        }
+
+        with (
+            patch(
+                "cli_agent_orchestrator.services.session_service.get_backend",
+                return_value=backend,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.session_service.list_terminals_by_session",
+                return_value=[{"id": "terminal-error"}],
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.capture_terminal_snapshot",
+                return_value=metadata,
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.dismantle_terminal_runtime",
+                side_effect=RuntimeError("runtime release failed"),
+            ),
+            patch(
+                "cli_agent_orchestrator.services.terminal_service.delete_terminal_row"
+            ) as delete_row,
+            patch(
+                "cli_agent_orchestrator.services.session_service.delete_terminals_by_ids",
+                return_value=0,
+            ) as delete_rows,
+            patch("cli_agent_orchestrator.services.session_service.clear_session_env"),
+            patch(
+                "cli_agent_orchestrator.services.session_service.dispatch_plugin_event"
+            ) as dispatch,
+        ):
+            result = delete_session("cao-runtime-error")
+
+        assert result == {
+            "deleted": [],
+            "errors": [
+                {
+                    "terminal_id": "terminal-error",
+                    "error": "runtime cleanup failed: runtime release failed",
+                }
+            ],
+        }
+        delete_row.assert_not_called()
+        delete_rows.assert_called_once_with([])
+        dispatch.assert_not_called()
 
     @patch("cli_agent_orchestrator.services.session_service.delete_terminals_by_ids")
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminal_row")

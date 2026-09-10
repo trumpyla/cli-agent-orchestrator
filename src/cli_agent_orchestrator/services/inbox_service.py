@@ -27,6 +27,7 @@ from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services import terminal_service
 from cli_agent_orchestrator.services.event_bus import bus
 from cli_agent_orchestrator.services.status_monitor import status_monitor
+from cli_agent_orchestrator.services.terminal_service import InputAcceptanceUnconfirmedError
 from cli_agent_orchestrator.utils.event import terminal_id_from_topic
 
 logger = logging.getLogger(__name__)
@@ -117,8 +118,9 @@ class InboxService:
         # pane; that output flows back through the FIFO/StatusMonitor pipeline and
         # can re-emit an IDLE/COMPLETED status event, re-entering deliver_pending.
         # If the messages were still PENDING then, they would be delivered twice.
-        # Marking them DELIVERED first closes that window; the except path resets
-        # them to FAILED.
+        # Marking them DELIVERED first closes that window; definite transport
+        # failures become FAILED. Unconfirmed provider acceptance retains the
+        # dispatch outcome so the same task is not offered as failed/retryable.
         for message in messages:
             update_message_status(message.id, MessageStatus.DELIVERED)
 
@@ -142,6 +144,17 @@ class InboxService:
                         orchestration_type=OrchestrationType.SEND_MESSAGE,
                     )
                 logger.info(f"Delivered {len(batch)} message(s) to terminal {terminal_id}")
+            except InputAcceptanceUnconfirmedError:
+                # The transport send completed. Lack of acceptance evidence does
+                # not prove the paste was dropped: a retry could execute twice.
+                # DELIVERED records dispatch, not task acceptance/completion.
+                # Keep Kimi's profile prefix pending until acceptance is proven.
+                logger.warning(
+                    "Dispatched %d message(s) to terminal %s; provider acceptance is "
+                    "unconfirmed. Retaining DELIVERED; inspect before any manual retry.",
+                    len(batch),
+                    terminal_id,
+                )
             except TerminalNotFoundError as e:
                 # Pane not resolvable yet (e.g. a herdr pane that isn't mapped
                 # for this window). Treat as transient: reset to PENDING so the

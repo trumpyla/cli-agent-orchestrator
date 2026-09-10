@@ -54,6 +54,24 @@ def _profile(mcp_servers) -> MagicMock:
 
 
 class TestKimiHttpMapping:
+    def test_sse_rejected_without_writing_http_config(self, tmp_path) -> None:
+        provider = KimiCliProvider("t1", "s", "w", agent_profile="dev")
+        try:
+            with (
+                patch(_HOME, return_value=tmp_path),
+                patch(
+                    _LOAD,
+                    return_value=_profile(
+                        {"remote": {"type": "sse", "url": "https://example.invalid/sse"}}
+                    ),
+                ),
+                pytest.raises(McpConfigError, match="no native SSE MCP mapping"),
+            ):
+                provider._build_kimi_command()
+            assert not (Path(provider._temp_dir) / KIMI_CWD_MCP_RELPATH).exists()
+        finally:
+            provider.cleanup()
+
     def test_http_entry_written_as_url_no_mcp_config_flag(self, tmp_path) -> None:
         provider = KimiCliProvider("t1", "s", "w", agent_profile="dev")
         with (
@@ -264,11 +282,13 @@ class TestInstalledKimiSmoke:
 
     @pytest.mark.skipif(shutil.which("kimi") is None, reason="kimi not installed")
     def test_generated_config_targets_installed_major_minor(self, tmp_path) -> None:
-        # Smoke: our .kimi-code/mcp.json shape is pinned to Kimi 0.29. If the
-        # installed CLI has moved off 0.29 the format assumption must be re-checked.
+        # Smoke: our .kimi-code/mcp.json shape supports the installed 0.29 and
+        # 0.41 release lines. Other versions require a format re-check.
         out = subprocess.run(["kimi", "--version"], capture_output=True, text=True, timeout=15)
         version = (out.stdout or out.stderr).strip()
-        assert version.startswith("0.29"), f"expected Kimi 0.29.x, got {version!r}"
+        assert version.startswith(
+            ("0.29", "0.41")
+        ), f"expected Kimi 0.29.x or 0.41.x, got {version!r}"
 
         provider = KimiCliProvider("t1", "s", "w", agent_profile="dev")
         with (

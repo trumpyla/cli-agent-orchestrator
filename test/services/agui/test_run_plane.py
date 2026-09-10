@@ -265,6 +265,31 @@ async def test_run_plane_resume_approve():
 
 
 @pytest.mark.asyncio
+async def test_run_plane_uncertain_dispatch_reports_do_not_retry():
+    from cli_agent_orchestrator.services.agui.handoff_approval import DeliveryError
+    from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream
+
+    construct = AgentHandoffWithApproval(emitter=RecordingUiEmitter(), answer_delivery=None)
+    interrupt = construct.on_provider_waiting("t-1", "kimi_cli", "approval")
+    input_data = _minimal_run_input(
+        resume=[{"interruptId": interrupt.id, "status": "resolved", "payload": {"approved": True}}]
+    )
+    with patch.object(
+        construct,
+        "resume",
+        new=AsyncMock(side_effect=DeliveryError("already dispatched", retryable=False)),
+    ):
+        parsed = _parse_frames(
+            await _collect_stream(
+                run_plane_stream(input_data=input_data, approval_construct=construct)
+            )
+        )
+    assert parsed[-1]["type"] == "RUN_ERROR"
+    assert "do not retry" in parsed[-1]["message"]
+    assert "(retryable)" not in parsed[-1]["message"]
+
+
+@pytest.mark.asyncio
 async def test_run_plane_resume_deny():
     """resume[] with approved=false maps to deny."""
     from cli_agent_orchestrator.services.agui.run_plane import run_plane_stream

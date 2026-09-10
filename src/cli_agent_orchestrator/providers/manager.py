@@ -301,13 +301,14 @@ class ProviderManager:
         return provider
 
     def cleanup_provider(self, terminal_id: str) -> bool:
-        """Cleanup a provider, retaining retryable Grok state on failure.
+        """Cleanup a provider, retaining pending or failed cleanup for retry.
 
         Grok's private home can only be deleted after its escaped updater has
         been positively stopped or ruled out.  A ``False`` return therefore
         deliberately keeps the map entry (and lets the service keep DB
         metadata) so a later lifecycle retry does not lose the only route to
-        that deterministic home.
+        that deterministic home. Antigravity also returns False while its
+        asynchronous ownership cleanup is pending or incomplete.
         """
         try:
             provider = self._providers.get(terminal_id)
@@ -337,6 +338,43 @@ class ProviderManager:
                     logger.warning("Cleanup deferred for restored Grok provider: %s", terminal_id)
                     return False
                 logger.info("Cleaned up restored Grok provider for terminal: %s", terminal_id)
+            elif metadata and metadata.get("provider") in {
+                ProviderType.CODEX.value,
+                ProviderType.CLAUDE_CODE.value,
+                ProviderType.KIMI_CLI.value,
+            }:
+                provider_class = {
+                    ProviderType.CODEX.value: CodexProvider,
+                    ProviderType.CLAUDE_CODE.value: ClaudeCodeProvider,
+                    ProviderType.KIMI_CLI.value: KimiCliProvider,
+                }[metadata["provider"]]
+                restored_provider = provider_class(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                )
+                self._providers[terminal_id] = restored_provider
+                if restored_provider.cleanup() is False:
+                    logger.warning("Cleanup deferred for restored provider: %s", terminal_id)
+                    return False
+                self._providers.pop(terminal_id, None)
+            elif metadata and metadata.get("provider") == ProviderType.ANTIGRAVITY_CLI.value:
+                restored_provider = AntigravityCliProvider(
+                    terminal_id,
+                    metadata["tmux_session"],
+                    metadata["tmux_window"],
+                    metadata.get("agent_profile"),
+                )
+                # Retain pending asynchronous work and failed ownership cleanup
+                # so both in-process retries and restart retries keep their debt.
+                self._providers[terminal_id] = restored_provider
+                if restored_provider.cleanup() is False:
+                    logger.warning(
+                        "Cleanup deferred for restored Antigravity provider: %s", terminal_id
+                    )
+                    return False
+                self._providers.pop(terminal_id, None)
             elif metadata and metadata.get("provider") == ProviderType.MINIMAX_CODE.value:
                 restored_minimax_provider = MiniMaxCodeProvider(
                     terminal_id,

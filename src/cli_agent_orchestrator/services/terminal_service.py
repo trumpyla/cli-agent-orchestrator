@@ -67,6 +67,7 @@ from cli_agent_orchestrator.plugins import (
     PostSendMessageEvent,
 )
 from cli_agent_orchestrator.providers.base import OutputExtractionError
+from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
 from cli_agent_orchestrator.providers.kiro_capabilities import (
     KiroCapabilities,
     KiroPhase0KASError,
@@ -89,7 +90,7 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
 from cli_agent_orchestrator.utils.path_validation import resolve_and_validate_path
-from cli_agent_orchestrator.utils.skills import build_skill_catalog
+from cli_agent_orchestrator.utils.skills import build_inline_skill_prompt, build_skill_catalog
 from cli_agent_orchestrator.utils.terminal import (
     generate_session_name,
     generate_terminal_id,
@@ -117,6 +118,14 @@ _memory_injected_lock = threading.Lock()
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
 # silently leaving a worker uninitialized. Tasks drop themselves on completion.
 _deferred_init_tasks: set = set()
+
+
+class InputAcceptanceUnconfirmedError(TimeoutError):
+    """Input was dispatched; whether the provider consumed it remains unknown."""
+
+    def __init__(self, message: str, *, acceptance_probe=None) -> None:
+        super().__init__(message)
+        self.acceptance_probe = acceptance_probe
 
 
 def _persist_provider_initialized(terminal_id: str) -> None:
@@ -583,13 +592,20 @@ async def create_terminal(
         # it at launch time (see RUNTIME_SKILL_PROMPT_PROVIDERS).
         if provider in RUNTIME_SKILL_PROMPT_PROVIDERS:
             skill_filter = profile.skills if profile else None
+            skill_builder = (
+                build_inline_skill_prompt
+                if provider == ProviderType.CODEX.value
+                and profile is not None
+                and profile.permissionMode in {"plan", "acceptEdits"}
+                else build_skill_catalog
+            )
             if working_directory or use_worktree:
-                skill_prompt = build_skill_catalog(
+                skill_prompt = skill_builder(
                     skill_filter,
                     start=Path(resolved_working_directory),
                 )
             else:
-                skill_prompt = build_skill_catalog(skill_filter)
+                skill_prompt = skill_builder(skill_filter)
         else:
             skill_prompt = None
 
@@ -985,12 +1001,13 @@ async def create_terminal(
         cleanup_complete = True
         try:
             if terminal_id is not None:
-                cleanup_complete = provider_manager.cleanup_provider(terminal_id) is not False
+                cleanup_complete = (
+                    await asyncio.to_thread(provider_manager.cleanup_provider, terminal_id)
+                    is not False
+                )
         except Exception:
-            # Preserve the existing rollback contract for an unexpected
-            # provider-manager failure. Only an explicit False is a Grok
-            # cleanup deferral with enough information to retry safely.
-            cleanup_complete = True
+            # Unconfirmed cleanup must retain the row as its retry handle.
+            cleanup_complete = False
         # Do not erase the only retry handle before Grok has safely released
         # its private home.  The original create error is still raised below;
         # retaining this row makes the failed terminal discoverable and its
@@ -1329,6 +1346,8 @@ def _schedule_deferred_init(
     ``TerminalInputBlockedError`` (the worker is parked on a WAITING_USER_ANSWER
     prompt right after init) is NOT a teardown case: the worker is alive and
     answerable via answer_user_prompt, so we leave it in place and only log.
+    ``InputAcceptanceUnconfirmedError`` means input was already dispatched:
+    retain the worker and notify the caller to inspect it before any retry.
     """
 
     async def _run() -> None:
@@ -1363,6 +1382,7 @@ def _schedule_deferred_init(
                 # _schedule_deferred_init), so defaulting an unstated orchestration_type
                 # to ASSIGN here is always correct and cannot affect answer_user_prompt.
                 effective_orchestration_type = orchestration_type or OrchestrationType.ASSIGN
+                kimi_native_acceptance = isinstance(provider_instance, KimiCliProvider)
                 # send_input is blocking tmux I/O — off the loop so it can't
                 # freeze the server for concurrent requests.
                 await asyncio.to_thread(
@@ -1372,8 +1392,14 @@ def _schedule_deferred_init(
                     registry=registry,
                     sender_id=caller_id,
                     orchestration_type=effective_orchestration_type,
-                    _commit_prepared_input=False,
+                    _commit_prepared_input=kimi_native_acceptance,
                 )
+                if kimi_native_acceptance:
+                    # Every Kimi send requires fresh acceptance evidence,
+                    # including profiles without a staged instruction prefix.
+                    # Its uncertain outcome raises into the dedicated handler;
+                    # neither outcome belongs in the generic resend loop.
+                    return
                 # Delivery can be silently dropped (Enter swallowed / paste lost)
                 # when the TUI isn't input-ready. Confirm the worker actually
                 # started and re-submit if not; if it never starts, surface the
@@ -1413,6 +1439,23 @@ def _schedule_deferred_init(
                         terminal_id,
                     )
                     return
+        except InputAcceptanceUnconfirmedError:
+            logger.warning(
+                "Deferred init for terminal %s dispatched input but acceptance is uncertain; "
+                "retaining worker for inspection without retry.",
+                terminal_id,
+            )
+            await asyncio.to_thread(
+                _notify_caller_of_deferred_failure,
+                terminal_id,
+                f"Worker {terminal_id}: input was dispatched, but acceptance is uncertain. "
+                "The worker remains alive and may already be processing the task. "
+                "Do not retry or re-assign automatically; inspect this terminal before "
+                "deciding whether another submission is safe. Any staged profile instructions "
+                "remain uncommitted.",
+                registry,
+                delete_worker=False,
+            )
         except TerminalInputBlockedError as e:
             # The worker initialized but is parked on an interactive prompt
             # (WAITING_USER_ANSWER). It is alive and can be driven via
@@ -1706,6 +1749,17 @@ def _send_input_impl(
             message = provider.prepare_input(message)
         message = inject_memory_context(message, terminal_id, frozen_memory)
 
+        # A successful Kimi paste is not proof the TUI consumed it, even without
+        # a staged prefix. Capture before dispatch and require fresh response
+        # evidence; commit any one-shot instructions only after acceptance.
+        delivery_baseline = None
+        if (
+            _commit_prepared_input
+            and _prepare_provider_input
+            and isinstance(provider, KimiCliProvider)
+        ):
+            delivery_baseline = provider.capture_delivery_baseline()
+
         # Check how many Enter keys the provider needs after paste
         enter_count = provider.paste_enter_count if provider else 1
 
@@ -1754,11 +1808,23 @@ def _send_input_impl(
             submit_delay=provider.paste_submit_delay if provider else 0.3,
         )
 
-        if provider and _commit_prepared_input and provider.commit_prepared_input():
+        # Activity and dispatch telemetry describe the completed transport send,
+        # even when later acceptance evidence is inconclusive. Such uncertainty
+        # must not make an active terminal look idle or erase its dispatch event.
+        update_last_active(terminal_id)
+        acceptance_confirmed = delivery_baseline is None or provider.confirm_input_accepted(
+            delivery_baseline, message
+        )
+
+        if (
+            acceptance_confirmed
+            and provider
+            and _commit_prepared_input
+            and provider.commit_prepared_input()
+        ):
             _persist_profile_prompt_delivered(terminal_id)
 
-        update_last_active(terminal_id)
-        logger.info(f"Sent input to terminal: {terminal_id}")
+        logger.info(f"Dispatched input to terminal: {terminal_id}")
         if registry is not None and sender_id is not None and orchestration_type is not None:
             # Telemetry (opt-in; no-ops without the [otel] extra or when the SDK
             # is disabled): record a GenAI ``execute_tool`` span for the dispatch,
@@ -1787,8 +1853,20 @@ def _send_input_impl(
                         traceparent=inject_traceparent(),
                     ),
                 )
+        if not acceptance_confirmed:
+            raise InputAcceptanceUnconfirmedError(
+                f"Kimi input acceptance unconfirmed for terminal {terminal_id}; "
+                "input was dispatched and may already be processing. Any staged profile instructions "
+                "retained. Inspect the terminal before retrying; a retry may duplicate the task.",
+                acceptance_probe=lambda: provider.confirm_input_accepted(
+                    delivery_baseline, message, timeout=0
+                ),
+            )
         return True
 
+    except InputAcceptanceUnconfirmedError:
+        logger.warning("Input dispatched to terminal %s but acceptance is unconfirmed", terminal_id)
+        raise
     except Exception as e:
         logger.error(f"Failed to send input to terminal {terminal_id}: {e}")
         raise
@@ -1854,7 +1932,12 @@ def exit_terminal_cli(terminal_id: str) -> None:
     if exit_command.startswith(("C-", "M-")):
         send_special_key(terminal_id, exit_command)
     else:
-        _send_input_impl(terminal_id, exit_command, _prepare_provider_input=False)
+        _send_input_impl(
+            terminal_id,
+            exit_command,
+            _prepare_provider_input=False,
+            _commit_prepared_input=False,
+        )
 
 
 def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:

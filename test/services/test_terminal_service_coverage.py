@@ -273,9 +273,7 @@ class TestCreateTerminalCleanup:
         mock_status_monitor,
         mock_delete_terminals_by_session,
     ):
-        """Cleanup errors should be swallowed, original error re-raised. The DB
-        rollback still runs after cleanup_provider raises, and its own error is
-        swallowed too."""
+        """Preserve the original error and retain metadata when cleanup is unconfirmed."""
         from cli_agent_orchestrator.services.terminal_service import create_terminal
 
         mock_tmux.session_exists.return_value = False
@@ -299,8 +297,7 @@ class TestCreateTerminalCleanup:
                 allowed_tools=["*"],
             )
 
-        # DB rollback runs even though cleanup_provider raised first.
-        mock_db_delete.assert_called_once_with("tid1")
+        mock_db_delete.assert_not_called()
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.delete_terminals_by_session")

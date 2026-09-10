@@ -170,6 +170,7 @@ from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
 from cli_agent_orchestrator.services.terminal_service import (
     TERMINAL_RANGE_MAX_LENGTH,
+    InputAcceptanceUnconfirmedError,
     OutputMode,
     TerminalInputBlockedError,
 )
@@ -3064,10 +3065,14 @@ async def create_session(
                 )
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = (
-            [t.strip() for t in allowed_tools.split(",") if t.strip()]
-            if allowed_tools.strip()
-            else []
-        ) if allowed_tools is not None else None
+            (
+                [t.strip() for t in allowed_tools.split(",") if t.strip()]
+                if allowed_tools.strip()
+                else []
+            )
+            if allowed_tools is not None
+            else None
+        )
 
         result = await session_service.create_session(
             provider=provider,
@@ -3268,10 +3273,14 @@ async def create_terminal_in_session(
 
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = (
-            [t.strip() for t in allowed_tools.split(",") if t.strip()]
-            if allowed_tools.strip()
-            else []
-        ) if allowed_tools is not None else None
+            (
+                [t.strip() for t in allowed_tools.split(",") if t.strip()]
+                if allowed_tools.strip()
+                else []
+            )
+            if allowed_tools is not None
+            else None
+        )
 
         initial_message = body.initial_message if body else None
 
@@ -3591,6 +3600,11 @@ async def send_terminal_input(
             orchestration_type=orchestration_type,
         )
         return {"success": success}
+    except InputAcceptanceUnconfirmedError as e:
+        # A transport send occurred: HTTP 500 would describe a generic failed
+        # send and invite replay. Keep a non-2xx response so MCP callers cannot
+        # mistake dispatched-but-unconfirmed input for accepted work.
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except TerminalInputBlockedError as e:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(e))
     except ValueError as e:
@@ -4090,6 +4104,12 @@ async def run_step(
                 "step_id": e.step_id,
                 "rule": e.rule.value,
             },
+        )
+    except InputAcceptanceUnconfirmedError as e:
+        # Preserve uncertain dispatch instead of settling it FAILED/retryable.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail={"message": str(e), "kind": "acceptance_unconfirmed", "retryable": False},
         )
     except StepExecutionError as e:
         # The step did not complete successfully. Distinguish a worker that
@@ -7858,6 +7878,9 @@ def main():
 
     host = args.host or SERVER_HOST
     port = args.port or SERVER_PORT
+    from cli_agent_orchestrator.providers.mcp_translation import set_managed_cao_origin
+
+    set_managed_cao_origin(host, port)
     # Extend the CORS allowlist so a custom --host/--port still permits
     # same-host browser access without requiring CAO_CORS_ORIGINS. The
     # already-installed CORSMiddleware reads the list by reference, so

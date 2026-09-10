@@ -619,25 +619,13 @@ class TestAliasAmplificationIsBounded:
 
 
 class TestMcpServerTransports:
-    """``mcpServers`` entries may be command-launched *or* url-based.
-
-    The schema required ``command`` unconditionally, which made the write routes
-    reject a form CAO supports: ``resolve_mcp_server_config`` documents entries
-    without a ``command`` (``{"type": "http", "url": ...}``) as passing through
-    untouched, and providers forward them to their own MCP config. Because
-    #585 made this schema the blocking gate in front of persistence, a latent
-    description gap became a broken save path. Reported by @haofeif.
-    """
+    """Schema and runtime accept distinct command and HTTP-family forms."""
 
     ACCEPTED = {
         "http url": {"docs": {"type": "http", "url": "https://example.test/mcp"}},
         "sse url": {"docs": {"type": "sse", "url": "https://example.test/sse"}},
-        "url with headers": {
-            "docs": {"type": "http", "url": "https://example.test/mcp", "headers": {"A": "b"}}
-        },
         "command": {"fs": {"command": "npx", "args": ["-y", "server"]}},
         "bundled cao server": {"cao-mcp-server": {"command": "cao-mcp-server", "args": []}},
-        "command and url together": {"z": {"command": "npx", "url": "https://example.test/mcp"}},
     }
 
     @pytest.mark.parametrize("label", sorted(ACCEPTED))
@@ -647,6 +635,28 @@ class TestMcpServerTransports:
         )
 
         assert [f for f in findings if f.severity == "error"] == []
+        from cli_agent_orchestrator.models.mcp_server import MCP_SERVER_ADAPTER
+
+        for entry in self.ACCEPTED[label].values():
+            MCP_SERVER_ADAPTER.validate_python(entry)
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            {"type": "http", "url": "https://example.test/mcp", "headers": {"A": "b"}},
+            {"command": "npx", "url": "https://example.test/mcp"},
+            {"type": "http", "url": "https://example.test/mcp", "command": "npx"},
+        ],
+    )
+    def test_mixed_and_custom_header_forms_fail_both_boundaries(self, entry):
+        from pydantic import ValidationError
+
+        from cli_agent_orchestrator.models.mcp_server import MCP_SERVER_ADAPTER
+
+        findings = validate_frontmatter({"name": "x", "mcpServers": {"docs": entry}})
+        assert any(f.severity == "error" for f in findings)
+        with pytest.raises(ValidationError):
+            MCP_SERVER_ADAPTER.validate_python(entry)
 
     @pytest.mark.parametrize(
         "entry", [{"type": "http"}, {}, {"args": ["-y"]}], ids=["type only", "empty", "args only"]
@@ -667,22 +677,18 @@ class TestMcpServerTransports:
         assert errors[0].path == "mcpServers.broken"
 
     def test_url_is_described_rather_than_merely_tolerated(self) -> None:
-        """The field is typed, so a form generator can render it and catch a typo.
-
-        The inner object does not set ``additionalProperties: false``, so a url
-        entry would pass even with no ``url`` property declared. Declaring it is
-        what makes ``GET /agents/profiles/schema`` describe the shape, and what
-        makes a wrong type a finding.
-        """
+        """Each transport has a closed, typed shape for schema consumers."""
         inner = load_profile_schema()["properties"]["mcpServers"]["additionalProperties"]
-        assert inner["properties"]["url"] == {"type": "string"}
-        assert inner["anyOf"] == [{"required": ["command"]}, {"required": ["url"]}]
+        http = next(branch for branch in inner["oneOf"] if "url" in branch["properties"])
+        assert http["properties"]["url"] == {"type": "string"}
+        assert set(http["required"]) == {"type", "url"}
+        assert http["additionalProperties"] is False
 
         findings = validate_frontmatter(
-            {"name": "x", "description": "d", "mcpServers": {"docs": {"url": 7}}}
+            {"name": "x", "description": "d", "mcpServers": {"docs": {"type": "http", "url": 7}}}
         )
 
-        assert any(f.severity == "error" and f.path == "mcpServers.docs.url" for f in findings)
+        assert any(f.severity == "error" and f.path.startswith("mcpServers.docs") for f in findings)
 
 
 class TestAggregateFindingBudget:

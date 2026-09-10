@@ -1586,6 +1586,12 @@ class TestLifespan:
 class TestMainEntryPoint:
     """Tests for the main() CLI entry point."""
 
+    @pytest.fixture(autouse=True)
+    def isolate_managed_origin(self, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.mcp_translation._managed_cao_origin", None
+        )
+
     def test_main_default_args(self):
         """main() runs uvicorn with default host/port."""
         with (

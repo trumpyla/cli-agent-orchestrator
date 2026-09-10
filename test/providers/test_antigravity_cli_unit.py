@@ -13,6 +13,7 @@ from cli_agent_orchestrator.providers.antigravity_cli import (
     PROCESSING_FOOTER_PATTERN,
     AntigravityCliProvider,
     ProviderError,
+    _agy_supported_modes,
 )
 
 _REAL_HANDLE_STARTUP_DIALOG = AntigravityCliProvider._handle_startup_dialog
@@ -289,6 +290,18 @@ def test_build_command_includes_skip_permissions_and_model():
     assert "--model" in cmd and "Gemini 3.1 Pro (High)" in cmd
 
 
+def test_agy_supported_modes_caches_help_probe_by_binary(tmp_path):
+    binary = str(tmp_path / "agy-cache-test")
+    with patch("cli_agent_orchestrator.providers.antigravity_cli.subprocess.run") as run:
+        run.return_value.stdout = "--mode <plan|accept-edits>"
+        run.return_value.stderr = ""
+
+        assert _agy_supported_modes(binary) == frozenset({"plan", "accept-edits"})
+        assert _agy_supported_modes(binary) == frozenset({"plan", "accept-edits"})
+
+    run.assert_called_once_with([binary, "--help"], capture_output=True, text=True, timeout=10)
+
+
 def test_build_command_injects_system_prompt_via_i(tmp_path, monkeypatch):
     from cli_agent_orchestrator.models.agent_profile import AgentProfile
 
@@ -347,6 +360,39 @@ def test_mcp_registration_writes_config(tmp_path, monkeypatch):
         assert "cao-mcp-server-test-tid" not in data2.get("mcpServers", {})
 
 
+def test_mcp_registration_writes_owner_only_config_without_http_auth(tmp_path):
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(json.dumps({"mcpServers": {}}), encoding="utf-8")
+    cfg.chmod(0o644)
+    provider = make_provider()
+
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        provider._register_mcp_servers({"local": {"command": "local-mcp-server", "args": []}})
+
+    assert stat.S_IMODE(cfg.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize("failure_site", ["write", "replace"])
+def test_mcp_registration_removes_temporary_config_after_publish_failure(tmp_path, failure_site):
+    cfg = tmp_path / "mcp_config.json"
+    temp_config = cfg.with_suffix(".json.tmp")
+    provider = make_provider()
+    failure_target = (
+        "cli_agent_orchestrator.providers.antigravity_cli.json.dump"
+        if failure_site == "write"
+        else "cli_agent_orchestrator.providers.antigravity_cli.os.replace"
+    )
+
+    with (
+        patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+        patch(failure_target, side_effect=OSError(f"{failure_site} failed")),
+        pytest.raises(OSError, match=f"{failure_site} failed"),
+    ):
+        provider._register_mcp_servers({"local": {"command": "local-mcp-server", "args": []}})
+
+    assert not temp_config.exists()
+
+
 def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
     """The bundled bare `cao-mcp-server` command is resolved to a PATH-
     independent invocation before it is written to mcp_config.json. agy reads
@@ -384,6 +430,128 @@ def test_mcp_registration_resolves_bundled_command(tmp_path, monkeypatch):
         # or the versioned sibling.
         assert entry["command"] == "/home/u/.local/bin/cao-mcp-server"
         assert entry["args"] == []
+
+
+@pytest.mark.parametrize("failure_site", ["journal", "config", "sidecar", "sidecar_loss"])
+def test_http_ownership_transaction_recovers_after_restart(tmp_path, failure_site):
+    cfg = tmp_path / "mcp_config.json"
+    cfg.write_text(json.dumps({"mcpServers": {"user": {"command": "keep"}}}))
+    provider = make_provider()
+    http = {"remote": {"type": "http", "url": "https://example.invalid/mcp"}}
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        if failure_site == "journal":
+            with (
+                patch(
+                    "cli_agent_orchestrator.providers.antigravity_cli.atomic_write_text",
+                    side_effect=OSError("journal failed"),
+                ),
+                pytest.raises(OSError),
+            ):
+                provider._register_mcp_servers(http)
+        elif failure_site in ("config", "sidecar"):
+            method = "_write_mcp_config" if failure_site == "config" else "_write_mcp_ownership"
+            with (
+                patch.object(provider, method, side_effect=OSError("publish failed")),
+                pytest.raises(OSError),
+            ):
+                provider._register_mcp_servers(http)
+        else:
+            provider._register_mcp_servers(http)
+            Path(f"{cfg}.cao-ownership").unlink()
+        restarted = make_provider()
+        restarted._unregister_mcp_servers()
+    assert json.loads(cfg.read_text())["mcpServers"] == {"user": {"command": "keep"}}
+
+
+def test_failed_removal_keeps_http_ownership_for_retry(tmp_path):
+    cfg = tmp_path / "mcp_config.json"
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        provider = make_provider()
+        provider._register_mcp_servers(
+            {"remote": {"type": "http", "url": "https://example.invalid/mcp"}}
+        )
+        with patch.object(provider, "_write_mcp_config", side_effect=OSError("publish failed")):
+            provider._unregister_mcp_servers()
+        Path(f"{cfg}.cao-ownership").unlink()
+        make_provider()._unregister_mcp_servers()
+    assert json.loads(cfg.read_text())["mcpServers"] == {}
+
+
+def test_journal_does_not_claim_user_replacement(tmp_path):
+    cfg = tmp_path / "mcp_config.json"
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        provider = make_provider()
+        provider._register_mcp_servers(
+            {"remote": {"type": "http", "url": "https://example.invalid/mcp"}}
+        )
+        replacement = {"mcpServers": {"remote-test-tid": {"command": "user-owned"}}}
+        cfg.write_text(json.dumps(replacement))
+        make_provider()._unregister_mcp_servers()
+    assert json.loads(cfg.read_text()) == replacement
+
+
+def test_private_temp_mode_is_verified_before_payload_write(tmp_path):
+    import os
+
+    cfg = tmp_path / "mcp_config.json"
+    observed = []
+    real_dump = json.dump
+
+    def inspect_write(config, stream, **kwargs):
+        observed.append(stat.S_IMODE(os.fstat(stream.fileno()).st_mode))
+        assert observed[-1] == 0o600
+        return real_dump(config, stream, **kwargs)
+
+    with patch("cli_agent_orchestrator.providers.antigravity_cli.json.dump", inspect_write):
+        AntigravityCliProvider._write_mcp_config(cfg, {"mcpServers": {}})
+    assert observed == [0o600]
+    assert list(tmp_path.glob(".mcp_config.json.*")) == []
+
+
+def test_malformed_journal_refuses_to_claim_from_legacy_sidecar(tmp_path):
+    cfg = tmp_path / "mcp_config.json"
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        provider = make_provider()
+        provider._register_mcp_servers(
+            {"remote": {"type": "http", "url": "https://example.invalid/mcp"}}
+        )
+        before = cfg.read_bytes()
+        Path(f"{cfg}.cao-ownership-journal").write_text("not-json")
+        assert make_provider()._unregister_mcp_servers() is False
+    assert cfg.read_bytes() == before
+
+
+def test_stale_prune_recovers_http_owner_from_journal_after_sidecar_loss(tmp_path):
+    cfg = tmp_path / "mcp_config.json"
+    with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
+        provider = make_provider()
+        provider._register_mcp_servers(
+            {"remote": {"type": "http", "url": "https://example.invalid/mcp"}}
+        )
+        Path(f"{cfg}.cao-ownership").unlink()
+        servers = json.loads(cfg.read_text())["mcpServers"]
+        with patch(
+            "cli_agent_orchestrator.clients.database.get_terminal_metadata", return_value=None
+        ):
+            owners = _real_prune_stale_mcp_entries(make_provider(), servers)
+        assert servers == {}
+        assert owners == {}
+        # The disk version still has attribution until publication succeeds.
+        assert provider._load_mcp_ownership(cfg) == {"remote-test-tid": "test-tid"}
+
+
+def test_mcp_transaction_uses_advisory_file_lock(tmp_path):
+    import fcntl
+    import os
+
+    cfg = tmp_path / "mcp_config.json"
+    with AntigravityCliProvider._mcp_config_lock(cfg):
+        fd = os.open(f"{cfg}.cao-lock", os.O_RDWR)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(fd)
 
 
 def test_mcp_registration_tracks_and_cleans_third_party_ownership(tmp_path):
@@ -439,12 +607,14 @@ def test_stale_prune_uses_sidecar_ownership_for_identity_free_entries(tmp_path):
             return_value=None,
         ),
     ):
-        _real_prune_stale_mcp_entries(provider, servers)
+        owners = _real_prune_stale_mcp_entries(provider, servers)
 
     assert servers == {}
+    assert owners == {}
+    # Pruning is in-memory until config and its ownership are published.
     assert json.loads(Path(f"{cfg}.cao-ownership").read_text()) == {
         "version": 1,
-        "owners": {},
+        "owners": {"github-old": "dead-terminal"},
     }
 
 
@@ -862,20 +1032,19 @@ def test_unregister_warns_on_corrupt_config(tmp_path):
     p = make_provider()
     p._mcp_server_names = ["cao-mcp-server-test-tid"]
     with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
-        p.cleanup()  # corrupt file -> logged warning, state reset, no raise
-    assert p._mcp_server_names == []
+        assert p.cleanup() is False
+    assert p._mcp_server_names == ["cao-mcp-server-test-tid"]
 
 
 @pytest.mark.parametrize("payload", ["[1, 2, 3]", '"just a string"', "42"])
 def test_unregister_handles_non_dict_config(tmp_path, payload):
-    # Valid-but-unexpected JSON shape must not raise during teardown, and the
-    # internal state must always be cleared (finally block).
+    # A parsed non-object config cannot contain any usable MCP server.
     cfg = tmp_path / "mcp_config.json"
     cfg.write_text(payload)
     p = make_provider()
     p._mcp_server_names = ["cao-mcp-server-test-tid"]
     with patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg):
-        p.cleanup()  # non-dict config -> no raise, state reset
+        assert p.cleanup() is True
     assert p._mcp_server_names == []
 
 
@@ -1127,7 +1296,7 @@ async def test_wait_until_input_ready_retries_transient_capture_failure(monkeypa
 
 
 @pytest.mark.asyncio
-async def test_wait_until_input_ready_caps_persistent_capture_failures(monkeypatch):
+async def test_wait_until_input_ready_caps_persistent_capture_failures(monkeypatch, caplog):
     """A dead backend must fail promptly instead of consuming the full init timeout."""
     p = make_provider()
     calls = 0
@@ -1136,7 +1305,7 @@ async def test_wait_until_input_ready_caps_persistent_capture_failures(monkeypat
         def get_history(self, session, window, tail_lines):
             nonlocal calls
             calls += 1
-            raise RuntimeError("pane is gone")
+            raise RuntimeError("PRIVATE_CAPTURE_ERROR_PAYLOAD")
 
     monkeypatch.setattr(
         "cli_agent_orchestrator.providers.antigravity_cli.get_backend", lambda: FakeBackend()
@@ -1144,6 +1313,8 @@ async def test_wait_until_input_ready_caps_persistent_capture_failures(monkeypat
 
     assert await p.wait_until_input_ready(timeout=0.05, poll_interval=0.0) is False
     assert calls == 3
+    assert "PRIVATE_CAPTURE_ERROR_PAYLOAD" not in caplog.text
+    assert "AGY_INPUT_CAPTURE_ERROR" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1163,6 +1334,29 @@ async def test_wait_until_input_ready_rejects_changing_startup_surface(monkeypat
 
     assert await p.wait_until_input_ready(timeout=0.04, poll_interval=0.01) is False
     assert p.is_input_ready is False
+
+
+@pytest.mark.asyncio
+async def test_wait_until_input_ready_timeout_logs_only_categorical_summary(monkeypatch, caplog):
+    provider = make_provider()
+    private_scrollback = "PRIVATE_SCROLLBACK_MARKER"
+
+    class FakeBackend:
+        def get_history(self, session, window, tail_lines):
+            return private_scrollback
+
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.antigravity_cli.get_backend",
+        lambda: FakeBackend(),
+    )
+
+    with caplog.at_level("WARNING", logger="cli_agent_orchestrator.providers.antigravity_cli"):
+        assert await provider.wait_until_input_ready(timeout=0.02, poll_interval=0.01) is False
+
+    assert private_scrollback not in caplog.text
+    assert "code=AGY_INPUT_READY_TIMEOUT" in caplog.text
+    assert "captures=" in caplog.text
+    assert "not_ready=" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -1403,6 +1597,7 @@ def test_cleanup_logs_unregister_exception(caplog):
     with caplog.at_level("ERROR", logger="cli_agent_orchestrator.providers.antigravity_cli"):
         _log_cleanup_exception(fut)
 
-    assert "disk full" in caplog.text
+    assert "disk full" not in caplog.text
+    assert "error_type=OSError" in caplog.text
     assert "_unregister_mcp_servers" in caplog.text
     loop.close()

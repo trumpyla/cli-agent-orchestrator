@@ -40,6 +40,11 @@ def _read_kimi_mcp(provider: KimiCliProvider) -> dict:
     return json.loads(path.read_text())
 
 
+@pytest.fixture(autouse=True)
+def isolate_kimi_runtime(tmp_path, monkeypatch):
+    monkeypatch.setattr("cli_agent_orchestrator.providers.kimi_cli.CAO_HOME_DIR", tmp_path)
+
+
 FIXTURES_DIR = Path(__file__).parent / "fixtures"
 
 
@@ -59,9 +64,12 @@ class TestKimiCliProviderInitialization:
     @pytest.fixture(autouse=True)
     def _skip_startup_dialog(self):
         # initialize() polls the pane to dismiss kimi's upgrade-reminder dialog;
-        # that path has its own tests. Stub it so command-send/timeout tests stay
-        # fast and independent of the (mocked) get_history return type.
-        with patch.object(KimiCliProvider, "_handle_startup_dialog", return_value=None):
+        # readiness polling has its own tests too. Stub both so command-send and
+        # timeout tests stay fast and independent of mocked pane captures.
+        with (
+            patch.object(KimiCliProvider, "_handle_startup_dialog", return_value=None),
+            patch.object(KimiCliProvider, "wait_until_input_ready", return_value=True),
+        ):
             yield
 
     @pytest.mark.asyncio
@@ -137,6 +145,28 @@ class TestKimiCliProviderInitialization:
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         with pytest.raises(TimeoutError, match="Kimi CLI initialization"):
             await provider.initialize()
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.wait_for_shell")
+    @patch("cli_agent_orchestrator.providers.kimi_cli.get_backend")
+    async def test_initialize_input_surface_timeout(
+        self, mock_tmux, mock_wait_shell, mock_wait_status
+    ):
+        """Initialization fails closed when the input widget never becomes ready."""
+        mock_wait_shell.return_value = True
+        mock_wait_status.return_value = True
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+
+        with patch.object(provider, "wait_until_input_ready", return_value=False) as ready:
+            with pytest.raises(
+                ProviderError,
+                match=r"Kimi CLI input surface not ready after 120\.0 seconds",
+            ):
+                await provider.initialize()
+
+        assert provider._initialized is False
+        ready.assert_awaited_once_with(timeout=120.0)
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.providers.kimi_cli.wait_until_status")
@@ -247,6 +277,18 @@ class TestKimiCliProviderInitialization:
 # =============================================================================
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("capture", [None, b"", MagicMock()], ids=["none", "bytes", "object"])
+async def test_wait_until_input_ready_rejects_non_string_capture(capture) -> None:
+    """Malformed pane captures cannot satisfy the input-readiness gate."""
+    backend = MagicMock()
+    backend.get_history.return_value = capture
+    provider = KimiCliProvider("term-1", "session-1", "window-1")
+
+    with patch("cli_agent_orchestrator.providers.kimi_cli.get_backend", return_value=backend):
+        assert await provider.wait_until_input_ready(timeout=1.0, poll_interval=0.0) is False
+
+
 @pytest.mark.parametrize(
     ("output", "expected"),
     [
@@ -337,6 +379,33 @@ async def test_startup_dialog_dismisses_supported_upgrade_then_accepts_ready() -
 
 
 @pytest.mark.asyncio
+async def test_startup_dialog_latches_trust_as_handled() -> None:
+    """Dismissing the trust prompt persists state for later status parsing."""
+    backend = MagicMock()
+    backend.get_history.side_effect = [
+        _read_fixture("kimi_cli_trust_dialog.txt"),
+        _read_fixture("kimi_code_tui_idle_raw.txt"),
+    ]
+    provider = KimiCliProvider("term-1", "session-1", "window-1")
+
+    with (
+        patch("cli_agent_orchestrator.providers.kimi_cli.get_backend", return_value=backend),
+        patch("cli_agent_orchestrator.providers.kimi_cli.time.monotonic", return_value=0.0),
+        patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep"),
+        patch("cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent"),
+    ):
+        await provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=10.0)
+
+    assert provider._trust_handled is True
+    backend.send_special_key.assert_called_once_with(
+        "session-1",
+        "window-1",
+        "Enter",
+    )
+    backend.send_keys.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_startup_dialog_does_not_answer_unsupported_dialog() -> None:
     """Unknown startup dialogs fail closed without sending guessed input."""
     backend = MagicMock()
@@ -361,6 +430,43 @@ async def test_startup_dialog_does_not_answer_unsupported_dialog() -> None:
 # =============================================================================
 
 
+class TestKimiDeliveryConfirmation:
+    @pytest.mark.parametrize(
+        "output",
+        [
+            "context: 0%",
+            "• Previous response\ncontext: 0%",
+            "• Echoed task\ncontext: 0%",
+            "⠋ MCP Servers: 0/1 connected\ncontext: 0%",
+            "💫 Please print ⠋\ncontext: 0%",
+            "Trust this folder?\n❯ Trust this folder",
+        ],
+    )
+    def test_dispatch_and_echo_are_not_acceptance(self, output):
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        provider.mark_input_received()
+        with patch.object(provider, "capture_delivery_baseline", return_value=output):
+            assert (
+                provider.confirm_input_accepted(
+                    "• Previous response\ncontext: 0%",
+                    "• Echoed task\nPlease print ⠋",
+                    timeout=0,
+                )
+                is False
+            )
+
+    @pytest.mark.parametrize("output", ["• Fresh response", "⠋ Thinking… 1s"])
+    def test_fresh_response_proves_acceptance(self, output):
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        with patch.object(provider, "capture_delivery_baseline", return_value=output):
+            assert provider.confirm_input_accepted("context: 0%", "Review", timeout=0) is True
+
+    def test_capture_failure_leaves_acceptance_unconfirmed(self):
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        with patch.object(provider, "capture_delivery_baseline", side_effect=RuntimeError):
+            assert provider.confirm_input_accepted("context: 0%", "Review", timeout=0) is False
+
+
 class TestKimiCliProviderStatusDetection:
     """Tests for KimiCliProvider.get_status()."""
 
@@ -368,6 +474,59 @@ class TestKimiCliProviderStatusDetection:
         """Test IDLE detection from fresh startup output."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
         assert provider.get_status(_read_fixture("kimi_cli_idle_output.txt")) == TerminalStatus.IDLE
+
+    def test_captured_kimi_042_trust_dialog_blocks_readiness(self):
+        """Sanitized startup capture: unbordered title, rules above/below, no footer."""
+        output = _read_fixture("kimi_cli_trust_dialog.txt")
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        assert _is_startup_output_ready(output) is False
+        assert provider.get_status(output) == TerminalStatus.PROCESSING
+        assert provider.get_status_from_screen(output.splitlines()) == TerminalStatus.PROCESSING
+
+    @pytest.mark.parametrize("phrase", ["Enable project MCP servers", "Trust this folder?"])
+    @pytest.mark.parametrize("screen", [False, True])
+    def test_reconstructed_provider_ignores_trust_text_in_response(self, phrase, screen):
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = f"• {phrase}\nuser@project💫\ncontext: 1%"
+        status = (
+            provider.get_status_from_screen(output.splitlines())
+            if screen
+            else provider.get_status(output)
+        )
+        assert status == TerminalStatus.COMPLETED
+        assert _is_startup_output_ready(output) is True
+
+    @pytest.mark.parametrize("screen", [False, True])
+    def test_reconstructed_provider_ignores_old_dialog_before_ready_chrome(self, screen):
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = "Trust this folder?\n❯ Trust this folder\n• Done\ncontext: 1%"
+        status = (
+            provider.get_status_from_screen(output.splitlines())
+            if screen
+            else provider.get_status(output)
+        )
+        assert status == TerminalStatus.COMPLETED
+        assert _is_startup_output_ready(output) is True
+
+    @pytest.mark.parametrize("screen", [False, True])
+    def test_current_trust_dialog_blocks_stale_ready_chrome(self, screen):
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        output = "context: 0%\nTrust this folder?\n❯ Trust this folder"
+        status = (
+            provider.get_status_from_screen(output.splitlines())
+            if screen
+            else provider.get_status(output)
+        )
+        assert status == TerminalStatus.PROCESSING
+        assert _is_startup_output_ready(output) is False
+
+    def test_get_status_ignores_lingering_trust_dialog_after_dismissal(self):
+        """Stale trust-dialog text does not mask an idle prompt after dismissal."""
+        provider = KimiCliProvider("term-1", "session-1", "window-1")
+        provider._trust_handled = True
+        output = "Trust this folder?\n" + _read_fixture("kimi_cli_idle_output.txt")
+
+        assert provider.get_status(output) == TerminalStatus.IDLE
 
     def test_get_status_idle_no_thinking(self):
         """Test IDLE detection with ✨ prompt (no-thinking mode)."""
@@ -1246,7 +1405,7 @@ class TestKimiCliProviderMisc:
     def test_cleanup_removes_temp_dir(self):
         """Test cleanup removes temporary directory and its contents."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        provider._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_test_")
+        provider._temp_dir = str(provider._prepare_runtime_directory())
         temp_path = provider._temp_dir  # Save path before cleanup resets it
 
         # Create a file in temp dir to verify it's removed
@@ -1261,7 +1420,7 @@ class TestKimiCliProviderMisc:
     def test_cleanup_nonexistent_temp_dir(self):
         """Test cleanup handles already-removed temp directory gracefully."""
         provider = KimiCliProvider("term-1", "session-1", "window-1")
-        provider._temp_dir = "/tmp/cao_kimi_nonexistent_12345"
+        provider._temp_dir = str(provider._runtime_directory())
         provider.cleanup()
         assert provider._temp_dir is None
 
@@ -1697,9 +1856,7 @@ class TestKimiCliProfileRestoration:
         mock_profile.skills = ["skillA"]
         mock_profile.system_prompt = "Base prompt"
 
-        provider = KimiCliProvider(
-            "term-1", "session-1", "window-1", working_directory="/my/repo"
-        )
+        provider = KimiCliProvider("term-1", "session-1", "window-1", working_directory="/my/repo")
         prefix = provider._compose_first_message_prefix(mock_profile)
 
         mock_build_skills.assert_called_once_with(["skillA"], start=Path("/my/repo"))

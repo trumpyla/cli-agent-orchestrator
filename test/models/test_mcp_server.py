@@ -61,18 +61,24 @@ class TestVariantNarrowing:
         assert entry.command == raw["command"]
 
     @pytest.mark.parametrize(
-        "url",
+        ("transport", "url"),
         [
-            pytest.param("http://127.0.0.1:9889/mcp/ops", id="literal-loopback-http"),
-            pytest.param("https://serena.example/mcp", id="literal-https"),
-            pytest.param("${CAO_SERENA_MCP_URL}", id="single-env-reference"),
+            pytest.param(
+                "http",
+                "http://127.0.0.1:9889/mcp/ops",
+                id="literal-loopback-http",
+            ),
+            pytest.param("http", "https://serena.example/mcp", id="literal-https"),
+            pytest.param("http", "${CAO_SERENA_MCP_URL}", id="single-env-reference"),
+            pytest.param("sse", "https://serena.example/sse", id="legacy-sse"),
         ],
     )
-    def test_http_entries_narrow_to_http(self, url: str) -> None:
-        # Break guarded: a ``type: http`` entry must narrow to the HTTP variant
+    def test_http_entries_narrow_to_http(self, transport: str, url: str) -> None:
+        # Break guarded: an HTTP or legacy SSE URL must narrow to the HTTP variant
         # and keep the url verbatim (references are NOT resolved at this layer).
-        entry = parse_mcp_server_entry({"type": "http", "url": url}, server_name="cao-ops")
+        entry = parse_mcp_server_entry({"type": transport, "url": url}, server_name="cao-ops")
         assert isinstance(entry, HttpMcpServer)
+        assert entry.type == transport
         assert entry.url == url
 
     def test_type_adapter_is_the_public_boundary(self) -> None:

@@ -11,9 +11,41 @@ from cli_agent_orchestrator.backends.base import (
     TerminalBackendError,
     TerminalNotFoundError,
 )
-from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend, HerdrWorkspace
 
 # --- Fixtures ---
+
+
+@pytest.mark.parametrize("inventory_error", [False, True])
+def test_close_workspace_requires_confirmed_absence(backend, monkeypatch, inventory_error):
+    monkeypatch.setattr(backend, "_run_herdr", MagicMock(return_value=_completed()))
+    inventory = MagicMock(
+        return_value=[
+            HerdrWorkspace(
+                workspace_id="ws-old",
+                label="cao-old",
+                agent_status="done",
+                pane_count=1,
+                tab_count=1,
+                active_tab_id="tab",
+            )
+        ]
+    )
+    if inventory_error:
+        inventory.side_effect = TerminalBackendError("inventory unavailable")
+    monkeypatch.setattr(backend, "list_workspace_inventory", inventory)
+    monkeypatch.setattr(time, "sleep", lambda _delay: None)
+    assert backend.close_workspace_by_id("ws-old") is False
+    assert inventory.call_count == 5
+
+
+def test_close_workspace_accepts_delayed_authoritative_absence(backend, monkeypatch):
+    monkeypatch.setattr(backend, "_run_herdr", MagicMock(return_value=_completed()))
+    inventory = MagicMock(side_effect=[TerminalBackendError("retry"), []])
+    monkeypatch.setattr(backend, "list_workspace_inventory", inventory)
+    monkeypatch.setattr(time, "sleep", lambda _delay: None)
+    assert backend.close_workspace_by_id("ws-old") is True
+    assert inventory.call_count == 2
 
 
 @pytest.fixture
@@ -361,6 +393,7 @@ class TestHerdrBackendCommands:
         mock_run.side_effect = [
             _completed(_make_workspace_list_response(ws)),  # _resolve_workspace_id
             _completed(),  # workspace close
+            _completed(_make_workspace_list_response([])),  # confirmed absent
         ]
 
         result = backend.kill_session("cao-test")

@@ -9,8 +9,10 @@ import pytest
 
 from cli_agent_orchestrator.models.skill import SkillMetadata
 from cli_agent_orchestrator.utils.skills import (
+    InlineSkillPrompt,
     _project_extra_skill_dirs,
     build_skill_catalog,
+    build_inline_skill_prompt,
     list_skills,
     load_skill_content,
     load_skill_metadata,
@@ -704,6 +706,51 @@ class TestDefaultBundledSkills:
 
 class TestBuildSkillCatalog:
     """Tests for build_skill_catalog."""
+
+    def test_inline_declared_skills_resolve_content_and_deduplicate(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+        _write_skill(tmp_path / "review-checks", "review-checks", "Review", "Inspect each change.")
+        _write_skill(tmp_path / "worker", "worker", "Worker", "Send the result to the caller.")
+        _write_skill(tmp_path / "undeclared", "undeclared", "Other", "Do unrelated work.")
+        prompt = build_inline_skill_prompt(["review-*", "worker", "review-checks"])
+        assert isinstance(prompt, InlineSkillPrompt)
+        assert prompt.count("Inspect each change.") == 1
+        assert "Send the result to the caller." in prompt
+        assert "Do unrelated work." not in prompt
+        assert "mcp__cao-mcp-server__load_skill" not in prompt
+
+    def test_inline_empty_declarations_do_not_load_all_skills(self):
+        with patch("cli_agent_orchestrator.utils.skills.list_skills") as listing:
+            assert build_inline_skill_prompt([]) == ""
+        listing.assert_not_called()
+
+    def test_inline_omitted_declarations_include_all_full_bodies(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+        _write_skill(tmp_path / "review", "review", "Review", "Review full instructions.")
+        _write_skill(tmp_path / "worker", "worker", "Worker", "Worker full instructions.")
+        prompt = build_inline_skill_prompt(None)
+        assert "Review full instructions." in prompt
+        assert "Worker full instructions." in prompt
+        assert "load_skill" not in prompt
+
+    def test_inline_omitted_declarations_with_empty_store_are_empty(self, tmp_path, monkeypatch):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+        assert build_inline_skill_prompt(None) == ""
+
+    @pytest.mark.parametrize("declaration", ["unknown", "unknown-*", "../unsafe"])
+    def test_inline_unknown_or_unsafe_declaration_fails(self, tmp_path, monkeypatch, declaration):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+        with pytest.raises((FileNotFoundError, ValueError)):
+            build_inline_skill_prompt([declaration])
+
+    @pytest.mark.parametrize("body", ["", "---\nname: wrong-name\ndescription: wrong\n---\nbody"])
+    def test_inline_empty_or_invalid_declared_skill_fails(self, tmp_path, monkeypatch, body):
+        monkeypatch.setattr("cli_agent_orchestrator.utils.skills.SKILLS_DIR", tmp_path)
+        path = _write_skill(tmp_path / "worker", "worker", "Worker", body)
+        if body:
+            path.write_text(body)
+        with pytest.raises(ValueError):
+            build_inline_skill_prompt(["worker"])
 
     @patch("cli_agent_orchestrator.utils.skills.list_skills", return_value=[])
     def test_returns_empty_string_when_no_skills_installed(self, mock_list_skills):

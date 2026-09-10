@@ -30,6 +30,7 @@ from cli_agent_orchestrator.providers.mcp_translation import (
     codex_http_fields,
     kimi_http_entry,
     render_http_entry,
+    set_managed_cao_origin,
 )
 
 _OPS_URL = "http://127.0.0.1:9889/mcp/ops"
@@ -42,6 +43,9 @@ def _auth_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
     monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
     monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
+    monkeypatch.setattr(
+        "cli_agent_orchestrator.providers.mcp_translation._managed_cao_origin", ("127.0.0.1", 9889)
+    )
 
 
 def _read_claude_mcp(command: str) -> dict:
@@ -60,9 +64,118 @@ def _read_claude_mcp(command: str) -> dict:
 
 
 class TestTranslationRegistry:
-    def test_supported_providers_are_the_four_native_ones(self) -> None:
+    @pytest.mark.parametrize("provider", sorted(HTTP_SUPPORTED_PROVIDERS))
+    @pytest.mark.parametrize(
+        "configured_host,url_host,authorized",
+        [
+            ("127.0.0.1", "localhost", False),
+            ("localhost", "localhost", True),
+            ("localhost", "127.0.0.1", False),
+            ("::1", "[0:0:0:0:0:0:0:1]", True),
+            ("127.0.0.1", "[::ffff:127.0.0.1]", False),
+            ("::ffff:127.0.0.1", "127.0.0.1", False),
+            ("0.0.0.0", "127.0.0.1", True),
+            ("0.0.0.0", "0.0.0.0", False),
+            ("::", "[::1]", True),
+            ("::", "[::]", False),
+            ("cao.example.invalid", "cao.example.invalid", True),
+            ("cao.example.invalid", "localhost", False),
+        ],
+    )
+    def test_exact_host_authority_without_dns_aliases(
+        self, provider, configured_host, url_host, authorized
+    ):
+        set_managed_cao_origin(configured_host, 9897)
+        env = {"AUTH0_DOMAIN": "idp.example.test", "CAO_AUTH_LOCAL_TOKEN": "fake-machine-token"}
+        native = render_http_entry(provider, f"http://{url_host}:9897/mcp/ops", env=env)
+        assert (
+            bool({"headers", "bearer_token_env_var", "bearerTokenEnvVar"}.intersection(native))
+            is authorized
+        )
+
+    @pytest.mark.parametrize("provider", sorted(HTTP_SUPPORTED_PROVIDERS))
+    def test_default_http_port_matches_explicit_configured_port(self, monkeypatch, provider):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.mcp_translation._managed_cao_origin",
+            ("127.0.0.1", 80),
+        )
+        env = {"AUTH0_DOMAIN": "idp.example.test", "CAO_AUTH_LOCAL_TOKEN": "fake-machine-token"}
+        implicit = render_http_entry(provider, "http://127.0.0.1/mcp/ops", env=env)
+        explicit = render_http_entry(provider, "http://127.0.0.1:80/mcp/ops", env=env)
+        auth_keys = {"headers", "bearer_token_env_var", "bearerTokenEnvVar"}
+        assert {key: value for key, value in implicit.items() if key in auth_keys} == {
+            key: value for key, value in explicit.items() if key in auth_keys
+        }
+        assert auth_keys.intersection(implicit)
+
+    def test_default_origin_reads_current_configuration_at_render(self, monkeypatch):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.mcp_translation._managed_cao_origin", None
+        )
+        monkeypatch.setattr("cli_agent_orchestrator.constants.SERVER_HOST", "127.0.0.1")
+        monkeypatch.setattr("cli_agent_orchestrator.constants.SERVER_PORT", 9897)
+        env = {"AUTH0_DOMAIN": "idp.example.test", "CAO_AUTH_LOCAL_TOKEN": "fake-machine-token"}
+        assert "headers" in render_http_entry("grok_cli", "http://127.0.0.1:9897/mcp/ops", env=env)
+        assert "headers" not in render_http_entry(
+            "grok_cli", "http://127.0.0.1:9889/mcp/ops", env=env
+        )
+
+    @pytest.mark.parametrize("provider", sorted(HTTP_SUPPORTED_PROVIDERS))
+    @pytest.mark.parametrize("port", [9889, 9897])
+    def test_managed_auth_requires_effective_cao_origin(self, monkeypatch, provider, port):
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.providers.mcp_translation._managed_cao_origin",
+            ("127.0.0.1", port),
+        )
+        env = {
+            "CAO_AUTH_JWKS_URI": "https://idp.example.test/jwks",
+            "CAO_AUTH_LOCAL_TOKEN": "fake-machine-token",
+            "CAO_API_PORT": "9999",  # snapshot cannot redirect the running origin
+        }
+        for host in ("127.0.0.1",):
+            rendered = render_http_entry(provider, f"http://{host}:{port}/mcp/ops", env=env)
+            assert any(
+                key in rendered for key in ("headers", "bearer_token_env_var", "bearerTokenEnvVar")
+            )
+        denied_urls = [
+            f"http://127.0.0.2:{port}/mcp/ops",
+            f"http://localhost:{port}/mcp/ops",
+            f"http://[::1]:{port}/mcp/ops",
+            "http://127.0.0.1:9999/mcp/ops",
+            "http://127.0.0.1/mcp/ops",
+            "http://127.0.0.1:80/mcp/ops",
+            f"https://127.0.0.1:{port}/mcp/ops",
+            "https://localhost/mcp/ops",
+            f"http://user@127.0.0.1:{port}/mcp/ops",
+            f"http://127.0.0.1:{port}/mcp/ops?",
+            f"http://127.0.0.1:{port}/mcp/ops#",
+            f"http://127.0.0.1:{port}/mcp/ops?x=1",
+            f"http://127.0.0.1:{port}/mcp/ops#x",
+            f"http://127.0.0.1:{port}/other",
+            f"http://external.example.test:{port}/mcp/ops",
+        ]
+        for url in denied_urls:
+            rendered = render_http_entry(provider, url, env=env)
+            assert not any(
+                key in rendered for key in ("headers", "bearer_token_env_var", "bearerTokenEnvVar")
+            )
+            assert "fake-machine-token" not in json.dumps(rendered)
+
+    @pytest.mark.parametrize("provider", ["claude_code", "grok_cli"])
+    def test_native_mapping_preserves_explicit_sse(self, provider) -> None:
+        assert render_http_entry(provider, _EXTERNAL_URL, transport="sse") == {
+            "type": "sse",
+            "url": _EXTERNAL_URL,
+        }
+
+    @pytest.mark.parametrize("provider", ["codex", "antigravity_cli", "kimi_cli"])
+    def test_sse_without_a_verified_native_mapping_fails_closed(self, provider) -> None:
+        with pytest.raises(McpConfigError, match="no native SSE MCP mapping"):
+            render_http_entry(provider, _EXTERNAL_URL, transport="sse")
+
+    def test_supported_providers_have_native_mappings(self) -> None:
         assert HTTP_SUPPORTED_PROVIDERS == frozenset(
-            {"codex", "claude_code", "antigravity_cli", "kimi_cli"}
+            {"codex", "claude_code", "antigravity_cli", "kimi_cli", "grok_cli"}
         )
 
     @pytest.mark.parametrize(
@@ -71,6 +184,7 @@ class TestTranslationRegistry:
             pytest.param("claude_code", {"type": "http", "url": _OPS_URL}, id="claude"),
             pytest.param("antigravity_cli", {"serverUrl": _OPS_URL}, id="antigravity"),
             pytest.param("kimi_cli", {"url": _OPS_URL}, id="kimi"),
+            pytest.param("grok_cli", {"type": "http", "url": _OPS_URL}, id="grok"),
         ],
     )
     def test_render_http_entry_maps_native_shape(self, provider: str, expected: dict) -> None:
@@ -78,7 +192,7 @@ class TestTranslationRegistry:
 
     @pytest.mark.parametrize(
         "provider",
-        ["codex", "claude_code", "antigravity_cli", "kimi_cli"],
+        ["codex", "claude_code", "antigravity_cli", "kimi_cli", "grok_cli"],
     )
     def test_no_provider_emits_the_stale_httpurl_field(self, provider: str) -> None:
         # Break guarded: ``httpUrl`` is Gemini CLI's field, not the direct URL
@@ -143,6 +257,11 @@ class TestTranslationRegistry:
                 {"bearerTokenEnvVar": "CAO_AUTH_LOCAL_TOKEN"},
                 id="kimi",
             ),
+            pytest.param(
+                "grok_cli",
+                {"headers": {"Authorization": "Bearer fake-machine-token"}},
+                id="grok",
+            ),
         ],
     )
     def test_authenticated_local_ops_uses_provider_native_auth(
@@ -200,6 +319,14 @@ def _codex_http_profile(url: str) -> MagicMock:
 
 
 class TestCodexHttpMapping:
+    @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
+    def test_codex_rejects_sse_instead_of_rendering_http(self, mock_load) -> None:
+        profile = _codex_http_profile(_EXTERNAL_URL)
+        profile.mcpServers["cao-ops"]["type"] = "sse"
+        mock_load.return_value = profile
+        with pytest.raises(McpConfigError, match="no native SSE MCP mapping"):
+            CodexProvider("t1", "s", "w", "agent")._build_codex_command()
+
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_codex_emits_url_and_timeout_no_subprocess(self, mock_load) -> None:
         mock_load.return_value = _codex_http_profile(_OPS_URL)
@@ -261,6 +388,15 @@ def _claude_profile(mcp_servers: dict) -> MagicMock:
 
 class TestClaudeHttpMapping:
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
+    def test_claude_launch_preserves_sse(self, mock_load) -> None:
+        mock_load.return_value = _claude_profile({"remote": {"type": "sse", "url": _EXTERNAL_URL}})
+        command = ClaudeCodeProvider("term-1", "s", "w", "agent")._build_claude_command()
+        assert _read_claude_mcp(command)["mcpServers"]["remote"] == {
+            "type": "sse",
+            "url": _EXTERNAL_URL,
+        }
+
+    @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_claude_emits_type_http_url_no_subprocess(self, mock_load) -> None:
         mock_load.return_value = _claude_profile({"cao-ops": {"type": "http", "url": _OPS_URL}})
         provider = ClaudeCodeProvider("term-1", "s", "w", "agent")
@@ -310,6 +446,18 @@ class TestClaudeHttpMapping:
 
 
 class TestAntigravityHttpMapping:
+    def test_antigravity_rejects_sse_without_replacing_config(self, tmp_path) -> None:
+        cfg = tmp_path / "mcp_config.json"
+        original = json.dumps({"mcpServers": {"user-owned": {"command": "keep"}}})
+        cfg.write_text(original)
+        provider = AntigravityCliProvider("test-tid", "s", "w")
+        with (
+            patch.object(AntigravityCliProvider, "_mcp_config_path", return_value=cfg),
+            pytest.raises(McpConfigError, match="no native SSE MCP mapping"),
+        ):
+            provider._register_mcp_servers({"remote": {"type": "sse", "url": _EXTERNAL_URL}})
+        assert cfg.read_text() == original
+
     def test_antigravity_emits_server_url_no_subprocess(self, tmp_path) -> None:
         cfg = tmp_path / "mcp_config.json"
         profile = AgentProfile(

@@ -266,6 +266,71 @@ def test_oldest_activity_then_label_order_and_batch_limit():
     assert summary.reasons == {"batch_limited": 1}
 
 
+@pytest.mark.parametrize("cap", [1, 2])
+@pytest.mark.parametrize("failure", ["pending", "teardown"])
+def test_combined_schedule_rotates_past_failed_debt_and_retries_it(cap, failure):
+    debts = [
+        {
+            "label": f"cao-debt-{index}",
+            "workspace_id": f"ws-debt-{index}",
+            "newest_activity": NOW - timedelta(hours=4),
+            "terminal_ids": [f"debt-{index}"],
+        }
+        for index in range(3)
+    ]
+    rows = {
+        debt["label"]: [
+            terminal(debt["terminal_ids"][0], debt["label"], last_active=NOW - timedelta(hours=4))
+        ]
+        for debt in debts
+    }
+    fresh_workspaces = [
+        workspace(label=f"cao-fresh-{i}", workspace_id=f"ws-fresh-{i}") for i in range(3)
+    ]
+    rows.update(
+        {
+            ws.label: [terminal(f"fresh-{i}", ws.label, last_active=NOW - timedelta(hours=2))]
+            for i, ws in enumerate(fresh_workspaces)
+        }
+    )
+    attempts = []
+    pending_checks = []
+
+    def pending(terminal_id):
+        pending_checks.append(terminal_id)
+        return failure == "pending" and terminal_id.startswith("debt-")
+
+    def teardown(label, _workspace_id):
+        attempts.append(label)
+        if label.startswith("cao-debt-"):
+            raise RuntimeError("cleanup still deferred")
+
+    cleanup = RuntimeResourceCleanup(
+        backend=FakeHerdrBackend([fresh_workspaces]),
+        config_reader=lambda: CleanupConfig(
+            completed_sessions_enabled=True, max_sessions_per_sweep=cap
+        ),
+        terminal_reader=lambda label: rows[label],
+        pending_checker=pending,
+        teardown=teardown,
+        clock=lambda: NOW,
+        debt_reader=lambda: debts,
+    )
+
+    # Two complete rounds must visit every candidate, even though debt remains
+    # ineligible/failing throughout. Fresh inventory exceeds the per-sweep cap.
+    summaries = [cleanup.sweep() for _ in range(12 // cap)]
+    assert all(summary.selected == cap for summary in summaries)
+    assert all(summary.deleted <= cap for summary in summaries)
+    for ws in fresh_workspaces:
+        assert attempts.count(ws.label) == 2
+    for index in range(3):
+        if failure == "pending":
+            assert pending_checks.count(f"debt-{index}") == 2
+        else:
+            assert attempts.count(f"cao-debt-{index}") == 2
+
+
 @pytest.mark.parametrize(
     ("second_inventory", "expected_reason"),
     [

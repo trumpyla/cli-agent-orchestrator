@@ -34,7 +34,10 @@ from cli_agent_orchestrator.providers.kiro_capabilities import KiroPhase0KASErro
 from cli_agent_orchestrator.services import frozen_run_memory, terminal_service
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_fingerprint import StepCallFields, compute
-from cli_agent_orchestrator.services.terminal_service import OutputMode
+from cli_agent_orchestrator.services.terminal_service import (
+    InputAcceptanceUnconfirmedError,
+    OutputMode,
+)
 from cli_agent_orchestrator.utils.terminal import wait_until_status
 
 logger = logging.getLogger(__name__)
@@ -161,6 +164,7 @@ async def _wait_for_completion(
     cancel_event: Optional["asyncio.Event"] = None,
     *,
     prompt: Optional[str] = None,
+    acceptance_probe=None,
 ) -> None:
     """Wait for a post-input step to settle, polling ``status_monitor`` (issue #409).
 
@@ -230,14 +234,17 @@ async def _wait_for_completion(
                 terminal_id=terminal_id,
             )
         if current == TerminalStatus.COMPLETED:
-            return
+            if acceptance_probe is None or await asyncio.to_thread(acceptance_probe):
+                return
         if current == TerminalStatus.IDLE:
             # Post-input IDLE only counts once the agent has actually started
             # working — otherwise the idle-before-processing window right after
             # the send would settle immediately with empty/partial output.
             if observed_working:
                 consecutive_idle += 1
-                if consecutive_idle >= _IDLE_STABLE_POLLS:
+                if consecutive_idle >= _IDLE_STABLE_POLLS and (
+                    acceptance_probe is None or await asyncio.to_thread(acceptance_probe)
+                ):
                     logger.info(
                         "step on terminal %s settled IDLE post-input "
                         "(observed working; %d consecutive idle polls) — done",
@@ -721,18 +728,24 @@ async def run_agent_step(
         terminal_id,
         prompt,
     )
-    if frozen_memory is None:
-        # The call is left BYTE-IDENTICAL on the no-frozen-block path, rather than passing an extra
-        # `None`. Existing tests assert this exact two-argument shape, and keeping them passing
-        # unchanged is the strongest available evidence for C-1: a non-workflow step reaches
-        # ``send_input`` exactly as it did before this unit.
-        await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
-    else:
-        await asyncio.to_thread(
-            terminal_service.send_input,
+    dispatch_uncertainty = None
+    try:
+        if frozen_memory is None:
+            # Preserve the historical call shape without a frozen memory block.
+            await asyncio.to_thread(terminal_service.send_input, terminal_id, prompt)
+        else:
+            await asyncio.to_thread(
+                terminal_service.send_input,
+                terminal_id,
+                prompt,
+                frozen_memory=frozen_memory,
+            )
+    except InputAcceptanceUnconfirmedError as exc:
+        dispatch_uncertainty = exc
+        logger.warning(
+            "Input dispatched to step terminal %s; acceptance unconfirmed. "
+            "Waiting for completion without redelivery.",
             terminal_id,
-            prompt,
-            frozen_memory=frozen_memory,
         )
 
     # Wait for completion — IN-PROCESS poll of status_monitor (NOT the
@@ -745,7 +758,21 @@ async def run_agent_step(
     # StepExecutionError on timeout/ERROR, or StepCancelledError if cancellation
     # fires mid-wait.
     try:
-        await _wait_for_completion(terminal_id, timeout, cancel_event, prompt=prompt)
+        if dispatch_uncertainty is None:
+            await _wait_for_completion(terminal_id, timeout, cancel_event, prompt=prompt)
+        else:
+            await _wait_for_completion(
+                terminal_id,
+                timeout,
+                cancel_event,
+                prompt=None,
+                acceptance_probe=dispatch_uncertainty.acceptance_probe or (lambda: False),
+            )
+    except StepExecutionError:
+        if dispatch_uncertainty is not None:
+            # Do not turn an unknown outcome into a retryable workflow failure.
+            raise dispatch_uncertainty
+        raise
     except StepCancelledError:
         # A cancellation is NOT a run-failure. Tear down a terminal this call
         # created (best-effort — never let cleanup mask the cancellation), then

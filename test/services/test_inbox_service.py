@@ -11,6 +11,7 @@ from cli_agent_orchestrator.constants import INBOX_RECONCILE_GRACE_SECONDS
 from cli_agent_orchestrator.models.inbox import InboxMessage, MessageStatus
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.services.inbox_service import InboxService
+from cli_agent_orchestrator.services.terminal_service import InputAcceptanceUnconfirmedError
 
 
 def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageStatus.PENDING):
@@ -26,6 +27,31 @@ def _make_message(id=1, receiver_id="term-1", message="hello", status=MessageSta
 
 class TestDeliverPending:
     """Tests for InboxService.deliver_pending()."""
+
+    @pytest.mark.parametrize("registry", [None, MagicMock()])
+    def test_uncertain_acceptance_retains_dispatch_without_replay(self, registry, caplog):
+        status = {1: MessageStatus.PENDING}
+        with (
+            patch("cli_agent_orchestrator.services.inbox_service.get_pending_messages") as pending,
+            patch("cli_agent_orchestrator.services.inbox_service.status_monitor") as monitor,
+            patch("cli_agent_orchestrator.services.inbox_service.terminal_service") as terminals,
+            patch("cli_agent_orchestrator.services.inbox_service.update_message_status") as update,
+        ):
+            pending.side_effect = lambda *args, **kwargs: (
+                [_make_message()] if status[1] == MessageStatus.PENDING else []
+            )
+            update.side_effect = lambda message_id, value: status.update({message_id: value})
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            terminals.send_input.side_effect = InputAcceptanceUnconfirmedError("unconfirmed")
+            service = InboxService()
+            service.deliver_pending("term-1", registry=registry)
+            service.deliver_pending("term-1", registry=registry)
+
+        assert status[1] == MessageStatus.DELIVERED
+        update.assert_called_once_with(1, MessageStatus.DELIVERED)
+        terminals.send_input.assert_called_once()
+        assert "provider acceptance is unconfirmed" in caplog.text
+        assert "Retaining DELIVERED" in caplog.text
 
     @patch("cli_agent_orchestrator.services.inbox_service.update_message_status")
     @patch("cli_agent_orchestrator.services.inbox_service.terminal_service")

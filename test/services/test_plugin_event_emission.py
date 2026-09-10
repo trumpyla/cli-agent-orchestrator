@@ -384,7 +384,21 @@ class TestSessionPluginEvents:
         result = delete_session("cao-demo", registry=registry)
 
         assert any(e.get("step") == "delete_terminals_by_ids" for e in result["errors"])
-        assert [kind for kind, _ in dispatched] == ["post_kill_session"]
+        assert result["deleted"] == []
+        assert dispatched == []
+
+        # The retained row is retried after the backend is gone. Completion
+        # events belong to this successful attempt, exactly once.
+        mock_tmux.return_value.session_exists_strict.return_value = False
+        mock_db_delete.side_effect = None
+        mock_db_delete.return_value = True
+        mock_sweep.side_effect = None
+        mock_sweep.return_value = 0
+
+        retried = delete_session("cao-demo", registry=registry)
+
+        assert retried["deleted"] == ["cao-demo"]
+        assert [kind for kind, _ in dispatched] == ["post_kill_terminal", "post_kill_session"]
 
 
 class TestTerminalPluginEvents:

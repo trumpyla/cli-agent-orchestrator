@@ -319,7 +319,21 @@ class HerdrBackend(TerminalBackend):
             ["workspace", "close", workspace_id],
             check=False,
         )
-        return result.returncode == 0
+        if result.returncode != 0:
+            return False
+
+        for attempt in range(5):
+            try:
+                inventory = self.list_workspace_inventory()
+            except TerminalBackendError:
+                inventory = None
+            if inventory is not None and all(
+                workspace.workspace_id != workspace_id for workspace in inventory
+            ):
+                return True
+            if attempt < 4:
+                time.sleep(0.2)
+        return False
 
     def _resolve_workspace_id(self, session_name: str) -> str:
         """Resolve session_name (workspace label) to workspace ID.

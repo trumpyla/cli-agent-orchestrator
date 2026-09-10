@@ -35,7 +35,11 @@ from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.manager import provider_manager
 from cli_agent_orchestrator.services.fifo_reader import fifo_manager
 from cli_agent_orchestrator.services.status_monitor import status_monitor
-from cli_agent_orchestrator.services.terminal_service import create_terminal, send_input
+from cli_agent_orchestrator.services.terminal_service import (
+    InputAcceptanceUnconfirmedError,
+    create_terminal,
+    send_input,
+)
 from cli_agent_orchestrator.utils.template import render_template
 
 logger = logging.getLogger(__name__)
@@ -209,7 +213,7 @@ def _is_terminal_busy(terminal_id: str) -> bool:
 
 
 async def execute_flow(name: str) -> bool:
-    """Execute flow: run script, render prompt, launch session."""
+    """Run a flow; True records dispatch, not provider acceptance or completion."""
     try:
         logger.info(f"Executing flow: {name}")
         flow = get_flow(name)
@@ -305,7 +309,7 @@ async def execute_flow(name: str) -> bool:
                 # Do not bulk-delete DB rows if a Grok private home is still
                 # owned by a process we cannot safely inspect. Retained rows
                 # are the retry handle for a later terminal cleanup.
-                if provider_manager.cleanup_provider(t["id"]) is False:
+                if await asyncio.to_thread(provider_manager.cleanup_provider, t["id"]) is False:
                     cleanup_complete = False
             if not cleanup_complete:
                 logger.warning(
@@ -322,7 +326,12 @@ async def execute_flow(name: str) -> bool:
             # handle and could collide with the deterministic GROK_HOME path.
             cleanup_complete = True
             for terminal_metadata in terminals:
-                if provider_manager.cleanup_provider(terminal_metadata["id"]) is False:
+                if (
+                    await asyncio.to_thread(
+                        provider_manager.cleanup_provider, terminal_metadata["id"]
+                    )
+                    is False
+                ):
                     cleanup_complete = False
             if not cleanup_complete:
                 logger.warning("Flow %s has retained terminal cleanup; deferring next run", name)
@@ -343,7 +352,19 @@ async def execute_flow(name: str) -> bool:
         # so a slow tmux call can't freeze every other request (same hazard
         # class as issue #382, already fixed for POST /terminals/{id}/input
         # in api/main.py's send_terminal_input; this call site was missed).
-        await asyncio.to_thread(send_input, terminal.id, rendered_prompt)
+        try:
+            await asyncio.to_thread(send_input, terminal.id, rendered_prompt)
+        except InputAcceptanceUnconfirmedError:
+            # The transport send completed. Preserve the inspectable worker
+            # and distinguish uncertainty from a failed/pre-dispatch launch.
+            # next_run already denotes a new cron occurrence, not a retry.
+            logger.warning(
+                "Flow %s: input dispatched to terminal %s; provider acceptance unconfirmed "
+                "[outcome=dispatched_unconfirmed]. Inspect the worker before manual retry.",
+                name,
+                terminal.id,
+            )
+            return True
 
         logger.info(f"Flow {name}: launched session {session_name}")
         return True

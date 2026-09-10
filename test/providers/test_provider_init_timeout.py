@@ -314,13 +314,20 @@ class TestKimiInitTimeoutWiring:
     """
 
     @pytest.mark.asyncio
+    @patch.object(KimiCliProvider, "wait_until_input_ready", return_value=True)
     @patch.object(KimiCliProvider, "_handle_startup_dialog")
     @patch(f"{_KIMI}.load_agent_profile")
     @patch(f"{_KIMI}.wait_for_shell")
     @patch(f"{_KIMI}.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_profile_override_flows_to_startup_dialog_outer_timeout(
-        self, mock_backend, mock_wait_status, mock_wait_shell, mock_load, mock_handle
+        self,
+        mock_backend,
+        mock_wait_status,
+        mock_wait_shell,
+        mock_load,
+        mock_handle,
+        mock_wait_ready,
     ):
         """provider_init_timeout=180 reaches _handle_startup_dialog's outer_timeout kwarg."""
         mock_wait_shell.return_value = True
@@ -335,15 +342,23 @@ class TestKimiInitTimeoutWiring:
         # wait_until_status uses max(120, init_timeout) -- 180 wins here.
         assert mock_wait_status.call_args.kwargs["timeout"] == 180
         assert mock_wait_shell.call_args.kwargs["timeout"] == 180
+        mock_wait_ready.assert_awaited_once_with(timeout=180)
 
     @pytest.mark.asyncio
+    @patch.object(KimiCliProvider, "wait_until_input_ready", return_value=True)
     @patch(_SETTINGS, return_value={"provider_init_timeout": 60})
     @patch.object(KimiCliProvider, "_handle_startup_dialog")
     @patch(f"{_KIMI}.wait_for_shell")
     @patch(f"{_KIMI}.wait_until_status")
     @patch("cli_agent_orchestrator.backends.registry._backend")
     async def test_no_profile_uses_120s_floor_not_server_default(
-        self, mock_backend, mock_wait_status, mock_wait_shell, mock_handle, mock_settings
+        self,
+        mock_backend,
+        mock_wait_status,
+        mock_wait_shell,
+        mock_handle,
+        mock_settings,
+        mock_wait_ready,
     ):
         """No agent profile -> the 120s Kimi-specific floor wins over the 60s server default.
 
@@ -361,6 +376,7 @@ class TestKimiInitTimeoutWiring:
         assert mock_handle.call_args.kwargs["outer_timeout"] == 120.0
         assert mock_wait_status.call_args.kwargs["timeout"] == 120.0
         assert mock_wait_shell.call_args.kwargs["timeout"] == 60
+        mock_wait_ready.assert_awaited_once_with(timeout=120.0)
 
     @pytest.mark.asyncio
     @patch.object(KimiCliProvider, "_handle_startup_dialog")

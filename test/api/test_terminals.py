@@ -18,6 +18,19 @@ from cli_agent_orchestrator.models.terminal import Terminal
 class TestWorkingDirectoryEndpoint:
     """Test GET /terminals/{terminal_id}/working-directory endpoint."""
 
+    def test_input_uncertainty_is_explicit_conflict(self, client):
+        from cli_agent_orchestrator.services.terminal_service import InputAcceptanceUnconfirmedError
+
+        detail = "Input dispatched; acceptance unconfirmed. Do not retry without inspection."
+        with patch(
+            "cli_agent_orchestrator.api.main.terminal_service.send_input",
+            side_effect=InputAcceptanceUnconfirmedError(detail),
+        ) as dispatch:
+            response = client.post("/terminals/abcd1234/input", params={"message": "task"})
+        assert response.status_code == 409
+        assert response.json() == {"detail": detail}
+        dispatch.assert_called_once()
+
     def test_get_working_directory_success(self, client):
         """Test successful retrieval of working directory."""
         with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:

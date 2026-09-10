@@ -42,7 +42,9 @@ portable and make profile listings useful.
 - `skills` (array of strings): exact names or case-sensitive
   [`fnmatch`](https://docs.python.org/3/library/fnmatch.html) patterns limiting
   the advertised skill catalog. Omit it for the full catalog; use `[]` for
-  none.
+  none. Codex `plan` and `acceptEdits` preload the selected skills' full content
+  before launch because their approval policy prevents runtime skill loading.
+  Missing, invalid, or empty explicitly selected skills fail launch.
 - `container.path_maps` (array of `{host, guest}` objects): host-to-guest path
   translations for provider files used inside a container.
 - `provider_init_timeout` (integer, seconds): per-profile provider
@@ -53,8 +55,20 @@ portable and make profile listings useful.
 
 - `mcpServers` (object): MCP server definitions. Each entry defines either
   `command` (with optional `args`, `env`, `timeout`) for a server CAO launches,
-  or `url` for a remote one, with `type` naming its transport (for example
-  `http` or `sse`). An entry defining neither is invalid.
+  or `url` for a remote one with an explicit `type: http` or legacy `type: sse`.
+  These forms are exclusive: remote entries cannot contain subprocess fields
+  (`command`, `args`, `env`, `timeout`) or custom `headers`. CAO supplies its own
+  managed authentication only for its configured HTTP host and port at
+  `/mcp/ops`. The server's resolved `--host` and `--port` take precedence;
+  bind-all hosts `0.0.0.0` and `::` use client hosts `127.0.0.1` and `::1`.
+  Other loopback addresses and DNS aliases do not inherit the credential.
+  An entry defining neither transport is
+  invalid. Provider translation determines which remote transports it supports.
+  Claude Code preserves `type: sse` using its
+  [native SSE configuration](https://code.claude.com/docs/en/agent-sdk/mcp#http/sse-servers).
+  Grok preserves the configured transport. CAO currently rejects SSE for Codex,
+  Antigravity, and Kimi because their CAO adapters have no verified native SSE
+  mapping; it does not silently convert SSE to streamable HTTP.
 - `tools` (array), `toolAliases` (object), and `toolsSettings` (object):
   provider tool configuration.
 - `resources` (array), `hooks` (object), and `useLegacyMcpJson` (boolean):
@@ -70,6 +84,25 @@ portable and make profile listings useful.
 - `native_agent` (string): Claude Code native-agent name.
 - `codexProfile` (string): named Codex configuration profile.
 - `codexConfig` (object): inline Codex configuration overrides.
+  Codex MCP servers receive `default_tools_approval_mode: prompt` unless
+  `permissionMode` is explicitly `bypassPermissions`. Other modes reject inline
+  MCP approval overrides other than `prompt`, including per-tool overrides.
+  MCP operations can change remote state outside Codex's filesystem sandbox.
+  `plan` and `acceptEdits` workers can auto-approve `send_message` on the
+  managed stdio CAO server when `allowedTools` explicitly grants that configured
+  server (`@cao-mcp-server`) or its exact `mcp__cao-mcp-server__send_message` tool
+  and the effective tool permissions still allow it. The entry must use the
+  bare `cao-mcp-server` command without arguments or environment overrides,
+  resolved to the current installation. Custom commands, HTTP endpoints,
+  PATH-only fallbacks, and wildcard-only grants do not receive this exception.
+  Managed `assign` and `handoff` are approved only when each exact token
+  (`mcp__cao-mcp-server__assign` or `mcp__cao-mcp-server__handoff`) appears in
+  both the profile's `allowedTools` and effective permission list. A broad
+  server grant or wildcard does not grant fanout. The shipped Codex supervisor
+  profiles explicitly declare these two tools; reviewer profiles remain
+  callback-only. Other CAO tools retain `prompt` behavior.
+  This controls CAO-generated settings; existing user-level per-tool approval
+  rules remain subject to Codex's native configuration precedence.
 - `claudeConfig` (object): inline Claude Code launch flags; `{"effort":
   "<low|medium|high|xhigh>"}` maps to `--effort <level>` and
   `{"fallback_model": "<model>"}` to `--fallback-model <model>`. The Claude

@@ -26,6 +26,7 @@ Status Detection Strategy:
 """
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -40,6 +41,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
+from cli_agent_orchestrator.constants import CAO_HOME_DIR
 from cli_agent_orchestrator.models.mcp_server import (
     HttpMcpServer,
     McpConfigError,
@@ -161,6 +163,21 @@ UPGRADE_PROMPT_PATTERN = r"Skip reminders for version|Upgrade now"
 # enables project MCP servers and unblocks the REPL.
 TRUST_FOLDER_PATTERN = r"Trust this folder\?|Enable project MCP servers"
 
+
+def _has_active_trust_dialog(output: str) -> bool:
+    """Match dialog chrome, ignoring prose and dialogs superseded by ready chrome."""
+    lines = output.splitlines()
+    for index in range(len(lines) - 1, -1, -1):
+        line = lines[index].strip()
+        if re.search(NEW_TUI_STATUS_PATTERN, line) or re.search(
+            IDLE_PROMPT_PATTERN + r"\s*$", line
+        ):
+            return False
+        if re.fullmatch(TRUST_FOLDER_PATTERN, line):
+            return True
+    return False
+
+
 # User input box boundaries (pre-v1.20.0). Kimi displayed user messages in a bordered box:
 #   ╭──────────────────────────────╮
 #   │ user message text             │
@@ -251,7 +268,7 @@ def _is_startup_output_ready(output: str) -> bool:
     if re.search(ERROR_PATTERN, clean_output, re.MULTILINE):
         return False
 
-    if re.search(TRUST_FOLDER_PATTERN, clean_output):
+    if _has_active_trust_dialog(clean_output):
         return False
 
     lines = clean_output.splitlines()
@@ -320,12 +337,14 @@ class KimiCliProvider(BaseProvider):
         """Initialize provider state."""
         super().__init__(terminal_id, session_name, window_name, allowed_tools, skill_prompt)
         self._initialized = False
+        self._trust_handled: bool = False
         self._agent_profile = agent_profile
         self._working_directory = working_directory
         # Explicit per-call override for profile.model, see initialize().
         self._model = model
         # Track temp directory for cleanup (created when agent profile needs temp files)
         self._temp_dir: Optional[str] = None
+        self._runtime_root = Path(CAO_HOME_DIR) / "kimi-runtime"
         # Kimi 0.29 only accepts --agent/--agent-file in its v2 non-interactive
         # engine. CAO uses the interactive TUI, so profile instructions are
         # deferred and prepended to the first delivered task instead.
@@ -393,6 +412,48 @@ class KimiCliProvider(BaseProvider):
             return False
         self._first_message_prefix = None
         return True
+
+    @property
+    def has_pending_profile_prompt(self) -> bool:
+        return bool(self._first_message_prefix)
+
+    def capture_delivery_baseline(self) -> str:
+        """Capture before dispatch so retained transcript cannot prove acceptance."""
+        output = get_backend().get_history(
+            self.session_name, self.window_name, tail_lines=200, strip_escapes=True
+        )
+        if not isinstance(output, str):
+            raise ProviderError("Kimi delivery capture unavailable")
+        return strip_terminal_escapes(output)
+
+    def confirm_input_accepted(self, baseline: str, message: str, timeout: float = 8.0) -> bool:
+        """Require fresh rendered response evidence, never synthetic dispatch status.
+
+        The pasted input can redraw ready chrome or echo response-like text. Neither
+        proves submission. Exclude both the prior transcript and submitted lines;
+        only a fresh assistant bullet or live turn spinner can commit the prefix.
+        No resend occurs here because a capture failure leaves acceptance uncertain.
+        """
+        excluded = {line.strip() for line in (baseline + "\n" + message).splitlines()}
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                output = self.capture_delivery_baseline()
+            except Exception:
+                return False
+            if not _has_active_trust_dialog(output):
+                for line in output.splitlines():
+                    if line.strip() in excluded or line.strip() in message:
+                        continue
+                    if re.match(r"\s*[•●]\s", line) or (
+                        re.match(r"\s*(?:" + NEW_TUI_SPINNER_PATTERN + ")", line)
+                        and _is_live_turn_spinner_line(line)
+                    ):
+                        return True
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(0.25, remaining))
 
     def _compose_first_message_prefix(self, profile) -> Optional[str]:
         """Build the interactive profile contract prepended to Kimi's first task."""
@@ -519,7 +580,7 @@ class KimiCliProvider(BaseProvider):
         # Kimi CLI v1.20.0+ has a per-directory single-instance lock, so each
         # provider instance needs its own working directory.
         if not self._temp_dir:
-            self._temp_dir = tempfile.mkdtemp(prefix="cao_kimi_")
+            self._temp_dir = str(self._prepare_runtime_directory())
         # The cwd the launch command below ``cd``s into, and the directory whose
         # ``.kimi-code/mcp.json`` Kimi will therefore discover.
         launch_cwd = self._temp_dir
@@ -587,7 +648,7 @@ class KimiCliProvider(BaseProvider):
                             # args, env, or CAO_TERMINAL_ID.
                             url = resolve_http_url(entry.url, env_snapshot, server_name=server_name)
                             mcp_config[server_name] = render_http_entry(
-                                "kimi_cli", url, env=env_snapshot
+                                "kimi_cli", url, transport=entry.type, env=env_snapshot
                             )
                             continue
 
@@ -772,19 +833,19 @@ class KimiCliProvider(BaseProvider):
             if output:
                 clean_output = re.sub(ANSI_CODE_PATTERN, "", output)
                 # Answer the trust-folder dialog once; default option is "Trust this folder".
-                if not trust_handled and re.search(TRUST_FOLDER_PATTERN, clean_output):
+                if not trust_handled and _has_active_trust_dialog(clean_output):
                     from cli_agent_orchestrator.services.status_monitor import status_monitor
 
                     logger.info("Kimi trust-folder dialog detected, selecting Trust this folder")
                     status_monitor.notify_input_sent(self.terminal_id)
                     await asyncio.to_thread(
-                        get_backend().send_keys,
+                        get_backend().send_special_key,
                         self.session_name,
                         self.window_name,
-                        "",
-                        enter_count=1,
+                        "Enter",
                     )
                     trust_handled = True
+                    self._trust_handled = True
                     any_prompt_handled = True
                     last_prompt_time = time.monotonic()
                     await asyncio.sleep(1.0)
@@ -881,7 +942,8 @@ class KimiCliProvider(BaseProvider):
         ):
             raise TimeoutError(f"Kimi CLI initialization timed out after {ready_timeout} seconds")
 
-        await self.wait_until_input_ready(timeout=ready_timeout)
+        if not await self.wait_until_input_ready(timeout=ready_timeout):
+            raise ProviderError(f"Kimi CLI input surface not ready after {ready_timeout} seconds")
 
         self._initialized = True
         return True
@@ -916,7 +978,7 @@ class KimiCliProvider(BaseProvider):
                 continue
 
             if not isinstance(current, str):
-                return True
+                return False
 
             clean = strip_terminal_escapes(current)
             lines = clean.splitlines()
@@ -983,7 +1045,7 @@ class KimiCliProvider(BaseProvider):
 
         lines = clean_output.splitlines()
 
-        if re.search(TRUST_FOLDER_PATTERN, clean_output):
+        if not self._trust_handled and _has_active_trust_dialog(clean_output):
             return TerminalStatus.PROCESSING
 
         # Boot gate: while MCP servers are connecting, treat as PROCESSING
@@ -1178,7 +1240,7 @@ class KimiCliProvider(BaseProvider):
         # since the boot gate precedes the ready check and re-fires on every
         # settled frame, the inbox (delivers only on IDLE/COMPLETED) would then
         # never deliver to that terminal.
-        if re.search(TRUST_FOLDER_PATTERN, joined):
+        if not self._trust_handled and _has_active_trust_dialog(joined):
             return TerminalStatus.PROCESSING
 
         if any(
@@ -1508,18 +1570,119 @@ class KimiCliProvider(BaseProvider):
             )
             return {}
 
-    def cleanup(self) -> None:
+    def _runtime_directory(self) -> Path:
+        """Derive restart-discoverable ownership without scanning temporary folders."""
+        return self._runtime_root / hashlib.sha256(self.terminal_id.encode()).hexdigest()
+
+    @staticmethod
+    def _private_directory(path: Path) -> bool:
+        info = path.lstat()
+        return (
+            stat.S_ISDIR(info.st_mode)
+            and info.st_uid == os.geteuid()
+            and stat.S_IMODE(info.st_mode) == 0o700
+        )
+
+    def _prepare_runtime_directory(self) -> Path:
+        root = self._runtime_root
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        if not self._private_directory(root):
+            raise ProviderError("Kimi runtime root is not a private owned directory")
+        target = self._runtime_directory()
+        marker = root / (target.name + ".owner")
+        # Never claim an existing directory by adding ownership after the fact.
+        if target.exists() or target.is_symlink():
+            if not self._owns_runtime_directory(target):
+                raise ProviderError("Kimi runtime directory ownership is unverified")
+            return target
+
+        try:
+            # Publish and sync complete ownership before creating the directory.
+            # link() publishes without overwriting an existing ownership marker.
+            # A crash before publication can leave only an empty/non-secret
+            # staging file, never an unowned profile/MCP directory.
+            try:
+                with tempfile.NamedTemporaryFile(mode="w", dir=root, prefix=".owner-") as stream:
+                    stream.write(self.terminal_id)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                    os.link(stream.name, marker)
+            except FileExistsError:
+                if not self._owns_runtime_marker(target):
+                    raise ProviderError("Kimi runtime ownership marker is unverified")
+            root_fd = os.open(root, os.O_RDONLY)
+            try:
+                os.fsync(root_fd)
+            finally:
+                os.close(root_fd)
+            try:
+                target.mkdir(mode=0o700)
+            except FileExistsError:
+                if not self._owns_runtime_directory(target):
+                    raise ProviderError("Kimi runtime directory ownership is unverified")
+        except OSError as exc:
+            raise ProviderError("Kimi runtime ownership preparation failed") from exc
+        return target
+
+    def _owns_runtime_directory(self, target: Path) -> bool:
+        try:
+            return (
+                target == self._runtime_directory()
+                and self._private_directory(target)
+                and self._owns_runtime_marker(target)
+            )
+        except OSError:
+            return False
+
+    def _owns_runtime_marker(self, target: Path) -> bool:
+        marker = self._runtime_root / (target.name + ".owner")
+        try:
+            info = marker.lstat()
+            return (
+                stat.S_ISREG(info.st_mode)
+                and info.st_uid == os.geteuid()
+                and stat.S_IMODE(info.st_mode) == 0o600
+                and marker.read_text() == self.terminal_id
+            )
+        except (OSError, UnicodeError):
+            return False
+
+    def cleanup(self) -> bool:
         """Clean up Kimi CLI provider resources.
 
         Removes any temporary files created for agent profiles
         and resets the initialization state. MCP timeout is NOT restored
         because multiple Kimi instances may share the config file concurrently.
         """
-        # Remove temp directory if it was created for agent profile
-        if self._temp_dir:
-            if os.path.exists(self._temp_dir):
-                shutil.rmtree(self._temp_dir, ignore_errors=True)
-            self._temp_dir = None
+        # A reconstructed provider has no in-memory path. Derive only its exact
+        # managed child; never infer ownership of legacy random cao_kimi_* dirs.
+        target = self._runtime_directory()
+        try:
+            if self._temp_dir and Path(self._temp_dir) != target:
+                return False
+            if self._runtime_root.exists() or self._runtime_root.is_symlink():
+                if not self._private_directory(self._runtime_root):
+                    return False
+                if target.exists() or target.is_symlink():
+                    if not self._owns_runtime_directory(target):
+                        return False
+                    shutil.rmtree(target)
+                marker = self._runtime_root / (target.name + ".owner")
+                if marker.exists() or marker.is_symlink():
+                    info = marker.lstat()
+                    if (
+                        not stat.S_ISREG(info.st_mode)
+                        or info.st_uid != os.geteuid()
+                        or stat.S_IMODE(info.st_mode) != 0o600
+                        or marker.read_text() != self.terminal_id
+                    ):
+                        return False
+                    marker.unlink()
+        except OSError:
+            logger.warning("Kimi runtime cleanup incomplete for terminal %s", self.terminal_id)
+            return False
+        self._temp_dir = None
 
         self._initialized = False
         self._has_received_input = False
+        return True

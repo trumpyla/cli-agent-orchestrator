@@ -40,6 +40,9 @@ counter, since the TUI looks identical in both states).
 """
 
 import asyncio
+import fcntl
+import functools
+import hashlib
 import json
 import logging
 import os
@@ -48,8 +51,10 @@ import shlex
 import shutil
 import stat
 import subprocess
+import tempfile
 import threading
 import time
+from contextlib import contextmanager
 from pathlib import Path
 from typing import List, Optional
 
@@ -90,9 +95,11 @@ _MCP_CONFIG_WRITE_LOCK = threading.Lock()
 
 def _log_cleanup_exception(fut: asyncio.Future) -> None:
     """Done-callback for the offloaded _unregister_mcp_servers future."""
+    if fut.cancelled():
+        return
     exc = fut.exception()
     if exc is not None:
-        logger.error("_unregister_mcp_servers raised during cleanup: %s", exc, exc_info=exc)
+        logger.error("_unregister_mcp_servers cleanup deferred [error_type=%s]", type(exc).__name__)
 
 
 # Antigravity native permission modes: a profile ``permissionMode`` maps to an
@@ -100,6 +107,7 @@ def _log_cleanup_exception(fut: asyncio.Future) -> None:
 _ANTIGRAVITY_NATIVE_MODES = {"plan": "plan", "acceptEdits": "accept-edits"}
 
 
+@functools.lru_cache(maxsize=4)
 def _agy_supported_modes(binary: str = "agy") -> frozenset:
     """Probe the installed ``agy`` for the native ``--mode`` values it accepts.
 
@@ -275,6 +283,7 @@ class AntigravityCliProvider(BaseProvider):
         # MCP server names registered into ~/.gemini/config/mcp_config.json,
         # removed on cleanup().
         self._mcp_server_names: list[str] = []
+        self._mcp_cleanup_future: Optional[asyncio.Future] = None
         # Turn counter. get_status() returns IDLE while _turns == 0 (fresh
         # spawn / post-init, no task delivered yet) and COMPLETED once at least
         # one turn has been delivered and the agent is back to a ready footer.
@@ -348,8 +357,55 @@ class AntigravityCliProvider(BaseProvider):
         """Path to CAO's private ownership sidecar for an agy MCP config."""
         return Path(f"{path}.cao-ownership")
 
+    @staticmethod
+    @contextmanager
+    def _mcp_config_lock(path: Path):
+        """Serialize CAO writers across threads and daemon processes."""
+        with _MCP_CONFIG_WRITE_LOCK:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(f"{path}.cao-lock", os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                os.close(fd)
+
     def _load_mcp_ownership(self, path: Path) -> dict[str, str]:
         """Read valid CAO MCP ownership without trusting malformed sidecars."""
+        # A write-ahead record survives a missing legacy sidecar. Fingerprints
+        # ensure an entry replaced by the user is never attributed by name alone.
+        try:
+            with open(path, encoding="utf-8") as file_object:
+                config = json.load(file_object)
+            journal_path = Path(f"{path}.cao-ownership-journal")
+            if journal_path.exists():
+                with open(journal_path, encoding="utf-8") as file_object:
+                    records = json.load(file_object)
+                if not isinstance(records, list):
+                    raise OSError("invalid CAO ownership journal")
+                servers = config.get("mcpServers", {}) if isinstance(config, dict) else {}
+                owners = {}
+                for record in records:
+                    if not isinstance(record, dict) or not all(
+                        isinstance(record.get(key), str) and record[key]
+                        for key in ("name", "owner", "digest")
+                    ):
+                        raise OSError("invalid CAO ownership journal record")
+                    name = record["name"]
+                    if (
+                        isinstance(servers, dict)
+                        and name in servers
+                        and (self._mcp_entry_digest(servers[name]) == record["digest"])
+                    ):
+                        if name in owners and owners[name] != record["owner"]:
+                            raise OSError("ambiguous CAO ownership journal")
+                        owners[name] = record["owner"]
+                return owners
+        except FileNotFoundError:
+            pass
+        except json.JSONDecodeError as exc:
+            if Path(f"{path}.cao-ownership-journal").exists():
+                raise OSError("invalid CAO ownership transaction") from exc
         ownership_path = self._mcp_ownership_path(path)
         if not ownership_path.exists():
             return {}
@@ -375,6 +431,55 @@ class AntigravityCliProvider(BaseProvider):
             logger.warning("Ignoring invalid entries in MCP ownership sidecar %s", ownership_path)
         return valid
 
+    @staticmethod
+    def _mcp_entry_digest(entry: object) -> str:
+        return hashlib.sha256(
+            json.dumps(entry, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _publish_mcp_config(self, path: Path, config: dict, owners: dict[str, str]) -> None:
+        """Record both sides of a transaction before publishing any entries.
+
+        A crash at any write boundary leaves ownership for whichever config
+        version is visible. The journal contains hashes, never bearer payloads.
+        """
+        records = []
+        if path.exists():
+            try:
+                with open(path, encoding="utf-8") as file_object:
+                    old_config = json.load(file_object)
+            except json.JSONDecodeError:
+                old_config = {}
+            old_servers = old_config.get("mcpServers", {}) if isinstance(old_config, dict) else {}
+            if isinstance(old_servers, dict):
+                for name, owner in self._load_mcp_ownership(path).items():
+                    if name in old_servers:
+                        records.append(
+                            {
+                                "name": name,
+                                "owner": owner,
+                                "digest": self._mcp_entry_digest(old_servers[name]),
+                            }
+                        )
+        for name, owner in owners.items():
+            if name in config.get("mcpServers", {}):
+                records.append(
+                    {
+                        "name": name,
+                        "owner": owner,
+                        "digest": self._mcp_entry_digest(config["mcpServers"][name]),
+                    }
+                )
+        atomic_write_text(Path(f"{path}.cao-ownership-journal"), json.dumps(records, indent=2))
+        # Make the journal rename durable before the config may expose entries.
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        self._write_mcp_config(path, config)
+        self._write_mcp_ownership(path, owners)
+
     def _write_mcp_ownership(self, path: Path, owners: dict[str, str]) -> None:
         """Atomically persist the owner-only CAO MCP ownership sidecar."""
         ownership_path = self._mcp_ownership_path(path)
@@ -382,6 +487,38 @@ class AntigravityCliProvider(BaseProvider):
             ownership_path,
             json.dumps({"version": 1, "owners": dict(sorted(owners.items()))}, indent=2),
         )
+
+    @staticmethod
+    def _write_mcp_config(path: Path, config: dict) -> None:
+        """Atomically publish an owner-only Antigravity MCP config."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = None
+        fd = -1
+        try:
+            fd, tmp_name = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+            tmp_path = Path(tmp_name)
+            os.fchmod(fd, 0o600)
+            if stat.S_IMODE(os.fstat(fd).st_mode) != 0o600:
+                raise OSError("private mode not enforced")
+            with open(fd, "w") as f:
+                fd = -1  # the file object owns and closes the descriptor
+                json.dump(config, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp_path.chmod(0o600)
+            if stat.S_IMODE(tmp_path.stat().st_mode) != 0o600:
+                raise OSError("private mode not enforced")
+            os.replace(tmp_path, path)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            try:
+                if tmp_path is not None:
+                    tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                logger.warning("Could not remove temporary Antigravity MCP config: %s", exc)
 
     def _resolve_native_mode(self, profile: Optional["object"]) -> Optional[str]:
         """Map a profile ``permissionMode`` to a validated native ``agy --mode``.
@@ -491,12 +628,11 @@ class AntigravityCliProvider(BaseProvider):
         method in N threads at once -- ``_MCP_CONFIG_WRITE_LOCK`` (shared with
         ``_unregister_mcp_servers``) serializes the read-modify-write so one
         thread's write can never clobber another's concurrently-registered
-        entry. In-process only: a second cao-server process, or agy itself,
-        writing between our read and write is still a last-writer-wins lost
-        update.
+        entry. An advisory file lock also serializes cooperating CAO processes.
+        Agy or manual writers that ignore that lock may still race a write.
         """
         path = self._mcp_config_path()
-        with _MCP_CONFIG_WRITE_LOCK:
+        with self._mcp_config_lock(path):
             config_loaded_cleanly = True
             try:
                 if path.exists() and path.stat().st_size > 0:
@@ -534,9 +670,11 @@ class AntigravityCliProvider(BaseProvider):
             # GC: prune entries left by terminals that crashed/were killed
             # without a graceful cleanup(). We're already holding the lock and
             # about to write — cheap to check liveness now.
-            if config_loaded_cleanly:
-                self._prune_stale_mcp_entries(servers)
             owners = self._load_mcp_ownership(path)
+            if config_loaded_cleanly:
+                pruned_owners = self._prune_stale_mcp_entries(servers)
+                if isinstance(pruned_owners, dict):
+                    owners = pruned_owners
             env_snapshot = snapshot_process_env()
             requires_private_config = False
 
@@ -544,7 +682,9 @@ class AntigravityCliProvider(BaseProvider):
                 parsed = parse_mcp_server_entry(server_config, server_name=server_name)
                 if isinstance(parsed, HttpMcpServer):
                     url = resolve_http_url(parsed.url, env_snapshot, server_name=server_name)
-                    entry = render_http_entry("antigravity_cli", url, env=env_snapshot)
+                    entry = render_http_entry(
+                        "antigravity_cli", url, transport=parsed.type, env=env_snapshot
+                    )
                     requires_private_config = requires_private_config or bool(
                         (entry.get("headers") or {}).get("Authorization")
                     )
@@ -573,41 +713,21 @@ class AntigravityCliProvider(BaseProvider):
 
             # Agy has no documented header environment expansion, so an
             # authenticated local CAO Ops entry contains a literal bearer.
-            # Establish and verify private permissions before writing that
-            # token to the shared config.
-            if requires_private_config:
-                created_probe = not path.exists()
-                try:
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    if created_probe:
-                        path.touch(mode=0o600)
-                    path.chmod(0o600)
-                    if stat.S_IMODE(path.stat().st_mode) != 0o600:
-                        raise OSError("private mode not enforced")
-                except OSError as exc:
-                    if created_probe:
-                        try:
-                            if path.exists() and path.stat().st_size == 0:
-                                path.unlink()
-                        except OSError:
-                            pass
+            # Every managed config write is private, including profiles that
+            # currently contain only local stdio servers.
+            try:
+                self._publish_mcp_config(path, config, owners)
+            except OSError as exc:
+                if requires_private_config:
                     raise McpConfigError(
-                        "could not establish private Antigravity MCP config; "
-                        "refusing to write local bearer"
+                        "could not complete private Antigravity MCP config transaction"
                     ) from exc
+                raise
 
-            tmp_path = path.with_suffix(".json.tmp")
-            with open(tmp_path, "w") as f:
-                json.dump(config, f, indent=2)
-            if path.exists():
-                os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
-            os.replace(tmp_path, path)
-            self._write_mcp_ownership(path, owners)
-
-    def _unregister_mcp_servers(self) -> None:
+    def _unregister_mcp_servers(self) -> bool:
         """Remove the MCP servers this provider registered.
 
-        Scheduled via ``loop.run_in_executor`` (fire-and-forget) from
+        Scheduled via a retained ``loop.run_in_executor`` future from
         ``cleanup()`` when called on the event-loop thread, or run inline
         when already on a worker thread. Shares ``_MCP_CONFIG_WRITE_LOCK``
         with ``_register_mcp_servers`` so this can't interleave with another
@@ -619,11 +739,19 @@ class AntigravityCliProvider(BaseProvider):
         removed. Rehydrate names from the sidecar and legacy env fields so a
         provider reconstructed after a daemon restart can still clean up.
         Entries belonging to a newer terminal are left intact, making
-        fire-and-forget scheduling safe regardless of executor ordering.
+        deferred scheduling safe regardless of executor ordering. Failures
+        retain names and return False so lifecycle cleanup can retry.
         """
         path = self._mcp_config_path()
-        with _MCP_CONFIG_WRITE_LOCK:
-            owners = self._load_mcp_ownership(path)
+        with self._mcp_config_lock(path):
+            ownership_failed = False
+            try:
+                owners = self._load_mcp_ownership(path)
+            except OSError:
+                # Independently marked stdio entries are still attributable.
+                # Preserve ambiguous entries and the broken journal for retry.
+                owners = {}
+                ownership_failed = True
             names = set(self._mcp_server_names)
             names.update(
                 name for name, terminal_id in owners.items() if terminal_id == self.terminal_id
@@ -637,10 +765,11 @@ class AntigravityCliProvider(BaseProvider):
                             removed_sidecar = True
                     if removed_sidecar:
                         self._write_mcp_ownership(path, owners)
-                    return
+                    self._mcp_server_names = []
+                    return True
                 with open(path) as f:
                     config = json.load(f)
-                servers = config.get("mcpServers") if isinstance(config, dict) else None
+                servers = config.get("mcpServers", {}) if isinstance(config, dict) else None
                 if isinstance(servers, dict):
                     for name, entry in servers.items():
                         env = entry.get("env", {}) if isinstance(entry, dict) else {}
@@ -662,18 +791,28 @@ class AntigravityCliProvider(BaseProvider):
                         owners.pop(name, None)
                         removed_any = True
                     if removed_any:
-                        tmp_path = path.with_suffix(".json.tmp")
-                        with open(tmp_path, "w") as f:
-                            json.dump(config, f, indent=2)
-                        os.chmod(tmp_path, stat.S_IMODE(os.stat(path).st_mode))
-                        os.replace(tmp_path, path)
-                        self._write_mcp_ownership(path, owners)
-            except (json.JSONDecodeError, OSError) as exc:
-                logger.warning("Failed to unregister MCP servers from %s: %s", path, exc)
-            finally:
-                # Always clear our state so a malformed config can never leave
-                # stale names behind and block terminal teardown.
+                        if ownership_failed:
+                            self._write_mcp_config(path, config)
+                        else:
+                            self._publish_mcp_config(path, config, owners)
+                # A sibling's explicit owner marker proves it is not ours.
+                # Unmarked entries remain ambiguous when the journal is broken.
+                if ownership_failed and isinstance(servers, dict):
+                    for entry in servers.values():
+                        env = entry.get("env", {}) if isinstance(entry, dict) else {}
+                        owner = env.get("CAO_TERMINAL_ID") if isinstance(env, dict) else None
+                        if not isinstance(owner, str) or not owner or owner == self.terminal_id:
+                            logger.warning(
+                                "Antigravity MCP cleanup deferred: ownership unavailable"
+                            )
+                            return False
                 self._mcp_server_names = []
+                return True
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning(
+                    "Antigravity MCP cleanup deferred [error_type=%s]", type(exc).__name__
+                )
+                return False
 
     def _prune_stale_mcp_entries(self, servers: dict) -> dict[str, str]:
         """Remove entries whose CAO owner no longer maps to a live terminal.
@@ -701,7 +840,6 @@ class AntigravityCliProvider(BaseProvider):
             owners.pop(key, None)
         if stale_keys:
             logger.info("Pruned %d stale MCP config entries: %s", len(stale_keys), stale_keys)
-        self._write_mcp_ownership(path, owners)
         return owners
 
     async def _handle_startup_dialog(
@@ -897,7 +1035,12 @@ class AntigravityCliProvider(BaseProvider):
         deadline = time.monotonic() + timeout
         consecutive_ready = 0
         capture_failures = 0
+        capture_attempts = 0
+        capture_error_count = 0
+        ready_captures = 0
+        not_ready_captures = 0
         while time.monotonic() < deadline:
+            capture_attempts += 1
             try:
                 backend = get_backend()
                 current = await asyncio.to_thread(
@@ -908,7 +1051,12 @@ class AntigravityCliProvider(BaseProvider):
                 )
             except Exception as exc:
                 capture_failures += 1
-                logger.warning("Antigravity input-ready capture failed: %s", exc)
+                capture_error_count += 1
+                logger.warning(
+                    "Antigravity input-ready capture failed "
+                    "[code=AGY_INPUT_CAPTURE_ERROR error_type=%s]",
+                    type(exc).__name__,
+                )
                 consecutive_ready = 0
                 if capture_failures >= 3:
                     logger.error(
@@ -924,18 +1072,25 @@ class AntigravityCliProvider(BaseProvider):
             capture_failures = 0
             clean = strip_terminal_escapes(current or "")
             if _has_ready_input_surface(clean):
+                ready_captures += 1
                 consecutive_ready += 1
                 if consecutive_ready >= 2:
                     return True
             else:
+                not_ready_captures += 1
                 consecutive_ready = 0
             await asyncio.sleep(poll_interval)
 
         logger.warning(
-            "Antigravity input surface did not settle within %.1fs for %s; last capture: %r",
+            "Antigravity input surface did not settle within %.1fs for %s "
+            "[code=AGY_INPUT_READY_TIMEOUT captures=%d ready=%d not_ready=%d "
+            "capture_errors=%d]",
             timeout,
             self.terminal_id,
-            clean if "clean" in locals() else None,
+            capture_attempts,
+            ready_captures,
+            not_ready_captures,
+            capture_error_count,
         )
         return False
 
@@ -1181,7 +1336,7 @@ class AntigravityCliProvider(BaseProvider):
         """Get the command to exit agy. ``/quit`` is the slash command."""
         return "/quit"
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> bool:
         """Remove the MCP servers this provider registered and reset state.
 
         _unregister_mcp_servers acquires _MCP_CONFIG_WRITE_LOCK and does file
@@ -1191,20 +1346,39 @@ class AntigravityCliProvider(BaseProvider):
         on the event-loop thread — mirroring how _register_mcp_servers is
         already offloaded via asyncio.to_thread in initialize().
         """
+        if self._mcp_cleanup_future is not None:
+            if not self._mcp_cleanup_future.done():
+                return False
+            future = self._mcp_cleanup_future
+            self._mcp_cleanup_future = None
+            try:
+                completed = future.result()
+            except (Exception, asyncio.CancelledError):
+                return False
+            if completed is False:
+                return False
+            self._initialized = False
+            return True
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             loop = None
         if loop and loop.is_running():
             # On the event-loop thread — offload blocking I/O + lock to a worker.
-            # Retain the future so exceptions are surfaced (not silently swallowed).
-            fut = loop.run_in_executor(None, self._unregister_mcp_servers)
-            fut.add_done_callback(_log_cleanup_exception)
+            # Return pending to the manager until a later call observes success.
+            self._mcp_cleanup_future = loop.run_in_executor(None, self._unregister_mcp_servers)
+            self._mcp_cleanup_future.add_done_callback(_log_cleanup_exception)
+            return False
         else:
             # Already on a worker thread (e.g. api delete_terminal path) — safe
             # to run inline.
-            self._unregister_mcp_servers()
+            try:
+                if self._unregister_mcp_servers() is False:
+                    return False
+            except Exception:
+                return False
         self._initialized = False
+        return True
 
     def mark_input_received(self) -> None:
         """Record that a turn was delivered (IDLE → COMPLETED on next status)."""

@@ -148,6 +148,10 @@ class DeliveryError(RuntimeError):
     stranding the terminal on a silent failure.
     """
 
+    def __init__(self, message: str, *, retryable: bool = True) -> None:
+        super().__init__(message)
+        self.retryable = retryable
+
 
 # Per-terminal delivery lock with reference counting. Incremented before any
 # await (loop-atomic with get/create) so queued waiters keep the entry alive;
@@ -531,6 +535,13 @@ class AgentHandoffWithApproval(AguiConstruct):
             if interrupt.resolved:
                 return interrupt
 
+            if interrupt.metadata.get("delivery_status") == "dispatched_unconfirmed":
+                raise DeliveryError(
+                    "Answer already dispatched; provider acceptance unconfirmed. "
+                    "Inspect the terminal; resubmission is disabled to prevent duplicates.",
+                    retryable=False,
+                )
+
             # If an authoritative delivery+commit is already in flight for THIS
             # interrupt, JOIN it rather than starting a second one (P1): a retry
             # (possibly with a contrary decision) must never overtake a delivery
@@ -680,6 +691,17 @@ class AgentHandoffWithApproval(AguiConstruct):
                                 self._delivery_progress[interrupt_id] = index + 1
                                 self._delivery_decisions.setdefault(interrupt_id, decision)
                     except Exception as e:
+                        from cli_agent_orchestrator.services.terminal_service import (
+                            InputAcceptanceUnconfirmedError,
+                        )
+
+                        if isinstance(e, InputAcceptanceUnconfirmedError):
+                            interrupt.metadata["delivery_status"] = "dispatched_unconfirmed"
+                            raise DeliveryError(
+                                "Answer dispatched; provider acceptance unconfirmed. "
+                                "Inspect the terminal; resubmission is disabled to prevent duplicates.",
+                                retryable=False,
+                            ) from e
                         # Reconcile a concurrent expire() (unlocked sync path) that
                         # resolved this interrupt while the FAILED delivery was in
                         # flight: nothing was delivered, so expiry wins and the

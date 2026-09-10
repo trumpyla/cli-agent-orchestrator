@@ -67,9 +67,9 @@
           },
           {
             "type": "object",
-            "description": "Streamable-HTTP MCP server.",
+            "description": "HTTP-family MCP server (http or legacy sse); no subprocess fields or custom headers.",
             "properties": {
-              "type": {"type": "string", "const": "http"},
+              "type": {"type": "string", "enum": ["http", "sse"]},
               "url": {"type": "string"}
             },
             "required": ["type", "url"],

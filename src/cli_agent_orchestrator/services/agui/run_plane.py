@@ -286,7 +286,12 @@ async def run_plane_stream(
                     type=EventType.RUN_ERROR,
                     thread_id=thread_id,
                     run_id=run_id,
-                    message=f"Delivery failed for interrupt {interrupt_id} (retryable): {e}",
+                    message=(
+                        f"Delivery failed for interrupt {interrupt_id} (retryable): {e}"
+                        if e.retryable
+                        else f"Delivery outcome unconfirmed for interrupt {interrupt_id} "
+                        f"(do not retry): {e}"
+                    ),
                 )
                 yield _emit(err)
                 finished = True

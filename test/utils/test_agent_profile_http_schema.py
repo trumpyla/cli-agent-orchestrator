@@ -47,6 +47,7 @@ class TestSchemaAcceptsExclusiveShapes:
                 {"type": "http", "url": "http://127.0.0.1:9889/mcp/ops"}, id="http-literal"
             ),
             pytest.param({"type": "http", "url": "${CAO_SERENA_MCP_URL}"}, id="http-reference"),
+            pytest.param({"type": "sse", "url": "https://serena.example/sse"}, id="sse-literal"),
         ],
     )
     def test_valid_entries_pass_schema(self, entry: dict) -> None:

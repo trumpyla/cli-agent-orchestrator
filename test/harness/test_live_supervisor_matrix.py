@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import shutil
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -13,7 +14,9 @@ from test.harness.live_supervisor_matrix import (
     PREFLIGHT_MARKER,
     CommandResult,
     LiveProviderLane,
+    _default_runner,
     run_live_preflight,
+    select_live_lanes,
 )
 
 
@@ -24,6 +27,29 @@ def _environment() -> dict[str, str]:
         "CAO_OPS_MCP_URL": "http://127.0.0.1:9889/mcp/ops",
         "CAO_SERENA_MCP_URL": "http://127.0.0.1:8765/mcp",
     }
+
+
+@pytest.mark.parametrize("selection", ["codex,unknown", "unknown", "", " ", "codex,", ",grok"])
+def test_invalid_roster_fails_before_any_provider_probe(tmp_path, selection):
+    commands = []
+    env = {**_environment(), "CAO_LIVE_LANES": selection}
+    report = run_live_preflight(
+        tmp_path,
+        environ=env,
+        which=lambda _: "/bin/fake",
+        disk_usage=_disk,
+        runner=lambda *args: commands.append(args),
+    )
+    assert not report.ready
+    assert "lanes" in {failure.component for failure in report.failures}
+    assert commands == []
+    with pytest.raises(ValueError):
+        select_live_lanes(selection)
+
+
+def test_roster_selection_preserves_every_requested_lane():
+    assert {lane.name for lane in select_live_lanes("grok, codex")} == {"grok", "codex"}
+    assert select_live_lanes(None) == LIVE_PROVIDER_LANES
 
 
 def _disk(_path: Path) -> shutil._ntuple_diskusage:
@@ -172,6 +198,29 @@ def test_live_lane_rejects_model_alias() -> None:
         LiveProviderLane.model_validate(template)
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        subprocess.TimeoutExpired(cmd=("missing",), timeout=1),
+        FileNotFoundError("missing executable"),
+        OSError("process unavailable"),
+    ],
+)
+def test_default_runner_returns_failure_for_process_errors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    exc: BaseException,
+) -> None:
+    def fail_run(*_args: object, **_kwargs: object) -> None:
+        raise exc
+
+    monkeypatch.setattr(subprocess, "run", fail_run)
+
+    result = _default_runner(("missing",), tmp_path, 1)
+
+    assert result == CommandResult(returncode=127, stdout="", stderr=str(exc))
+
+
 def test_preflight_filters_lanes_by_env_variable(tmp_path: Path) -> None:
     commands: list[tuple[str, ...]] = []
     env = _environment()
@@ -189,4 +238,3 @@ def test_preflight_filters_lanes_by_env_variable(tmp_path: Path) -> None:
     assert len(commands) == 2  # herdr version + grok probe
     assert commands[0] == ("herdr", "--version")
     assert commands[1][0] == "grok"
-

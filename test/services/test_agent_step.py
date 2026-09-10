@@ -70,6 +70,38 @@ def _patch_terminal_layer(
 
 
 class TestHappyPath:
+    @pytest.mark.parametrize("accepted", [True, False])
+    def test_uncertain_dispatch_waits_without_replay_or_false_completion(self, accepted, caplog):
+        from cli_agent_orchestrator.services.terminal_service import InputAcceptanceUnconfirmedError
+
+        create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
+        uncertainty = InputAcceptanceUnconfirmedError(
+            "already dispatched", acceptance_probe=lambda: accepted
+        )
+        with (
+            create,
+            send as dispatch,
+            delete,
+            get_output,
+            exit_cli,
+            get_wd,
+            wait,
+            status,
+            patch(f"{_MODULE}.terminal_service.redeliver_dropped_message") as redeliver,
+            patch(f"{_MODULE}.frozen_run_memory.frozen_memory_for", return_value=None),
+        ):
+            dispatch.side_effect = uncertainty
+            if accepted:
+                result = asyncio.run(run_agent_step("kimi_cli", "dev", "task", timeout=0))
+                assert result.last_message == "the answer"
+            else:
+                with pytest.raises(InputAcceptanceUnconfirmedError) as caught:
+                    asyncio.run(run_agent_step("kimi_cli", "dev", "task", timeout=0))
+                assert caught.value is uncertainty
+            dispatch.assert_called_once()
+            redeliver.assert_not_called()
+        assert "acceptance unconfirmed" in caplog.text
+
     def test_an_empty_frozen_block_is_passed_to_suppress_live_memory(self):
         create, send, delete, get_output, exit_cli, get_wd, wait, status = _patch_terminal_layer()
         with (

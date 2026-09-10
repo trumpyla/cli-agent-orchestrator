@@ -1,0 +1,12 @@
+ ──────────────────────────────────────────────────────────────────────
+  Trust this folder?
+  ↑↓ navigate · Enter select · Esc exit
+
+  [Project-specific details omitted]
+
+   ❯ Trust this folder
+     Enable project MCP servers. Remembered for this folder.
+
+     Exit Kimi Code. Asked again next launch.
+
+ ──────────────────────────────────────────────────────────────────────

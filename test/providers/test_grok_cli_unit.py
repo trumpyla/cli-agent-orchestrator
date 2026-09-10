@@ -5,6 +5,7 @@ import os
 import shlex
 import signal
 import stat
+import tomllib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -698,7 +699,6 @@ def test_private_home_and_atomic_mcp_config(tmp_path):
         "remote": {
             "url": "https://mcp.example.invalid/mcp",
             "type": "http",
-            "headers": {"Authorization": "Bearer placeholder"},
         },
         "events": {
             "url": "https://mcp.example.invalid/events",
@@ -720,7 +720,7 @@ def test_private_home_and_atomic_mcp_config(tmp_path):
     assert "tool_timeout_sec = 321" in text
     assert 'type = "http"\nurl = "https://mcp.example.invalid/mcp"' in text
     assert 'type = "sse"\nurl = "https://mcp.example.invalid/events"' in text
-    assert '[mcp_servers."remote".headers]' in text
+    assert '[mcp_servers."remote".headers]' not in text
     assert "grok mcp add" not in text
     provider.cleanup()
     assert not home.exists()
@@ -743,6 +743,42 @@ def test_auth_is_symlinked_not_copied(tmp_path):
     assert link.resolve() == auth.resolve()
     provider.cleanup()
     assert auth.read_text(encoding="utf-8") == '{"secret":"not-copied"}'
+
+
+@pytest.mark.parametrize("legacy_trust", ["absent", "copy", "symlink"])
+def test_private_home_does_not_inherit_persistent_trust(tmp_path, legacy_trust):
+    fake_user_home = tmp_path / "user"
+    trusted_source = fake_user_home / ".grok" / "trusted_folders.toml"
+    trusted_source.parent.mkdir(parents=True)
+    original = 'trusted = ["/workspace"]\n'
+    trusted_source.write_text(original, encoding="utf-8")
+    provider = make_provider()
+
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path / "cao"),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.Path.home",
+            return_value=fake_user_home,
+        ),
+    ):
+        private_home = provider._home_path()
+        private_home.mkdir(parents=True)
+        prior_trust = private_home / "trusted_folders.toml"
+        if legacy_trust == "copy":
+            prior_trust.write_text(original, encoding="utf-8")
+        elif legacy_trust == "symlink":
+            prior_trust.symlink_to(trusted_source)
+        home = provider._prepare_grok_home(None)
+
+    trusted_copy = home / "trusted_folders.toml"
+    assert trusted_copy.is_file()
+    assert not trusted_copy.is_symlink()
+    assert trusted_copy.read_text(encoding="utf-8") == ""
+    assert stat.S_IMODE(trusted_copy.stat().st_mode) == 0o600
+
+    trusted_copy.write_text('trusted = ["/isolated"]\n', encoding="utf-8")
+    assert trusted_source.read_text(encoding="utf-8") == original
+    provider.cleanup()
 
 
 def test_auth_honors_existing_custom_grok_home(tmp_path, monkeypatch):
@@ -859,10 +895,176 @@ def test_cleanup_refuses_symlinked_managed_ancestor(tmp_path, symlinked_ancestor
 
 
 def test_url_mcp_rejects_unknown_transport():
-    with pytest.raises(ProviderError, match="unsupported URL transport"):
+    with pytest.raises(ProviderError, match="MCP server 'unknown'"):
         make_provider()._render_mcp_config(
             {"unknown": {"url": "https://mcp.example.invalid", "type": "websocket"}}
         )
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {
+            "type": "http",
+            "url": "https://example.invalid/private-value",
+            "headers": {"Authorization": "private-value"},
+        },
+        {"type": "sse", "url": "https://example.invalid/private-value", "command": "private-value"},
+        {"command": "private-value", "url": "https://example.invalid/private-value"},
+        {"type": "http", "url": "https://example.invalid/private-value", "enabled": True},
+        {"type": "http", "url": "https://example.invalid/private-value", "timeout": 30},
+        {"type": "http", "url": "https://user:private-value@example.invalid"},
+        {"command": 123, "env": {"PRIVATE": "private-value"}},
+        {"command": "echo", "args": [123, "private-value"]},
+        {"command": "echo", "env": ["private-value"]},
+        "private-value",
+        {},
+    ],
+)
+def test_handloaded_invalid_mcp_fails_before_private_home_publication(tmp_path, entry):
+    profile = AgentProfile(
+        name="invalid-mcp",
+        description="test",
+        mcpServers={
+            "valid-first": {"command": "echo", "args": ["valid"]},
+            "invalid": entry,
+        },
+    )
+    provider = make_provider()
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.shutil.which", return_value="/usr/bin/grok"
+        ),
+        patch.object(provider, "_load_profile", return_value=profile),
+        patch.object(provider, "_atomic_write_private") as publish,
+    ):
+        with pytest.raises(ProviderError) as raised:
+            provider._build_grok_command()
+        publish.assert_not_called()
+        assert not provider._home_path().exists()
+    assert "MCP server 'invalid'" in str(raised.value)
+    assert "private-value" not in str(raised.value)
+
+
+@pytest.mark.parametrize("transport", ["http", "sse"])
+@pytest.mark.parametrize("port", [9889, 9897])
+def test_http_url_and_local_auth_use_one_launch_snapshot(tmp_path, transport, port):
+    provider = make_provider()
+    profile_servers = {
+        "local": {"type": transport, "url": "${OPS_ENDPOINT}"},
+        "remote": {"type": transport, "url": "${REMOTE_ENDPOINT}"},
+    }
+    launch_env = {
+        "OPS_ENDPOINT": f"http://127.0.0.1:{port}/mcp/ops",
+        "REMOTE_ENDPOINT": "https://mcp.example.invalid/mcp/ops",
+        "CAO_AUTH_JWKS_URI": "https://idp.example.invalid/jwks",
+        "CAO_AUTH_LOCAL_TOKEN": "synthetic-grok-token",
+        "CAO_API_PORT": "9999",  # cannot redirect the effective server origin
+    }
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch(
+            "cli_agent_orchestrator.providers.mcp_translation._managed_cao_origin",
+            ("127.0.0.1", port),
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.snapshot_process_env",
+            return_value=launch_env,
+        ) as snapshot,
+    ):
+        home = provider._prepare_grok_home(profile_servers)
+    snapshot.assert_called_once_with()
+    native = tomllib.loads((home / "config.toml").read_text())["mcp_servers"]
+    assert native["local"] == {
+        "type": transport,
+        "url": launch_env["OPS_ENDPOINT"],
+        "enabled": True,
+        "headers": {"Authorization": "Bearer synthetic-grok-token"},
+    }
+    assert native["remote"] == {
+        "type": transport,
+        "url": launch_env["REMOTE_ENDPOINT"],
+        "enabled": True,
+    }
+    assert profile_servers["local"]["url"] == "${OPS_ENDPOINT}"
+    assert stat.S_IMODE((home / "config.toml").stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    "resolved",
+    [None, "file:///synthetic-private", "https://user:synthetic-private@example.invalid"],
+)
+def test_http_reference_failure_is_sanitized_and_precedes_publication(tmp_path, resolved):
+    provider = make_provider()
+    launch_env = {} if resolved is None else {"OPS_ENDPOINT": resolved}
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.snapshot_process_env",
+            return_value=launch_env,
+        ),
+        patch.object(provider, "_atomic_write_private") as publish,
+    ):
+        with pytest.raises(ProviderError) as raised:
+            provider._prepare_grok_home({"local": {"type": "http", "url": "${OPS_ENDPOINT}"}})
+        publish.assert_not_called()
+        assert not provider._home_path().exists()
+    assert "OPS_ENDPOINT" in str(raised.value)
+    assert "synthetic-private" not in str(raised.value)
+
+
+@pytest.mark.parametrize("transport", ["http", "sse"])
+def test_authenticated_local_ops_requires_token_before_publication(tmp_path, transport):
+    provider = make_provider()
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.CAO_HOME_DIR", tmp_path),
+        patch(
+            "cli_agent_orchestrator.providers.mcp_translation._managed_cao_origin",
+            ("localhost", 9889),
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.snapshot_process_env",
+            return_value={"AUTH0_DOMAIN": "idp.example.invalid"},
+        ),
+        patch.object(provider, "_atomic_write_private") as publish,
+    ):
+        with pytest.raises(ProviderError, match="CAO_AUTH_LOCAL_TOKEN"):
+            provider._prepare_grok_home(
+                {"local": {"type": transport, "url": "http://localhost:9889/mcp/ops"}}
+            )
+        publish.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://external.example.invalid/mcp/ops",
+        "http://127.0.0.1:9999/mcp/ops",
+        "http://127.0.0.1/mcp/ops",
+        "https://127.0.0.1:9889/mcp/ops",
+        "http://127.0.0.1:9889/other",
+        "http://127.0.0.1:9889/mcp/ops?other=1",
+        "http://localhost.example.invalid:9889/mcp/ops",
+    ],
+)
+def test_local_token_never_reaches_unrelated_grok_mcp_endpoints(url):
+    with (
+        patch(
+            "cli_agent_orchestrator.providers.mcp_translation._managed_cao_origin",
+            ("127.0.0.1", 9889),
+        ),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.snapshot_process_env",
+            return_value={
+                "CAO_AUTH_JWKS_URI": "https://idp.example.invalid/jwks",
+                "CAO_AUTH_LOCAL_TOKEN": "synthetic-grok-token",
+            },
+        ),
+    ):
+        native_text = make_provider()._render_mcp_config({"remote": {"type": "http", "url": url}})
+    assert "synthetic-grok-token" not in native_text
+    assert "headers" not in tomllib.loads(native_text)["mcp_servers"]["remote"]
 
 
 def test_cleanup_failure_keeps_home_retryable(tmp_path):
@@ -960,11 +1162,28 @@ def test_home_process_fails_closed_when_candidate_environment_is_protected(tmp_p
         assert GrokCliProvider._pid_uses_home(12345, tmp_path) is None
 
 
-@pytest.mark.parametrize("blocked_attribute", ["uids", "exe", "cmdline"])
+def test_home_process_scan_skips_process_when_uid_inspection_is_protected(tmp_path):
+    pid = os.getpid() + 1
+    proc = MagicMock()
+    proc.uids.side_effect = psutil.AccessDenied(pid=pid)
+
+    with (
+        patch("cli_agent_orchestrator.providers.grok_cli.psutil.pids", return_value=[pid]),
+        patch(
+            "cli_agent_orchestrator.providers.grok_cli.psutil.Process",
+            return_value=proc,
+        ),
+    ):
+        assert GrokCliProvider._pids_using_home(tmp_path) == set()
+
+    proc.exe.assert_not_called()
+
+
+@pytest.mark.parametrize("blocked_attribute", ["exe", "cmdline"])
 def test_cleanup_retains_home_when_process_identity_inspection_is_protected(
     tmp_path, blocked_attribute
 ):
-    """Identity metadata is uncertain on macOS too, so cleanup must fail closed."""
+    """A protected same-user Grok candidate keeps cleanup fail-closed."""
 
     provider = make_provider()
     proc = MagicMock()

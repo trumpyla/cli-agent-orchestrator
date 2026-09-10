@@ -5,6 +5,7 @@ import logging
 import os
 import re
 import shlex
+import sys
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -27,11 +28,67 @@ from cli_agent_orchestrator.utils.mcp_launch import (
     resolve_http_url,
     snapshot_process_env,
 )
-from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
+from cli_agent_orchestrator.utils.mcp_resolution import (
+    CAO_MCP_SERVER_COMMAND,
+    CAO_MCP_SERVER_MODULE,
+    resolve_mcp_server_config,
+)
 from cli_agent_orchestrator.utils.terminal import wait_for_shell, wait_until_status
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
 
 logger = logging.getLogger(__name__)
+
+
+def _managed_mcp_module_args() -> list[str]:
+    """Launch the loaded CAO source tree without trusting worker import paths."""
+    import_root = str(Path(__file__).resolve().parents[2])
+    bootstrap = (
+        "import runpy, sys; "
+        f"sys.path.insert(0, {import_root!r}); "
+        f"runpy.run_module({CAO_MCP_SERVER_MODULE!r}, run_name='__main__')"
+    )
+    return ["-I", "-c", bootstrap]
+
+
+def _managed_tool_approvals(
+    profile, allowed_tools, server_name: str, declared: dict, resolved: dict
+) -> tuple[str, ...]:
+    """Grant only the managed callback and explicitly authorized fanout tools."""
+    if getattr(profile, "permissionMode", None) not in {"plan", "acceptEdits"}:
+        return ()
+    requested = getattr(profile, "allowedTools", None)
+    if not isinstance(requested, list):
+        return ()
+    # Neither server labels nor basename/argument matches establish trust.
+    # Profile overrides could change the program or its import/search behavior.
+    if (
+        declared.get("command") != CAO_MCP_SERVER_COMMAND
+        or declared.get("args")
+        or set(declared) - {"type", "command", "args"}
+        or not sys.executable
+    ):
+        return ()
+    sibling = str(Path(sys.executable).with_name(CAO_MCP_SERVER_COMMAND))
+    trusted = (resolved.get("command") == sibling and not resolved.get("args")) or (
+        resolved.get("command") == sys.executable
+        and resolved.get("args") == ["-m", CAO_MCP_SERVER_MODULE]
+    )
+    if not trusted:
+        return ()
+    approvals = []
+    callbacks = {f"@{server_name}", f"mcp__{server_name}__send_message"}
+    if callbacks.intersection(requested) and (
+        allowed_tools is None or "*" in allowed_tools or callbacks.intersection(allowed_tools)
+    ):
+        approvals.append("send_message")
+    # Server-family and wildcard permissions intentionally do not imply fanout.
+    # Both policy layers must explicitly authorize each of these two operations.
+    for tool in ("assign", "handoff"):
+        grant = f"mcp__{server_name}__{tool}"
+        if grant in requested and allowed_tools is not None and grant in allowed_tools:
+            approvals.append(tool)
+    return tuple(approvals)
+
 
 # Regex patterns for Codex output analysis
 ANSI_CODE_PATTERN = r"\x1b\[[0-9;]*m"
@@ -868,6 +925,35 @@ class CodexProvider(BaseProvider):
                 raise ProviderError(f"Failed to load agent profile '{self._agent_profile}': {e}")
 
         permission_mode = getattr(profile, "permissionMode", None)
+        if permission_mode in {"plan", "acceptEdits"}:
+            from cli_agent_orchestrator.utils.skills import (
+                InlineSkillPrompt,
+                build_inline_skill_prompt,
+            )
+
+            if not isinstance(self._skill_prompt, InlineSkillPrompt):
+                declared_skills = getattr(profile, "skills", None)
+                try:
+                    self._skill_prompt = build_inline_skill_prompt(
+                        declared_skills if isinstance(declared_skills, list) else None
+                    )
+                except (OSError, ValueError) as exc:
+                    raise ProviderError("Failed to resolve declared Codex worker skills") from exc
+        mcp_approval_mode = "approve" if permission_mode == "bypassPermissions" else "prompt"
+        # MCP operations can mutate remote state outside the filesystem sandbox.
+        # A profile's inline overrides must not bypass its declared policy.
+        if profile is not None and profile.codexConfig and mcp_approval_mode != "approve":
+            for key, value in profile.codexConfig.items():
+                if (
+                    isinstance(key, str)
+                    and key.startswith("mcp_servers.")
+                    and key.rsplit(".", 1)[-1] in {"default_tools_approval_mode", "approval_mode"}
+                    and value != "prompt"
+                ):
+                    raise ProviderError(
+                        "Codex MCP approval overrides require prompt unless "
+                        "permissionMode is bypassPermissions"
+                    )
         if permission_mode == "plan":
             # A profile explicitly advertised as plan/read-only must never
             # inherit CAO's unattended --yolo default, even when its logical
@@ -1030,13 +1116,18 @@ class CodexProvider(BaseProvider):
                     entry = parse_mcp_server_entry(server_config, server_name=server_name)
                     if isinstance(entry, HttpMcpServer):
                         url = resolve_http_url(entry.url, env_snapshot, server_name=server_name)
-                        fields = render_http_entry("codex", url, env=env_snapshot)
+                        fields = render_http_entry(
+                            "codex", url, transport=entry.type, env=env_snapshot
+                        )
                         command_parts.extend(["-c", f"{prefix}.url={_toml_scalar(fields['url'])}"])
                         command_parts.extend(
                             ["-c", f"{prefix}.tool_timeout_sec={fields['tool_timeout_sec']}"]
                         )
                         command_parts.extend(
-                            ["-c", f"{prefix}.default_tools_approval_mode=\"approve\""]
+                            [
+                                "-c",
+                                f"{prefix}.default_tools_approval_mode={_toml_scalar(mcp_approval_mode)}",
+                            ]
                         )
                         bearer_env = fields.get("bearer_token_env_var")
                         if bearer_env:
@@ -1058,7 +1149,15 @@ class CodexProvider(BaseProvider):
                     )
                     # Resolve the bundled cao-mcp-server console script to a
                     # PATH-independent invocation.
+                    declared_cfg = cfg
                     cfg = resolve_mcp_server_config(cfg)
+                    managed_approvals = _managed_tool_approvals(
+                        profile, self._allowed_tools, server_name, declared_cfg, cfg
+                    )
+                    if managed_approvals and cfg.get("command") == sys.executable:
+                        # Pin the loaded installation, including source-only
+                        # deployments that depend on the parent's PYTHONPATH.
+                        cfg["args"] = _managed_mcp_module_args()
                     # Fresh callback identity for THIS terminal, set explicitly
                     # via ``env`` rather than inherited through ``env_vars``.
                     # env_vars would copy CAO_TERMINAL_ID from cao-server's OWN
@@ -1103,8 +1202,15 @@ class CodexProvider(BaseProvider):
                     if "tool_timeout_sec" not in cfg:
                         command_parts.extend(["-c", f"{prefix}.tool_timeout_sec=600.0"])
                     command_parts.extend(
-                        ["-c", f"{prefix}.default_tools_approval_mode=\"approve\""]
+                        [
+                            "-c",
+                            f"{prefix}.default_tools_approval_mode={_toml_scalar(mcp_approval_mode)}",
+                        ]
                     )
+                    for tool in managed_approvals:
+                        command_parts.extend(
+                            ["-c", f'{prefix}.tools.{tool}.approval_mode="approve"']
+                        )
 
             # Inline Codex config overrides (-c key=value). Lets a profile set
             # per-agent Codex knobs — reasoning effort, service tier, fast mode,
@@ -1622,9 +1728,8 @@ class CodexProvider(BaseProvider):
         """Get the command to exit Codex CLI."""
         return "/exit"
 
-    def cleanup(self) -> None:
+    def cleanup(self) -> bool:
         """Clean up Codex CLI provider."""
-        self._initialized = False
         # Remove the developer_instructions temp file written by _build_codex_command, if any --
         # same convention claude_code.py's own cleanup() uses for its analogous .prompt file.
         # Path comes from _developer_instructions_file_path() (single source of truth shared
@@ -1632,4 +1737,6 @@ class CodexProvider(BaseProvider):
         try:
             self._developer_instructions_file_path().unlink(missing_ok=True)
         except OSError:
-            pass
+            return False
+        self._initialized = False
+        return True

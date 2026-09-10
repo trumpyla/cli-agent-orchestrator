@@ -15,6 +15,21 @@ from cli_agent_orchestrator.services.agent_step import StepExecutionError
 _RUN_STEP = "cli_agent_orchestrator.api.main.run_agent_step"
 
 
+def test_uncertain_dispatch_is_not_settled_as_retryable_timeout(client):
+    from cli_agent_orchestrator.services.terminal_service import InputAcceptanceUnconfirmedError
+
+    with patch(
+        _RUN_STEP,
+        new=AsyncMock(
+            side_effect=InputAcceptanceUnconfirmedError("already dispatched; do not retry")
+        ),
+    ):
+        response = client.post(TERMINALS_RUN_STEP_ROUTE, json=_body())
+    assert response.status_code == 409
+    assert response.json()["detail"]["kind"] == "acceptance_unconfirmed"
+    assert response.json()["detail"]["retryable"] is False
+
+
 @pytest.fixture
 def isolated_journal(tmp_path, monkeypatch):
     """Point the workflow journal at a temp DB for one test (issue #583).

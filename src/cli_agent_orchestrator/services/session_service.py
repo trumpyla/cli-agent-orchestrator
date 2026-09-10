@@ -30,8 +30,13 @@ from cli_agent_orchestrator.backends.base import TerminalBackend
 from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
+    clear_runtime_cleanup_debt,
     delete_terminals_by_ids,
+    get_pending_messages,
+    get_terminal_metadata,
+    list_runtime_cleanup_debt,
     list_terminals_by_session,
+    retain_runtime_cleanup_debt,
 )
 from cli_agent_orchestrator.constants import SESSION_PREFIX
 from cli_agent_orchestrator.models.inbox import OrchestrationType
@@ -343,6 +348,55 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
         with session_lifecycle_lock(session_name):
             terminals = list_terminals_by_session(session_name)
             incarnation_ids = [t["id"] for t in terminals]
+            backend = get_backend()
+            captured_debts = []
+            quarantined_debt = False
+            manual_backend_id = None
+            if isinstance(backend, HerdrBackend):
+                session_debts = [
+                    debt for debt in list_runtime_cleanup_debt() if debt["label"] == session_name
+                ]
+                quarantined_debt = any(debt.get("invalid") for debt in session_debts)
+                if quarantined_debt:
+                    result["errors"].append(
+                        {
+                            "session": session_name,
+                            "step": "quarantined_runtime_cleanup_debt",
+                            "error": "invalid cleanup debt retained; only current inventory can be cleaned",
+                        }
+                    )
+                if session_debts:
+                    debt_inventory = backend.list_workspace_inventory()
+                    if quarantined_debt:
+                        label_matches = [
+                            workspace
+                            for workspace in debt_inventory
+                            if workspace.label == session_name
+                        ]
+                        if len(label_matches) > 1:
+                            raise RuntimeError("backend identity ambiguous")
+                        manual_backend_id = label_matches[0].workspace_id if label_matches else None
+                    for debt in session_debts:
+                        if debt.get("invalid"):
+                            continue
+                        identity_matches = [
+                            workspace
+                            for workspace in debt_inventory
+                            if workspace.workspace_id == debt["workspace_id"]
+                        ]
+                        # A renamed identity is outside this manual operation.
+                        if len(identity_matches) > 1 or any(
+                            workspace.label != session_name for workspace in identity_matches
+                        ):
+                            continue
+                        if all(
+                            terminal_id in incarnation_ids
+                            or get_terminal_metadata(terminal_id) is None
+                            for terminal_id in debt["terminal_ids"]
+                        ):
+                            # Includes env/marker-only debt after its captured
+                            # rows have already been durably removed.
+                            captured_debts.append(debt)
 
             # Step 2: read-only scrollback/metadata capture, which has to happen
             # while the panes still exist. ``metadata`` is kept because both
@@ -360,9 +414,35 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             # Step 3/4: confirm the tmux session is gone BEFORE dismantling
             # anything. Any inability to confirm raises with the session fully
             # intact — never half-dismantled, never registry-less.
-            backend = get_backend()
             try:
-                session_still_alive = backend.session_exists_strict(session_name)
+                if quarantined_debt:
+                    # The user's request authorizes this current inventory;
+                    # corrupt debt contributes no identity or row authority.
+                    inventory = backend.list_workspace_inventory()
+                    matches = [
+                        workspace for workspace in inventory if workspace.label == session_name
+                    ]
+                    if (
+                        len(matches) > 1
+                        or any(workspace.workspace_id != manual_backend_id for workspace in matches)
+                        or any(
+                            workspace.workspace_id == manual_backend_id
+                            and workspace.label != session_name
+                            for workspace in inventory
+                        )
+                    ):
+                        raise RuntimeError("backend identity changed")
+                    if matches and not backend.close_workspace_by_id(manual_backend_id):
+                        raise RuntimeError("backend close failed")
+                    if any(
+                        workspace.label == session_name
+                        or workspace.workspace_id == manual_backend_id
+                        for workspace in backend.list_workspace_inventory()
+                    ):
+                        raise RuntimeError("backend close not confirmed")
+                    session_still_alive = False
+                else:
+                    session_still_alive = backend.session_exists_strict(session_name)
             except Exception as e:
                 raise RuntimeError(
                     f"could not verify tmux session '{session_name}' liveness during "
@@ -396,7 +476,7 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
             # log spurious warnings.
             # ``registry=None``: the per-terminal events are dispatched together
             # with post_kill_session AFTER the lock is released — see below.
-            cleanup_complete = True
+            cleanup_complete = not quarantined_debt
             deferred_ids: List[str] = []
             # Terminals whose runtime was dismantled but whose FIRST row delete
             # raised: their rows are what the sweep below exists to remove, and
@@ -409,7 +489,15 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                     )
                 except Exception as e:
                     logger.warning(f"Failed to cleanup terminal {terminal_id}: {e}")
-                    runtime_released = True
+                    cleanup_complete = False
+                    deferred_ids.append(terminal_id)
+                    result["errors"].append(
+                        {
+                            "terminal_id": terminal_id,
+                            "error": f"runtime cleanup failed: {e}",
+                        }
+                    )
+                    continue
                 if runtime_released is False:
                     # Grok has not yet released its private home (#596). The row
                     # is the only handle a retry has, so keep it: skip both the
@@ -464,6 +552,15 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 delete_terminals_by_ids([i for i in incarnation_ids if i not in deferred_ids])
             except Exception as e:
                 logger.warning(f"Failed to sweep registry rows for {session_name}: {e}")
+                # An empty fallback can fail after all rows were durably
+                # removed. Only surviving rows make the session incomplete.
+                try:
+                    remaining_rows = list_terminals_by_session(session_name)
+                except Exception:
+                    cleanup_complete = False
+                else:
+                    if any(row["id"] in incarnation_ids for row in remaining_rows):
+                        cleanup_complete = False
                 result["errors"].append(
                     {
                         "session": session_name,
@@ -482,13 +579,45 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
 
             # Drop the per-session forwarded-env mapping (issue #248). Safe
             # even when no vars were forwarded — the helper is a no-op then.
+            env_cleared = True
             try:
                 clear_session_env(session_name)
             except Exception as e:
+                env_cleared = False
                 logger.warning(f"Failed to clear forwarded env for {session_name}: {e}")
                 result["errors"].append(
                     {"session": session_name, "step": "clear_session_env", "error": str(e)}
                 )
+
+            if captured_debts and cleanup_complete:
+                # Manual teardown has completed these captured incarnations.
+                # Retiring their automatic retry handles must precede the
+                # session event, or the next sweep would emit completion again.
+                if not env_cleared:
+                    cleanup_complete = False
+                else:
+                    try:
+                        live_ids = {
+                            workspace.workspace_id
+                            for workspace in backend.list_workspace_inventory()
+                        }
+                        for debt in captured_debts:
+                            if debt["workspace_id"] in live_ids or any(
+                                get_terminal_metadata(terminal_id) is not None
+                                for terminal_id in debt["terminal_ids"]
+                            ):
+                                raise RuntimeError("captured cleanup identity remains live")
+                            delete_terminals_by_ids(debt["terminal_ids"])
+                            clear_runtime_cleanup_debt(session_name, debt["workspace_id"])
+                    except Exception as e:
+                        cleanup_complete = False
+                        result["errors"].append(
+                            {
+                                "session": session_name,
+                                "step": "reconcile_runtime_cleanup_debt",
+                                "error": str(e),
+                            }
+                        )
 
             if cleanup_complete:
                 result["deleted"].append(session_name)
@@ -526,11 +655,12 @@ def delete_session(session_name: str, registry: PluginRegistry | None = None) ->
                 )
             except Exception as e:
                 logger.warning(f"Failed to emit post_kill_terminal for {terminal_id}: {e}")
-        dispatch_plugin_event(
-            registry,
-            "post_kill_session",
-            PostKillSessionEvent(session_id=session_name, session_name=session_name),
-        )
+        if not deferred_ids and session_name in result["deleted"]:
+            dispatch_plugin_event(
+                registry,
+                "post_kill_session",
+                PostKillSessionEvent(session_id=session_name, session_name=session_name),
+            )
         return result
 
     except Exception as e:
@@ -572,10 +702,37 @@ def delete_session_automatically(
         if len(label_matches) > 1 or len(id_matches) > 1:
             raise RuntimeError("backend identity ambiguous")
 
-        terminals = list_terminals_by_session(session_name)
+        # Rows reserved by another captured workspace are never part of this
+        # incarnation, even when the backend has reused its human-facing label.
+        session_debts = [
+            debt for debt in list_runtime_cleanup_debt() if debt["label"] == session_name
+        ]
+        if any(debt.get("invalid") for debt in session_debts):
+            raise RuntimeError("cleanup debt identity invalid")
+        foreign_ids = {
+            terminal_id
+            for debt in session_debts
+            if debt["workspace_id"] != expected_backend_id
+            for terminal_id in debt["terminal_ids"]
+        }
+        terminals = [
+            terminal
+            for terminal in list_terminals_by_session(session_name)
+            if terminal["id"] not in foreign_ids
+        ]
         incarnation_ids = [terminal["id"] for terminal in terminals]
+        if any(get_pending_messages(terminal_id, limit=1) for terminal_id in incarnation_ids):
+            raise RuntimeError("pending inbox changed")
         captured = [
-            (terminal["id"], terminal_service.capture_terminal_snapshot(terminal["id"]))
+            (
+                terminal["id"],
+                terminal_service.capture_terminal_snapshot(terminal["id"])
+                or (
+                    terminal
+                    if all(key in terminal for key in ("tmux_session", "tmux_window", "provider"))
+                    else None
+                ),
+            )
             for terminal in terminals
         ]
 
@@ -585,15 +742,20 @@ def delete_session_automatically(
                 raise RuntimeError("backend identity changed")
             if workspace.agent_status != "done":
                 raise RuntimeError("backend state changed")
+        elif id_matches:
+            raise RuntimeError("backend identity changed")
+
+        # Commit the stable identity before close so a process restart can find
+        # remaining runtime, row, or environment cleanup after the backend is gone.
+        retain_runtime_cleanup_debt(session_name, expected_backend_id, incarnation_ids)
+        if label_matches:
             if not selected_backend.close_workspace_by_id(expected_backend_id):
                 raise RuntimeError("backend close failed")
-        elif id_matches:
-            # The captured stable identity still exists under a different label.
-            raise RuntimeError("backend identity changed")
         # No label or ID match is an authoritative already-absent backend. Continue
         # persistence cleanup so a close/crash boundary resumes idempotently.
 
         deferred_ids: List[str] = []
+        cleanup_complete = True
         row_delete_failed: List[Tuple[str, Dict]] = []
         for terminal_id, metadata in captured:
             try:
@@ -633,6 +795,7 @@ def delete_session_automatically(
                 [terminal_id for terminal_id in incarnation_ids if terminal_id not in deferred_ids]
             )
         except Exception as exc:
+            cleanup_complete = False
             result["errors"].append(
                 {"session": session_name, "step": "delete_terminals_by_ids", "error": str(exc)}
             )
@@ -642,12 +805,24 @@ def delete_session_automatically(
         try:
             clear_session_env(session_name)
         except Exception as exc:
+            cleanup_complete = False
             result["errors"].append(
                 {"session": session_name, "step": "clear_session_env", "error": str(exc)}
             )
 
-        if not deferred_ids:
-            result["deleted"].append(session_name)
+        if not deferred_ids and cleanup_complete:
+            try:
+                clear_runtime_cleanup_debt(session_name, expected_backend_id)
+            except Exception as exc:
+                result["errors"].append(
+                    {
+                        "session": session_name,
+                        "step": "clear_runtime_cleanup_debt",
+                        "error": str(exc),
+                    }
+                )
+            else:
+                result["deleted"].append(session_name)
 
     for terminal_id, metadata in torn_down:
         try:
@@ -662,9 +837,10 @@ def delete_session_automatically(
             )
         except Exception as exc:
             logger.warning("Failed to emit post_kill_terminal for %s: %s", terminal_id, exc)
-    dispatch_plugin_event(
-        registry,
-        "post_kill_session",
-        PostKillSessionEvent(session_id=session_name, session_name=session_name),
-    )
+    if not deferred_ids and session_name in result["deleted"]:
+        dispatch_plugin_event(
+            registry,
+            "post_kill_session",
+            PostKillSessionEvent(session_id=session_name, session_name=session_name),
+        )
     return result

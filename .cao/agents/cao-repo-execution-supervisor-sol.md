@@ -26,6 +26,8 @@ allowedTools:
   - "fs_list"
   - "execute_bash"
   - "@cao-mcp-server"
+  - "mcp__cao-mcp-server__assign"
+  - "mcp__cao-mcp-server__handoff"
 mcpServers:
   cao-mcp-server:
     type: stdio

@@ -260,6 +260,7 @@ class TestExitTerminalCli:
             "abcd1234",
             "/exit",
             _prepare_provider_input=False,
+            _commit_prepared_input=False,
         )
         mock_special.assert_not_called()
 

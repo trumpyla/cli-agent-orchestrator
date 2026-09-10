@@ -2,12 +2,12 @@
 
 import json
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from cli_agent_orchestrator.backends.base import TerminalBackendError
-from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
+from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend, HerdrWorkspace
 
 
 @pytest.fixture
@@ -175,9 +175,39 @@ def test_revalidate_requires_same_label_and_workspace_id(backend: HerdrBackend) 
 
 def test_close_workspace_uses_stable_id_not_label(backend: HerdrBackend) -> None:
     backend._run_herdr = MagicMock(return_value=_completed({}, returncode=0))
+    backend.list_workspace_inventory = MagicMock(return_value=[])
 
     assert backend.close_workspace_by_id("workspace-123") is True
     backend._run_herdr.assert_called_once_with(
         ["workspace", "close", "workspace-123"],
         check=False,
     )
+    backend.list_workspace_inventory.assert_called_once_with()
+
+
+@patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep")
+def test_close_workspace_retries_until_stable_id_disappears(
+    sleep: MagicMock,
+    backend: HerdrBackend,
+) -> None:
+    target = HerdrWorkspace.model_validate(_workspace(workspace_id="workspace-123"))
+    backend._run_herdr = MagicMock(return_value=_completed({}, returncode=0))
+    backend.list_workspace_inventory = MagicMock(side_effect=[[target], [target], []])
+
+    assert backend.close_workspace_by_id("workspace-123") is True
+    assert backend.list_workspace_inventory.call_count == 3
+    assert sleep.call_args_list == [call(0.2), call(0.2)]
+
+
+@patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep")
+def test_close_workspace_fails_when_stable_id_remains_after_retry_bound(
+    sleep: MagicMock,
+    backend: HerdrBackend,
+) -> None:
+    target = HerdrWorkspace.model_validate(_workspace(workspace_id="workspace-123"))
+    backend._run_herdr = MagicMock(return_value=_completed({}, returncode=0))
+    backend.list_workspace_inventory = MagicMock(return_value=[target])
+
+    assert backend.close_workspace_by_id("workspace-123") is False
+    assert backend.list_workspace_inventory.call_count == 5
+    assert sleep.call_args_list == [call(0.2)] * 4

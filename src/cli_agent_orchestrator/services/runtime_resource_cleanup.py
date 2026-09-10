@@ -44,6 +44,8 @@ class CleanupCandidate(BaseModel):
     label: str = Field(strict=True)
     workspace_id: str = Field(strict=True)
     newest_activity: datetime = Field(strict=True)
+    terminal_ids: list[str] | None = None
+    excluded_terminal_ids: frozenset[str] = frozenset()
 
 
 class CleanupSweepSummary(BaseModel):
@@ -72,6 +74,7 @@ class RuntimeResourceCleanup:
         pending_checker: Callable[[str], bool],
         teardown: Callable[[str, str], None],
         clock: Callable[[], datetime],
+        debt_reader: Callable[[], list[dict[str, object]]] = lambda: [],
     ) -> None:
         self._backend = backend
         self._config_reader = config_reader
@@ -79,6 +82,10 @@ class RuntimeResourceCleanup:
         self._pending_checker = pending_checker
         self._teardown = teardown
         self._clock = clock
+        self._debt_reader = debt_reader
+        # Scheduling fairness is local to this engine; durable teardown debt
+        # remains in SQLite and is rediscovered after a process restart.
+        self._selection_cursor: tuple[datetime, str, str] | None = None
 
     @staticmethod
     def _parse_terminals(raw_rows: list[dict[str, object]]) -> list[CleanupTerminal]:
@@ -97,6 +104,7 @@ class RuntimeResourceCleanup:
         config: CleanupConfig,
         now: datetime,
         reasons: Counter[str],
+        excluded_ids: dict[str, frozenset[str]] | None = None,
     ) -> list[CleanupCandidate]:
         if now.tzinfo is not None:
             reasons["clock_invalid"] += 1
@@ -123,7 +131,12 @@ class RuntimeResourceCleanup:
                 reasons["preserved"] += 1
                 continue
 
-            raw_rows = self._terminal_reader(workspace.label)
+            excluded = (excluded_ids or {}).get(workspace.label, frozenset())
+            raw_rows = [
+                row
+                for row in self._terminal_reader(workspace.label)
+                if not isinstance(row, dict) or row.get("id") not in excluded
+            ]
             if not raw_rows:
                 reasons["no_terminals"] += 1
                 continue
@@ -159,13 +172,16 @@ class RuntimeResourceCleanup:
                     label=workspace.label,
                     workspace_id=workspace.workspace_id,
                     newest_activity=newest,
+                    excluded_terminal_ids=excluded,
                 )
             )
 
         candidates.sort(key=lambda candidate: (candidate.newest_activity, candidate.label))
-        if len(candidates) > config.max_sessions_per_sweep:
-            reasons["batch_limited"] += len(candidates) - config.max_sessions_per_sweep
-        return candidates[: config.max_sessions_per_sweep]
+        return candidates
+
+    @staticmethod
+    def _candidate_order(candidate: CleanupCandidate) -> tuple[datetime, str, str]:
+        return candidate.newest_activity, candidate.label, candidate.workspace_id
 
     def _revalidate(
         self,
@@ -182,18 +198,28 @@ class RuntimeResourceCleanup:
             return False
 
         matches = [workspace for workspace in inventory if workspace.label == candidate.label]
-        if not matches:
-            reasons["workspace_absent"] += 1
-            return True
-        if len(matches) != 1 or matches[0].workspace_id != candidate.workspace_id:
+        if any(
+            workspace.workspace_id == candidate.workspace_id and workspace.label != candidate.label
+            for workspace in inventory
+        ):
             reasons["identity_changed"] += 1
             return False
-        if matches[0].agent_status != "done":
-            reasons["state_changed"] += 1
-            return False
+        if matches:
+            if len(matches) != 1 or matches[0].workspace_id != candidate.workspace_id:
+                reasons["identity_changed"] += 1
+                return False
+            if matches[0].agent_status != "done":
+                reasons["state_changed"] += 1
+                return False
 
-        raw_rows = self._terminal_reader(candidate.label)
+        raw_rows = [
+            row
+            for row in self._terminal_reader(candidate.label)
+            if not isinstance(row, dict) or row.get("id") not in candidate.excluded_terminal_ids
+        ]
         if not raw_rows:
+            if candidate.terminal_ids is not None:
+                return True
             reasons["terminal_state_changed"] += 1
             return False
         try:
@@ -204,9 +230,16 @@ class RuntimeResourceCleanup:
         if any(terminal.provider == "peer" for terminal in terminals):
             reasons["terminal_state_changed"] += 1
             return False
+        if candidate.terminal_ids is not None and not {t.id for t in terminals}.issubset(
+            candidate.terminal_ids
+        ):
+            reasons["identity_changed"] += 1
+            return False
         if self._has_pending(terminals):
             reasons["pending_inbox_changed"] += 1
             return False
+        if not matches:
+            reasons["workspace_absent"] += 1
         return True
 
     def sweep(self) -> CleanupSweepSummary:
@@ -235,9 +268,89 @@ class RuntimeResourceCleanup:
             self._log(summary)
             return summary
 
-        candidates = self._select(inventory, config, now, reasons)
+        try:
+            raw_debts = self._debt_reader()
+            debts = []
+            blocked_labels = set()
+            for row in raw_debts:
+                try:
+                    if row.get("invalid"):
+                        raise ValueError("invalid persisted debt")
+                    debts.append(CleanupCandidate.model_validate(row))
+                except (ValidationError, TypeError, ValueError):
+                    label = row.get("label")
+                    if not isinstance(label, str) or not label:
+                        raise ValueError("cannot isolate invalid cleanup debt")
+                    blocked_labels.add(label)
+                    reasons["debt_inventory_invalid"] += 1
+        except Exception:
+            summary = CleanupSweepSummary(reasons={"debt_inventory_failed": 1})
+            self._log(summary)
+            return summary
+        debts = [
+            candidate
+            for candidate in debts
+            if candidate.label not in blocked_labels
+            and candidate.label.startswith(SESSION_PREFIX)
+            and not any(fnmatch.fnmatchcase(candidate.label, p) for p in config.preserve_patterns)
+        ]
+        debt_identities = {(candidate.label, candidate.workspace_id) for candidate in debts}
+        excluded_ids = {
+            candidate.label: frozenset(
+                terminal_id
+                for debt in debts
+                if debt.label == candidate.label
+                for terminal_id in (debt.terminal_ids or [])
+            )
+            for candidate in debts
+        }
+        debts = [
+            candidate.model_copy(
+                update={
+                    "excluded_terminal_ids": frozenset(
+                        terminal_id
+                        for debt in debts
+                        if debt.label == candidate.label
+                        and debt.workspace_id != candidate.workspace_id
+                        for terminal_id in (debt.terminal_ids or [])
+                    )
+                }
+            )
+            for candidate in debts
+        ]
+        fresh = self._select(
+            [
+                workspace
+                for workspace in inventory
+                if workspace.label not in blocked_labels
+                and (workspace.label, workspace.workspace_id) not in debt_identities
+            ],
+            config,
+            now,
+            reasons,
+            excluded_ids,
+        )
+        candidates = sorted(debts + fresh, key=self._candidate_order)
+        if self._selection_cursor is not None:
+            # Continue after the previous selected identity, even if its row was
+            # removed. Wrap only after reaching the end of the current inventory.
+            pivot = next(
+                (
+                    index
+                    for index, candidate in enumerate(candidates)
+                    if self._candidate_order(candidate) > self._selection_cursor
+                ),
+                0,
+            )
+            candidates = candidates[pivot:] + candidates[:pivot]
+        if len(candidates) > config.max_sessions_per_sweep:
+            reasons["batch_limited"] += len(candidates) - config.max_sessions_per_sweep
+        candidates = candidates[: config.max_sessions_per_sweep]
         deleted = 0
         for candidate in candidates:
+            # Rejected or failed debt consumes this attempt, not every future
+            # sweep's budget. Advance before any external teardown boundary.
+            self._selection_cursor = self._candidate_order(candidate)
             if not self._revalidate(candidate, reasons):
                 continue
             try:
@@ -274,6 +387,7 @@ def build_runtime_resource_cleanup(
     from cli_agent_orchestrator.backends.registry import get_backend
     from cli_agent_orchestrator.clients.database import (
         get_pending_messages,
+        list_runtime_cleanup_debt,
         list_terminals_by_session,
     )
     from cli_agent_orchestrator.services.config_service import ConfigService
@@ -290,7 +404,8 @@ def build_runtime_resource_cleanup(
             registry=registry,  # type: ignore[arg-type]
             backend=selected_backend,  # type: ignore[arg-type]
         )
-        if result.get("errors"):
+        deferred_ids = result.get("deferred_ids") or []
+        if not result.get("deleted") or deferred_ids:
             raise RuntimeError("automatic cleanup incomplete")
 
     return RuntimeResourceCleanup(
@@ -300,4 +415,5 @@ def build_runtime_resource_cleanup(
         pending_checker=lambda terminal_id: bool(get_pending_messages(terminal_id, limit=1)),
         teardown=teardown,
         clock=clock or datetime.now,
+        debt_reader=list_runtime_cleanup_debt,
     )

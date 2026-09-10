@@ -34,9 +34,16 @@ import psutil
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.constants import CAO_HOME_DIR
+from cli_agent_orchestrator.models.mcp_server import (
+    HttpMcpServer,
+    McpConfigError,
+    parse_mcp_server_entry,
+)
 from cli_agent_orchestrator.models.terminal import TerminalStatus
 from cli_agent_orchestrator.providers.base import BaseProvider
+from cli_agent_orchestrator.providers.mcp_translation import render_http_entry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+from cli_agent_orchestrator.utils.mcp_launch import resolve_http_url, snapshot_process_env
 from cli_agent_orchestrator.utils.mcp_resolution import resolve_mcp_server_config
 from cli_agent_orchestrator.utils.terminal import wait_for_shell
 from cli_agent_orchestrator.utils.text import strip_terminal_escapes
@@ -270,19 +277,22 @@ class GrokCliProvider(BaseProvider):
         except OSError:
             return False
 
-    @staticmethod
-    def _server_dict(server: Any) -> dict[str, Any]:
-        if isinstance(server, dict):
-            return dict(server)
-        if hasattr(server, "model_dump"):
-            return dict(server.model_dump(exclude_none=True))
-        raise ProviderError(f"Unsupported MCP server configuration: {type(server).__name__}")
-
     def _render_mcp_config(self, mcp_servers: Optional[dict[str, Any]]) -> str:
         lines = ["# Managed by CLI Agent Orchestrator. Do not edit."]
+        env_snapshot = snapshot_process_env()
         for name, raw_server in (mcp_servers or {}).items():
-            config = self._server_dict(raw_server)
-            if "command" in config:
+            try:
+                entry = parse_mcp_server_entry(raw_server, server_name=name)
+                if isinstance(entry, HttpMcpServer):
+                    url = resolve_http_url(entry.url, env_snapshot, server_name=name)
+                    config = render_http_entry(
+                        "grok_cli", url, transport=entry.type, env=env_snapshot
+                    )
+                else:
+                    config = entry.model_dump(exclude_none=True)
+            except McpConfigError as exc:
+                raise ProviderError(str(exc)) from None
+            if not isinstance(entry, HttpMcpServer):
                 config = resolve_mcp_server_config(config)
                 env = dict(config.get("env") or {})
                 env["CAO_TERMINAL_ID"] = self.terminal_id
@@ -290,26 +300,14 @@ class GrokCliProvider(BaseProvider):
 
             table = f"mcp_servers.{_toml_string(name)}"
             lines.extend(["", f"[{table}]"])
-            if config.get("url"):
-                transport = config.get("type")
-                if transport is not None:
-                    if transport not in {"http", "sse"}:
-                        raise ProviderError(
-                            f"MCP server '{name}' has unsupported URL transport "
-                            f"{transport!r}; Grok supports 'http' and 'sse'"
-                        )
-                    # Grok defaults an untyped URL to HTTP.  SSE requires an
-                    # explicit type, so preserve the profile transport rather
-                    # than silently changing an SSE server into HTTP.
-                    lines.append(f"type = {_toml_string(transport)}")
+            if isinstance(entry, HttpMcpServer):
+                lines.append(f"type = {_toml_string(entry.type)}")
                 lines.append(f"url = {_toml_string(config['url'])}")
-            elif config.get("command"):
+            else:
                 lines.append(f"command = {_toml_string(config['command'])}")
                 args = config.get("args") or []
                 serialized_args = ", ".join(_toml_string(arg) for arg in args)
                 lines.append(f"args = [{serialized_args}]")
-            else:
-                raise ProviderError(f"MCP server '{name}' has neither command nor url")
             lines.append(f"enabled = {'true' if config.get('enabled', True) else 'false'}")
             if config.get("timeout") is not None:
                 # CAO's common MCP schema exposes one timeout knob. Grok has
@@ -391,6 +389,9 @@ class GrokCliProvider(BaseProvider):
                 pass
 
     def _prepare_grok_home(self, mcp_servers: Optional[dict[str, Any]]) -> Path:
+        # Hand-loaded profiles bypass JSON-schema validation. Narrow every
+        # entry before publishing any private-home files, including trust state.
+        rendered_config = self._render_mcp_config(mcp_servers)
         home = self._home_path()
         home.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(home, 0o700)
@@ -403,14 +404,12 @@ class GrokCliProvider(BaseProvider):
         if auth_source.is_file() and not auth_link.exists():
             auth_link.symlink_to(auth_source)
 
-        trusted_source = (
-            Path(configured_home).expanduser() if configured_home else Path.home() / ".grok"
-        ) / "trusted_folders.toml"
-        trusted_link = home / "trusted_folders.toml"
-        if trusted_source.is_file() and not trusted_link.exists():
-            trusted_link.symlink_to(trusted_source)
+        # Authentication does not authorize importing repository trust. Start
+        # each launch without persistent trust, including homes left by older
+        # releases that copied or symlinked the operator's trust database.
+        self._atomic_write_private(home / "trusted_folders.toml", "")
 
-        self._atomic_write_private(home / "config.toml", self._render_mcp_config(mcp_servers))
+        self._atomic_write_private(home / "config.toml", rendered_config)
         self._grok_home = home
         self._grok_home_root = home.parent
         return home
@@ -923,18 +922,27 @@ class GrokCliProvider(BaseProvider):
             # process. Its send_signal() then refuses a PID reused between this
             # verification and delivery.
             proc.create_time()
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied as exc:
+            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
+            return False
+        except psutil.Error as exc:
+            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
+            return False
+
+        try:
             if proc.uids().effective != os.geteuid():
                 return False
         except psutil.NoSuchProcess:
             return False
         except psutil.AccessDenied as exc:
-            # We cannot establish same-user ownership, so this can still be a
-            # Grok/updater process with this private home.  Retain it for a
-            # later retry rather than racing a live writer.
-            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
-            return None
+            # UID inspection has not established that this process belongs to
+            # our user, so it must not make the system-wide scan inconclusive.
+            logger.warning("Cannot inspect process %s UID before Grok cleanup: %s", pid, exc)
+            return False
         except psutil.Error as exc:
-            logger.warning("Cannot inspect process %s before Grok cleanup: %s", pid, exc)
+            logger.warning("Cannot inspect process %s UID before Grok cleanup: %s", pid, exc)
             return False
 
         try:
@@ -952,6 +960,16 @@ class GrokCliProvider(BaseProvider):
             )
             if not possible_owner:
                 return False
+        except psutil.NoSuchProcess:
+            return False
+        except psutil.AccessDenied as exc:
+            logger.warning("Cannot inspect process %s name before Grok cleanup: %s", pid, exc)
+            return False
+        except psutil.Error as exc:
+            logger.warning("Cannot inspect process %s name before Grok cleanup: %s", pid, exc)
+            return False
+
+        try:
             executable = proc.exe()
         except psutil.NoSuchProcess:
             return False

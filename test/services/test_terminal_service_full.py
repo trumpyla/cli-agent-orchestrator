@@ -1493,6 +1493,11 @@ class TestSendInput:
         provider._first_message_prefix = "Review only."
         mock_provider_manager.get_provider.return_value = provider
 
+        mock_backend.get_history.side_effect = [
+            "context: 0%",
+            "• Reviewing PR #1\ncontext: 1%",
+        ]
+
         with patch(
             "cli_agent_orchestrator.services.terminal_service._persist_profile_prompt_delivered"
         ) as mock_mark_delivered:
@@ -1501,6 +1506,98 @@ class TestSendInput:
         assert mock_backend.send_keys.call_args.args[2] == "Review only.\n\nInspect PR #1"
         assert provider._first_message_prefix is None
         mock_mark_delivered.assert_called_once_with("test1234")
+
+    def test_kimi_dropped_first_paste_retains_prefix_for_retry(self):
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("test1234", "cao-session", "reviewer-abcd")
+        provider._initialized = True
+        provider._first_message_prefix = "Review only."
+        confirm = provider.confirm_input_accepted
+        backend = MagicMock()
+        backend.get_history.side_effect = [
+            "context: 0%",  # first dispatch baseline
+            "context: 0%",  # dropped paste: no actual response
+            "context: 0%",  # explicit retry baseline
+            "• Reviewing PR #1\ncontext: 1%",  # accepted retry
+            "• Reviewing PR #1\ncontext: 1%",  # next task baseline, prefix consumed
+            "• Reviewing PR #2\ncontext: 2%",  # fresh acceptance without prefix
+        ]
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-session", "tmux_window": "reviewer-abcd"},
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch("cli_agent_orchestrator.backends.registry._backend", backend),
+            patch.object(ts, "status_monitor") as monitor,
+            patch.object(ts, "inject_memory_context", side_effect=lambda m, *args: m),
+            patch.object(ts, "update_last_active") as update_activity,
+            patch.object(ts, "dispatch_plugin_event") as dispatch_event,
+            patch.object(ts, "_persist_profile_prompt_delivered") as persist,
+            patch.object(
+                provider,
+                "confirm_input_accepted",
+                side_effect=lambda b, m: confirm(b, m, timeout=0),
+            ),
+        ):
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            with pytest.raises(ts.InputAcceptanceUnconfirmedError, match="retry may duplicate"):
+                send_input(
+                    "test1234",
+                    "Inspect PR #1",
+                    registry=MagicMock(),
+                    sender_id="sender",
+                    orchestration_type=OrchestrationType.SEND_MESSAGE,
+                )
+            assert provider._first_message_prefix == "Review only."
+            persist.assert_not_called()
+            backend.send_keys.assert_called_once()
+            update_activity.assert_called_once_with("test1234")
+            dispatch_event.assert_called_once()
+            assert dispatch_event.call_args.args[1] == "post_send_message"
+            assert dispatch_event.call_args.args[2].message == "Inspect PR #1"
+            assert send_input("test1234", "Inspect PR #1") is True
+            persist.assert_called_once_with("test1234")
+            assert provider._first_message_prefix is None
+            assert backend.send_keys.call_count == 2
+            assert [call.args[2] for call in backend.send_keys.call_args_list] == [
+                "Review only.\n\nInspect PR #1",
+                "Review only.\n\nInspect PR #1",
+            ]
+            assert send_input("test1234", "Inspect PR #2") is True
+            assert backend.send_keys.call_args.args[2] == "Inspect PR #2"
+            persist.assert_called_once_with("test1234")
+
+    def test_kimi_missing_baseline_prevents_first_paste(self):
+        from cli_agent_orchestrator.providers.kimi_cli import KimiCliProvider, ProviderError
+        from cli_agent_orchestrator.services import terminal_service as ts
+
+        provider = KimiCliProvider("test1234", "cao-session", "reviewer-abcd")
+        provider._initialized = True
+        provider._first_message_prefix = "Review only."
+        backend = MagicMock()
+        backend.get_history.return_value = None
+        with (
+            patch.object(
+                ts,
+                "get_terminal_metadata",
+                return_value={"tmux_session": "cao-session", "tmux_window": "reviewer-abcd"},
+            ),
+            patch.object(ts.provider_manager, "get_provider", return_value=provider),
+            patch("cli_agent_orchestrator.backends.registry._backend", backend),
+            patch.object(ts, "status_monitor") as monitor,
+            patch.object(ts, "inject_memory_context", side_effect=lambda m, *args: m),
+            patch.object(ts, "_persist_profile_prompt_delivered") as persist,
+        ):
+            monitor.get_status.return_value = TerminalStatus.IDLE
+            with pytest.raises(ProviderError, match="delivery capture unavailable"):
+                send_input("test1234", "Inspect PR #1")
+            backend.send_keys.assert_not_called()
+            persist.assert_not_called()
+            assert provider._first_message_prefix == "Review only."
 
     @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
     @patch("cli_agent_orchestrator.services.terminal_service.update_last_active")
@@ -1528,6 +1625,7 @@ class TestSendInput:
         provider._first_message_prefix = "Review only."
         mock_provider_manager.get_provider.return_value = provider
         mock_backend.send_keys.side_effect = RuntimeError("transient backend failure")
+        mock_backend.get_history.return_value = "context: 0%"
 
         with pytest.raises(RuntimeError, match="transient backend failure"):
             send_input("test1234", "Inspect PR #1")

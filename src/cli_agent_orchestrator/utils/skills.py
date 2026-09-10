@@ -29,6 +29,54 @@ class SkillNameError(ValueError):
     """Raised when a skill name is empty or unsafe to resolve on disk."""
 
 
+class InlineSkillPrompt(str):
+    """Already-resolved declared skills, preserving the string prompt contract."""
+
+
+def build_inline_skill_prompt(
+    skill_filter: Optional[List[str]] = None, *, start: Path | None = None
+) -> InlineSkillPrompt:
+    """Resolve declared skills before launch when runtime skill loading is blocked.
+
+    None selects all discoverable skills; an empty list selects none, matching
+    the catalog contract. Exact names and globs retain the
+    existing resolver precedence. Every declaration must resolve; missing,
+    invalid, or empty skill content fails launch instead of silently omitting
+    instructions. The tagged string prevents providers from resolving a service-
+    supplied prompt again against a different working directory.
+    """
+    if skill_filter == []:
+        return InlineSkillPrompt("")
+    names: List[str] = (
+        [skill.name for skill in list_skills(start=start)] if skill_filter is None else []
+    )
+    for pattern in skill_filter or []:
+        if any(character in pattern for character in "*?["):
+            matches = [
+                skill.name
+                for skill in list_skills(start=start)
+                if fnmatch.fnmatchcase(skill.name, pattern)
+            ]
+            if not matches:
+                raise FileNotFoundError(f"Declared skill pattern matched no skill: {pattern}")
+        else:
+            matches = [validate_skill_name(pattern)]
+        names.extend(name for name in matches if name not in names)
+    if not names:
+        return InlineSkillPrompt("")
+    blocks: List[str] = []
+    for name in names:
+        content = load_skill_content(name, start=start)
+        if not content.strip():
+            raise ValueError(f"Declared skill has empty content: {name}")
+        blocks.append(f"### {name}\n\n{content}")
+    return InlineSkillPrompt(
+        "## Declared Skills (preloaded)\n\n"
+        "The full declared skill instructions are included below. "
+        "No skill-loading tool call is needed.\n\n" + "\n\n".join(blocks)
+    )
+
+
 class _ProjectSkillsSettings(BaseModel):
     """Strict repository-owned subset of the user skills settings schema."""
 

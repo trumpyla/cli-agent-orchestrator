@@ -176,16 +176,34 @@ class PreflightReport(BaseModel):
 CommandRunner = Callable[[tuple[str, ...], Path, int], CommandResult]
 
 
+def select_live_lanes(
+    selection: str | None,
+    lanes: tuple[LiveProviderLane, ...] = LIVE_PROVIDER_LANES,
+) -> tuple[LiveProviderLane, ...]:
+    """Resolve the entire requested roster or reject it before launching."""
+    if selection is None:
+        return lanes
+    names = [name.strip() for name in selection.split(",")]
+    known = {lane.name for lane in lanes}
+    if not all(names) or set(names) - known:
+        # Do not echo arbitrary environment content in diagnostics.
+        raise ValueError("provider selection contains an empty or unknown lane")
+    return tuple(lane for lane in lanes if lane.name in names)
+
+
 def _default_runner(command: tuple[str, ...], cwd: Path, timeout: int) -> CommandResult:
-    completed = subprocess.run(
-        command,
-        cwd=cwd,
-        stdin=subprocess.DEVNULL,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    try:
+        completed = subprocess.run(
+            command,
+            cwd=cwd,
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as exc:
+        return CommandResult(returncode=127, stdout="", stderr=str(exc))
     return CommandResult(
         returncode=completed.returncode,
         stdout=completed.stdout,
@@ -256,17 +274,15 @@ def run_live_preflight(
         "CAO_SERENA_MCP_URL must be a loopback HTTP URL without userinfo",
     )
 
-    selected_lanes = env.get("CAO_LIVE_LANES")
-    if selected_lanes:
-        allowed = {x.strip() for x in selected_lanes.split(",") if x.strip()}
-        target_lanes = tuple(lane for lane in lanes if lane.name in allowed)
-    else:
-        target_lanes = lanes
+    try:
+        target_lanes = select_live_lanes(env.get("CAO_LIVE_LANES"), lanes)
+    except ValueError:
+        target_lanes = ()
 
     record(
         "lanes",
         bool(target_lanes),
-        "no matching provider lanes found for preflight",
+        "provider selection contains an empty or unknown lane",
     )
 
     record("herdr", which("herdr") is not None, "herdr binary is missing")

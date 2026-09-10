@@ -1,5 +1,6 @@
 """Minimal database client with only terminal metadata."""
 
+import json
 import logging
 import os
 import stat
@@ -65,6 +66,83 @@ class TerminalModel(Base):
     # literally named "metadata" per #432's design.
     metadata_json = Column("metadata", Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
+
+
+class RuntimeCleanupDebtModel(Base):
+    """Durable authorization to finish one captured workspace teardown."""
+
+    __tablename__ = "runtime_cleanup_debt"
+
+    session_name = Column(String, primary_key=True)
+    workspace_id = Column(String, primary_key=True)
+    terminal_ids = Column(Text, nullable=False)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+def list_runtime_cleanup_debt() -> List[Dict]:
+    with SessionLocal() as db:
+        debts = []
+        for row in db.query(RuntimeCleanupDebtModel).all():
+            try:
+                terminal_ids = json.loads(row.terminal_ids)
+                if not isinstance(terminal_ids, list) or any(
+                    not isinstance(terminal_id, str) or not terminal_id
+                    for terminal_id in terminal_ids
+                ):
+                    raise ValueError("invalid terminal identities")
+                invalid = False
+            except (ValueError, TypeError):
+                terminal_ids = None
+                invalid = True
+            debts.append(
+                {
+                    "label": row.session_name,
+                    "workspace_id": row.workspace_id,
+                    "terminal_ids": terminal_ids,
+                    "newest_activity": row.created_at,
+                    "invalid": invalid,
+                }
+            )
+        return debts
+
+
+def retain_runtime_cleanup_debt(
+    session_name: str, workspace_id: str, terminal_ids: List[str]
+) -> None:
+    """Persist before close; never widen an existing incarnation's authority."""
+    with SessionLocal() as db:
+        _begin_immediate(db)
+        row = db.get(RuntimeCleanupDebtModel, (session_name, workspace_id))
+        other_debts = db.query(RuntimeCleanupDebtModel).filter(
+            RuntimeCleanupDebtModel.session_name == session_name,
+            RuntimeCleanupDebtModel.workspace_id != workspace_id,
+        )
+        if any(
+            set(terminal_ids).intersection(json.loads(debt.terminal_ids)) for debt in other_debts
+        ):
+            raise RuntimeError("terminal belongs to another cleanup identity")
+        if row is not None:
+            if row.workspace_id != workspace_id or not set(terminal_ids).issubset(
+                json.loads(row.terminal_ids)
+            ):
+                raise RuntimeError("cleanup debt identity changed")
+        else:
+            db.add(
+                RuntimeCleanupDebtModel(
+                    session_name=session_name,
+                    workspace_id=workspace_id,
+                    terminal_ids=json.dumps(terminal_ids),
+                )
+            )
+        db.commit()
+
+
+def clear_runtime_cleanup_debt(session_name: str, workspace_id: str) -> None:
+    with SessionLocal() as db:
+        db.query(RuntimeCleanupDebtModel).filter_by(
+            session_name=session_name, workspace_id=workspace_id
+        ).delete(synchronize_session=False)
+        db.commit()
 
 
 class InboxModel(Base):
@@ -344,6 +422,45 @@ def init_db() -> None:
     # Appended LAST (issue #583 Bolt 2, ``approval-store``). Disjoint from every table above —
     # its own new table, no shared columns — so registry order is immaterial here too.
     _migrate_workflow_plan_approval()
+    _migrate_runtime_cleanup_debt()
+
+
+def _migrate_runtime_cleanup_debt() -> None:
+    """Preserve old debt while allowing successive identities to share a label."""
+
+    def migration_required(connection) -> bool:
+        columns = connection.exec_driver_sql("PRAGMA table_info(runtime_cleanup_debt)").fetchall()
+        primary_key = [column[1] for column in sorted(columns, key=lambda c: c[5]) if column[5]]
+        if not columns or primary_key == ["session_name", "workspace_id"]:
+            return False
+        if primary_key != ["session_name"]:
+            raise RuntimeError("unsupported runtime cleanup debt schema")
+        return True
+
+    # Routine startup must not require a writer reservation on a current DB.
+    with engine.connect() as connection:
+        if not migration_required(connection):
+            return
+    with engine.begin() as connection:
+        connection.exec_driver_sql("BEGIN IMMEDIATE")
+        # Another startup may have migrated between the read and reservation.
+        if not migration_required(connection):
+            return
+        connection.exec_driver_sql(
+            "CREATE TABLE runtime_cleanup_debt_v2 ("
+            "session_name VARCHAR NOT NULL, workspace_id VARCHAR NOT NULL, "
+            "terminal_ids TEXT NOT NULL, created_at DATETIME NOT NULL, "
+            "PRIMARY KEY (session_name, workspace_id))"
+        )
+        connection.exec_driver_sql(
+            "INSERT INTO runtime_cleanup_debt_v2 "
+            "(session_name, workspace_id, terminal_ids, created_at) "
+            "SELECT session_name, workspace_id, terminal_ids, created_at FROM runtime_cleanup_debt"
+        )
+        connection.exec_driver_sql("DROP TABLE runtime_cleanup_debt")
+        connection.exec_driver_sql(
+            "ALTER TABLE runtime_cleanup_debt_v2 RENAME TO runtime_cleanup_debt"
+        )
 
 
 def _restrict_db_file_permissions() -> None:
@@ -1707,7 +1824,7 @@ def delete_terminals_by_session(tmux_session: str) -> int:
 
 
 def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
-    """Delete specific terminal rows by id. Returns the number deleted.
+    """Atomically delete specific terminal rows and their receiver inbox rows.
 
     Unlike ``delete_terminals_by_session`` (which deletes EVERY row for a
     session name), this deletes only the given ids. Session teardown uses it to
@@ -1718,13 +1835,21 @@ def delete_terminals_by_ids(terminal_ids: List[str]) -> int:
     if not terminal_ids:
         return 0
     with SessionLocal() as db:
-        deleted = (
-            db.query(TerminalModel)
-            .filter(TerminalModel.id.in_(terminal_ids))
-            .delete(synchronize_session=False)
-        )
-        db.commit()
-        return deleted
+        try:
+            _begin_immediate(db)
+            db.query(InboxModel).filter(InboxModel.receiver_id.in_(terminal_ids)).delete(
+                synchronize_session=False
+            )
+            deleted = (
+                db.query(TerminalModel)
+                .filter(TerminalModel.id.in_(terminal_ids))
+                .delete(synchronize_session=False)
+            )
+            db.commit()
+            return int(deleted)
+        except Exception:
+            db.rollback()
+            raise
 
 
 def create_inbox_message(sender_id: str, receiver_id: str, message: str) -> InboxMessage:

@@ -126,7 +126,7 @@ class StdioMcpServer(BaseModel):
 
 
 class HttpMcpServer(BaseModel):
-    """A streamable-HTTP MCP entry: strictly ``type: http`` plus ``url``.
+    """An HTTP-family MCP entry: ``type: http|sse`` plus ``url``.
 
     ``extra="forbid"`` rejects every subprocess field (command/args/env/timeout)
     and any other stray key, so a mixed entry fails closed. ``url`` is validated
@@ -135,7 +135,7 @@ class HttpMcpServer(BaseModel):
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
-    type: Literal["http"]
+    type: Literal["http", "sse"]
     url: str
 
     @field_validator("url")
@@ -147,15 +147,15 @@ class HttpMcpServer(BaseModel):
 def _discriminator(value: Any) -> str:
     """Route an entry to its variant tag by the ``type`` field.
 
-    Anything that is not explicitly ``type: http`` routes to the stdio variant,
-    where a missing ``command`` (empty entry) or a stray ``url`` (mixed entry)
-    then fails validation.
+    ``type: http`` and the legacy ``type: sse`` both route to the HTTP variant.
+    Every other value routes to stdio, where a missing ``command`` (empty entry)
+    or a stray ``url`` (mixed entry) then fails validation.
     """
     if isinstance(value, Mapping):
         tag = value.get("type")
     else:
         tag = getattr(value, "type", None)
-    return "http" if tag == "http" else "stdio"
+    return "http" if tag in ("http", "sse") else "stdio"
 
 
 McpServerVariant = Annotated[
