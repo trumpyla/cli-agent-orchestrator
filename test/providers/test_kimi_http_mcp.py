@@ -10,6 +10,7 @@ the minimal ``{"url": ...}`` form; command entries keep command/args/env with
 from __future__ import annotations
 
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -33,8 +34,11 @@ _LOAD = "cli_agent_orchestrator.providers.kimi_cli.load_agent_profile"
 
 
 @pytest.fixture(autouse=True)
-def _auth_default_off(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Keep shape tests deterministic when the operator enables CAO auth."""
+def _isolated_runtime(tmp_path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Isolate deterministic runtime artifacts and operator authentication."""
+    # Path.home is patched separately for config-discovery assertions, but
+    # CAO_HOME_DIR was resolved at import time and needs its own isolation.
+    monkeypatch.setattr("cli_agent_orchestrator.providers.kimi_cli.CAO_HOME_DIR", tmp_path)
     monkeypatch.delenv("AUTH0_DOMAIN", raising=False)
     monkeypatch.delenv("CAO_AUTH_JWKS_URI", raising=False)
     monkeypatch.delenv("CAO_AUTH_LOCAL_TOKEN", raising=False)
@@ -274,6 +278,7 @@ class TestInstalledKimiSmoke:
         # Smoke: 0.29 removed --mcp-config. Passing it is a hard CLI error, so a
         # version that reintroduces the flag should be a deliberate decision.
         out = subprocess.run(["kimi", "--help"], capture_output=True, text=True, timeout=30)
+        assert out.returncode == 0
         help_text = (out.stdout or "") + (out.stderr or "")
         assert "--mcp-config" not in help_text
         # The model/prompt surfaces CAO relies on elsewhere.
@@ -282,22 +287,43 @@ class TestInstalledKimiSmoke:
 
     @pytest.mark.skipif(shutil.which("kimi") is None, reason="kimi not installed")
     def test_generated_config_targets_installed_major_minor(self, tmp_path) -> None:
-        # Smoke: our .kimi-code/mcp.json shape supports the installed 0.29 and
-        # 0.41 release lines. Other versions require a format re-check.
+        # Rechecked against the native 0.42 bundle's configLoader.ts and
+        # McpServerConfigSchema: cwd/.kimi-code/mcp.json contains mcpServers;
+        # url infers HTTP and command infers stdio when transport is absent.
+        # Other release lines still require a format re-check. This smoke
+        # checks generated configuration, not a live MCP connection.
         out = subprocess.run(["kimi", "--version"], capture_output=True, text=True, timeout=15)
+        assert out.returncode == 0
         version = (out.stdout or out.stderr).strip()
-        assert version.startswith(
-            ("0.29", "0.41")
-        ), f"expected Kimi 0.29.x or 0.41.x, got {version!r}"
+        assert re.match(
+            r"^0\.(?:29|41|42)\.", version
+        ), f"expected Kimi 0.29.x, 0.41.x or 0.42.x, got {version!r}"
 
         provider = KimiCliProvider("t1", "s", "w", agent_profile="dev")
         with (
             patch(_HOME, return_value=tmp_path),
-            patch(_LOAD, return_value=_profile({"cao-ops": {"type": "http", "url": _OPS_URL}})),
+            patch(
+                _LOAD,
+                return_value=_profile(
+                    {
+                        "cao-ops": {"type": "http", "url": _OPS_URL},
+                        "local": {
+                            "command": "fixture-command",
+                            "args": ["--stdio"],
+                            "env": {"FIXTURE_MODE": "stdio"},
+                        },
+                    }
+                ),
+            ),
         ):
             provider._build_kimi_command()
             path = Path(provider._temp_dir) / ".kimi-code" / "mcp.json"
             data = json.loads(path.read_text())
         # Documented shape: {"mcpServers": {name: {"url": ...}}}.
         assert data["mcpServers"]["cao-ops"] == {"url": _OPS_URL}
+        assert data["mcpServers"]["local"] == {
+            "command": "fixture-command",
+            "args": ["--stdio"],
+            "env": {"FIXTURE_MODE": "stdio"},
+        }
         provider.cleanup()

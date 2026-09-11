@@ -10,6 +10,7 @@ import os
 import re
 import tempfile
 import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -361,12 +362,13 @@ async def test_startup_dialog_dismisses_supported_upgrade_then_accepts_ready() -
 
     with (
         patch("cli_agent_orchestrator.providers.kimi_cli.get_backend", return_value=backend),
-        patch("cli_agent_orchestrator.providers.kimi_cli.time.monotonic", return_value=0.0),
+        patch("cli_agent_orchestrator.providers.kimi_cli.time", wraps=time) as provider_clock,
         patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep"),
         patch(
             "cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent"
         ) as notify_input_sent,
     ):
+        provider_clock.monotonic.return_value = 0.0
         await provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=10.0)
 
     backend.send_keys.assert_called_once_with(
@@ -390,10 +392,11 @@ async def test_startup_dialog_latches_trust_as_handled() -> None:
 
     with (
         patch("cli_agent_orchestrator.providers.kimi_cli.get_backend", return_value=backend),
-        patch("cli_agent_orchestrator.providers.kimi_cli.time.monotonic", return_value=0.0),
+        patch("cli_agent_orchestrator.providers.kimi_cli.time", wraps=time) as provider_clock,
         patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep"),
         patch("cli_agent_orchestrator.services.status_monitor.status_monitor.notify_input_sent"),
     ):
+        provider_clock.monotonic.return_value = 0.0
         await provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=10.0)
 
     assert provider._trust_handled is True
@@ -414,15 +417,22 @@ async def test_startup_dialog_does_not_answer_unsupported_dialog() -> None:
 
     with (
         patch("cli_agent_orchestrator.providers.kimi_cli.get_backend", return_value=backend),
-        patch(
-            "cli_agent_orchestrator.providers.kimi_cli.time.monotonic",
-            side_effect=[0.0, 0.0, 0.0, 2.0],
-        ),
+        patch("cli_agent_orchestrator.providers.kimi_cli.time", wraps=time) as provider_clock,
         patch("cli_agent_orchestrator.providers.kimi_cli.asyncio.sleep"),
     ):
+        # Patch only Kimi's module reference. Patching time.monotonic itself
+        # also replaces asyncio's event-loop clock, consuming this sequence
+        # during loop scheduling and aborting teardown before mocks restore.
+        real_monotonic = time.monotonic
+        provider_clock.monotonic.side_effect = [0.0, 0.0, 0.0, 2.0]
+        assert asyncio.get_running_loop().time() > 0
+        assert time.monotonic is real_monotonic
         await provider._handle_startup_dialog(idle_gap=1.0, outer_timeout=1.0)
 
     backend.send_keys.assert_not_called()
+    backend.send_special_key.assert_not_called()
+    backend.get_history.assert_called_once()
+    assert time.monotonic is real_monotonic
 
 
 # =============================================================================
